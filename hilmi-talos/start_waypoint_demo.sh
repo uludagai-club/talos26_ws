@@ -25,8 +25,9 @@ if [ -f "$PROJECT_ROOT/devel/setup.bash" ]; then
     source "$PROJECT_ROOT/devel/setup.bash"
     echo -e "${GREEN}[✓] ROS ortamı yüklendi${NC}"
 else
-    echo -e "${RED}[!] devel/setup.bash bulunamadı!${NC}"
-    exit 1
+    # Fallback: sistem ROS'u
+    source /opt/ros/noetic/setup.bash 2>/dev/null
+    echo -e "${YELLOW}[!] devel/setup.bash bulunamadı, sistem ROS kullanılıyor${NC}"
 fi
 
 # 1. vcan0 Kontrolü

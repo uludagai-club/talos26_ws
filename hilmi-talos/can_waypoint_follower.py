@@ -4,7 +4,6 @@
 CAN Bus Waypoint Follower - PID Controller
 Gazebo simülasyonunda aracı waypoint'lere götüren CAN tabanlı kontrol sistemi
 
-Maksimum Hız: 5 km/h
 CAN Mesajları:
     0x100: Gaz/Fren/Vites komutu gönder
     0x201: Direksiyon komutu gönder
@@ -20,34 +19,47 @@ import threading
 import time
 import numpy as np
 from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32
 from tf.transformations import euler_from_quaternion
 
 # =============================================================================
-# KONFİGÜRASYON
+# ARAÇ PARAMETRELERİ - TÜM AYARLAR BURADA
 # =============================================================================
 
-CAN_INTERFACE = 'vcan0'
-MAX_SPEED_KMH = 5.0          # Maksimum hız (km/h)
-MAX_SPEED_MS = MAX_SPEED_KMH / 3.6  # ~1.39 m/s
+# --- Hız Ayarları ---
+MAX_SPEED_KMH = 5.0                          # Maksimum hız (km/h)
+MAX_SPEED_MS = MAX_SPEED_KMH / 3.6           # Maksimum hız (m/s) - otomatik hesaplanır
+REVERSE_SPEED_RATIO = 0.6                    # Geri viteste hız oranı (0.6 = %60)
+REVERSE_SPEED_KMH = MAX_SPEED_KMH * REVERSE_SPEED_RATIO  # Geri vites hızı - otomatik
 
-# Direksiyon limitleri
-MAX_STEER_ANGLE = 30.0       # Derece
+# --- Direksiyon Ayarları ---
+MAX_STEER_ANGLE = 30.0                       # Maksimum direksiyon açısı (derece)
 
-# Waypoint toleransları
-ARRIVAL_THRESHOLD = 1.5      # metre - waypoint'e ulaşma eşiği
-SLOWDOWN_DISTANCE = 3.0      # metre - yavaşlamaya başlama mesafesi
-STOP_DISTANCE = 1.2          # metre - tamamen durma mesafesi (gaz kesme)
+# --- Waypoint Toleransları ---
+ARRIVAL_THRESHOLD = 1.5                      # Waypoint'e ulaşma eşiği (metre)
+SLOWDOWN_DISTANCE = 3.0                      # Yavaşlamaya başlama mesafesi (metre)
+STOP_DISTANCE = 1.2                          # Tamamen durma mesafesi (metre)
 
-# Vites sabitleri
+# --- Geri Vites Ayarları ---
+REVERSE_ANGLE_THRESHOLD = 120                # Bu açının üzerinde geri git (derece)
+REVERSE_MAX_DISTANCE = 8.0                   # Bu mesafenin altında geri git (metre)
+GEAR_CHANGE_STOP_TIME = 0.3                  # Vites değiştirirken bekleme (saniye)
+
+# --- CAN Bus Ayarları ---
+CAN_INTERFACE = 'vcan0'                      # CAN arayüzü
+
+# --- Şerit Takip (Line Following) Ayarları ---
+LINE_TOPIC = '/line'                         # Şerit açısı topic'i
+LINE_ENABLED = True                          # Şerit takibi aktif mi?
+LINE_WEIGHT = 0.15                           # Şerit düzeltme ağırlığı (0.0-0.5)
+LINE_TIMEOUT = 0.5                           # Veri timeout süresi (saniye)
+LINE_MAX_ANGLE = 25.0                        # Güvenilir maksimum açı (derece)
+LINE_OFFSET = -5.0                           # Kamera kalibrasyonu offset (derece)
+
+# --- Vites Sabitleri (değiştirmeyin) ---
 GEAR_NEUTRAL = 1
 GEAR_FORWARD = 2
 GEAR_REVERSE = 3
-
-# Geri vites ayarları
-REVERSE_ANGLE_THRESHOLD = 120  # Derece - bu açının üzerinde geri git
-REVERSE_MAX_DISTANCE = 8.0     # Metre - bu mesafenin altında geri git
-REVERSE_SPEED_KMH = 3.0        # Geri giderken maksimum hız
-GEAR_CHANGE_STOP_TIME = 0.3    # Saniye - vites değiştirirken bekleme süresi
 
 # =============================================================================
 # GELİŞMİŞ PID CONTROLLER
@@ -325,6 +337,20 @@ class CANWaypointFollower:
             self._odom_callback
         )
 
+        # Şerit takip (Line Following)
+        self.line_enabled = LINE_ENABLED
+        self.line_angle = 0.0                    # Şeritten gelen açı (derece)
+        self.line_last_time = 0.0                # Son veri zamanı
+        self.line_valid = False                  # Veri geçerli mi?
+
+        if self.line_enabled:
+            self.line_sub = rospy.Subscriber(
+                LINE_TOPIC,
+                Float32,
+                self._line_callback
+            )
+            rospy.loginfo(f"Şerit takibi aktif: {LINE_TOPIC}")
+
         # CAN okuyucu thread
         self.can_thread = threading.Thread(target=self._can_listener)
         self.can_thread.daemon = True
@@ -335,8 +361,7 @@ class CANWaypointFollower:
         rospy.loginfo(f"  Maksimum Hız: {MAX_SPEED_KMH} km/h")
         rospy.loginfo(f"  Toplam Waypoint: {len(waypoints)}")
         rospy.loginfo(f"  PID Modu: {pid_mode}")
-        rospy.loginfo(f"  Hız PID: kp={self.speed_pid.kp}, ki={self.speed_pid.ki}, kd={self.speed_pid.kd}")
-        rospy.loginfo(f"  Direksiyon PID: kp={self.steer_pid.kp}, ki={self.steer_pid.ki}, kd={self.steer_pid.kd}")
+        rospy.loginfo(f"  Şerit Takip: {'Aktif (ağırlık: ' + str(LINE_WEIGHT) + ')' if self.line_enabled else 'Kapalı'}")
         rospy.loginfo("  [DURUM] Başlatma komutu bekleniyor (CAN ID 0x500)...")
         rospy.loginfo("=" * 60)
 
@@ -388,6 +413,37 @@ class CANWaypointFollower:
         vx = msg.twist.twist.linear.x
         vy = msg.twist.twist.linear.y
         self.speed_ms = math.sqrt(vx**2 + vy**2)
+
+    def _line_callback(self, msg):
+        """Şerit açısı callback (/line topic)"""
+        raw_angle = msg.data
+
+        # Offset uygula (kamera kalibrasyonu)
+        self.line_angle = raw_angle + LINE_OFFSET
+        self.line_last_time = time.time()
+
+        # Güvenilirlik kontrolü
+        if abs(self.line_angle) <= LINE_MAX_ANGLE:
+            self.line_valid = True
+        else:
+            self.line_valid = False
+
+    def _is_line_data_fresh(self):
+        """Şerit verisi güncel mi kontrol et"""
+        if not self.line_enabled:
+            return False
+        elapsed = time.time() - self.line_last_time
+        return elapsed < LINE_TIMEOUT and self.line_valid
+
+    def _get_line_correction(self):
+        """Şerit takibinden direksiyon düzeltmesi al (derece)"""
+        if not self._is_line_data_fresh():
+            return 0.0
+
+        # Şerit açısını düzeltme olarak kullan
+        # Negatif açı = sola kayma = sağa dön (pozitif düzeltme)
+        correction = -self.line_angle * LINE_WEIGHT
+        return correction
 
     def _adapt_pid_gains(self, heading_error, distance):
         """
@@ -746,6 +802,13 @@ class CANWaypointFollower:
             # ========== DİREKSİYON KONTROLÜ ==========
             steer_deg = self.steer_pid.compute(heading_error, measurement=self.yaw)
 
+            # Şerit takip düzeltmesi ekle
+            line_correction = self._get_line_correction()
+            steer_deg += line_correction
+
+            # Direksiyon limitlerini uygula
+            steer_deg = np.clip(steer_deg, -MAX_STEER_ANGLE, MAX_STEER_ANGLE)
+
             # Geri viteste direksiyon ters etki eder
             if self.current_gear == GEAR_REVERSE:
                 steer_deg = -steer_deg
@@ -760,12 +823,12 @@ class CANWaypointFollower:
 
             # Debug çıktısı
             gear_str = self._gear_name(self.current_gear)
+            line_str = f"L:{self.line_angle:+.1f}°" if self._is_line_data_fresh() else "L:--"
             rospy.loginfo_throttle(0.5,
                 f"[{gear_str}] WP {self.current_waypoint_idx + 1}/{len(self.waypoints)} | "
-                f"Pos:({self.x:.1f},{self.y:.1f}) -> ({target_x:.1f},{target_y:.1f}) | "
                 f"Mesafe: {distance:.1f}m | "
                 f"Hız: {current_speed_kmh:.1f}/{target_speed_kmh:.1f} km/h | "
-                f"Gaz: {throttle_pct:.0f}% | Dir: {steer_deg:+.1f}°"
+                f"Dir: {steer_deg:+.1f}° | {line_str}"
             )
 
             rate.sleep()
@@ -802,7 +865,7 @@ DEFAULT_WAYPOINTS = [
 
 def main():
     """Ana fonksiyon"""
-    global MAX_SPEED_KMH, REVERSE_ANGLE_THRESHOLD
+    global MAX_SPEED_KMH, REVERSE_SPEED_KMH, REVERSE_ANGLE_THRESHOLD
     import argparse
 
     parser = argparse.ArgumentParser(description='TALOS CAN Waypoint Follower')
@@ -810,9 +873,9 @@ def main():
                         help='Waypoint listesi: "x1,y1 x2,y2 ..."')
     parser.add_argument('--mode', '-m', type=str, default='normal',
                         choices=['aggressive', 'normal', 'smooth'],
-                        help='PID modu (varsayılan: normal)')
-    parser.add_argument('--speed', '-s', type=float, default=5.0,
-                        help='Maksimum hız km/h (varsayılan: 5.0)')
+                        help='PID modu (varsayılan: normal)')   
+    parser.add_argument('--speed', '-s', type=float, default=None,
+                        help=f'Maksimum hız km/h (varsayılan: {MAX_SPEED_KMH})')
     parser.add_argument('--no-adaptive', action='store_true',
                         help='Adaptif PID\'yi devre dışı bırak')
     parser.add_argument('--no-reverse', action='store_true',
@@ -839,9 +902,14 @@ def main():
             print("Varsayılan waypoint'ler kullanılıyor.")
             waypoints = DEFAULT_WAYPOINTS
 
-    # Global değişkenleri güncelle
-    MAX_SPEED_KMH = args.speed
-    REVERSE_ANGLE_THRESHOLD = args.reverse_angle
+    # Global değişkenleri güncelle (sadece komut satırından verilmişse)
+    if args.speed is not None:
+        MAX_SPEED_KMH = args.speed
+    if args.reverse_angle != 120.0:
+        REVERSE_ANGLE_THRESHOLD = args.reverse_angle
+
+    # Geri vites hızını yeniden hesapla
+    REVERSE_SPEED_KMH = MAX_SPEED_KMH * REVERSE_SPEED_RATIO
 
     print("\n" + "=" * 60)
     print("  TALOS CAN Waypoint Follower (Gelişmiş PID + Geri Vites)")
