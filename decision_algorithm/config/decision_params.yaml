@@ -1,0 +1,52 @@
+# Karar Algoritması Parametreleri
+
+# Mesafe Eşikleri (metre cinsinden)
+distance_thresholds:
+  # Yaya Geçidi Mesafeleri
+  crosswalk_slow_down: 10.0      # Yaya geçidine bu mesafede yavaşla
+  crosswalk_stop: 3.0            # Yaya geçidine bu mesafede dur
+  
+  # Trafik Levhası Mesafeleri
+  traffic_sign_slow_down: 8.0    # Trafik levhasına bu mesafede yavaşla
+  traffic_sign_stop: 2.5         # STOP levhasına bu mesafede dur
+  traffic_sign_action: 5.0       # Genel trafik levhası aksiyon mesafesi
+  
+  # Güvenlik Mesafeleri
+  emergency_stop: 2.0            # Acil durum fren mesafesi
+  safe_distance: 1.5             # Güvenli minimum mesafe
+
+# Hız Parametreleri (m/s cinsinden)
+speed_limits:
+  normal_speed: 2.0              # Normal sürüş hızı
+  slow_speed: 0.5                # Yavaş sürüş hızı
+  stop_speed: 0.0                # Durma hızı
+
+# Zaman Parametreleri (saniye cinsinden)
+timing:
+  crosswalk_wait_time: 5.0       # Yaya geçidinde bekleme süresi
+  stop_sign_wait_time: 3.0       # Stop levhasında bekleme süresi
+  turn_duration: 2.0             # Dönüş süresi
+  acceleration_time: 1.0         # Hızlanma süresi
+  deceleration_time: 1.5         # Yavaşlama süresi
+
+# Güven Skoru Eşikleri
+confidence_thresholds:
+  min_sign_confidence: 0.7       # Minimum trafik levhası güven skoru
+  min_crosswalk_confidence: 0.6  # Minimum yaya geçidi güven skoru
+
+# Güvenlik Parametreleri
+safety:
+  max_acceleration: 1.0          # Maksimum ivme (m/s²)
+  max_deceleration: 2.0          # Maksimum yavaşlama (m/s²)
+  emergency_brake_decel: 5.0     # Acil fren yavaşlaması (m/s²)
+
+# Topic İsimleri
+topics:
+  traffic_sign_sub: "/trafik_levha"
+  crosswalk_sub: "/yaya_gecidi"
+  canbus_pub: "/control_canbus"
+
+# Debug Modu
+debug:
+  enable_logging: true           # Detaylı log kayıtları
+  publish_debug_info: true       # Debug bilgilerini yayınla
