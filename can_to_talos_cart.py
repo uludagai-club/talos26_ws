@@ -6,8 +6,14 @@ import sys
 import os
 import math
 
-# TALOS workspace'ini ekle
-sys.path.insert(0, os.path.expanduser('~/talos-sim/devel/lib/python3/dist-packages'))
+# TALOS workspace'ini ekle (Docker volume veya yerel)
+talos_paths = [
+    '/talos-sim/devel/lib/python3/dist-packages',  # Docker mount
+    os.path.expanduser('~/talos-sim/devel/lib/python3/dist-packages')  # Local
+]
+for path in talos_paths:
+    if os.path.exists(path) and path not in sys.path:
+        sys.path.insert(0, path)
 
 from cart_sim.msg import cart_control
 from std_msgs.msg import Header
