@@ -11,7 +11,7 @@ services:
     volumes:
       - /tmp/.X11-unix:/tmp/.X11-unix
       - ~/talos-sim:/talos-sim:ro
-    command: python3 can_waypoint_follower.py
+    command: python3 control.py
     restart: unless-stopped
 
   can-bridge:

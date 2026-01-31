@@ -26,4 +26,4 @@ RUN chmod +x *.sh *.py
 RUN echo "source /opt/ros/noetic/setup.bash" >> ~/.bashrc
 
 # Varsayılan komut
-CMD ["python3", "can_waypoint_follower.py"]
+CMD ["python3", "control.py"]
