@@ -1,0 +1,57 @@
+services:
+  waypoint-follower:
+    build: .
+    container_name: talos-waypoint
+    network_mode: host
+    privileged: true
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - DISPLAY=${DISPLAY}
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-sim/devel/lib/python3/dist-packages
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ~/talos-sim:/talos-sim:ro
+    command: python3 can_waypoint_follower.py
+    restart: unless-stopped
+
+  can-bridge:
+    build: .
+    container_name: talos-can-bridge
+    network_mode: host
+    privileged: true
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-sim/devel/lib/python3/dist-packages
+    volumes:
+      - ~/talos-sim:/talos-sim:ro
+    command: python3 can_to_talos_cart.py
+    restart: unless-stopped
+
+  state-bridge:
+    build: .
+    container_name: talos-state-bridge
+    network_mode: host
+    privileged: true
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-sim/devel/lib/python3/dist-packages
+    volumes:
+      - ~/talos-sim:/talos-sim:ro
+    command: python3 talos_state_to_can.py
+    restart: unless-stopped
+
+  visualizer:
+    build: .
+    container_name: talos-visualizer
+    network_mode: host
+    privileged: true
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - DISPLAY=${DISPLAY}
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-sim/devel/lib/python3/dist-packages
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ~/talos-sim:/talos-sim:ro
+      - ~/.Xauthority:/root/.Xauthority:ro
+    command: python3 can_visualizer.py
+    restart: unless-stopped
