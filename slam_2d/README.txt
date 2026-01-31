@@ -4,7 +4,6 @@ Bu klasör, 2D SLAM ve Simülasyon projesi için gerekli kaynak kodlarını içe
 
 İçerik:
 1. slam_2d/     : SLAM, haritalama ve waypoint araçlarını içeren ana paket.
-2. cart_sim/    : Gazebo simülasyonu ve robot modelini içeren paket.
 
 Sistem Gereksinimleri:
 - Ubuntu 20.04
