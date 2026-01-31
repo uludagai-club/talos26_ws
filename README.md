@@ -68,7 +68,7 @@ docker compose down
 ├── docker-compose.yml      # Servis konfigürasyonu
 ├── docker-start.sh         # Başlatma scripti
 ├── requirements.txt        # Python bağımlılıkları
-├── can_waypoint_follower.py   # Otonom waypoint takip
+├── control.py   # Otonom waypoint takip
 ├── can_to_talos_cart.py       # CAN -> Gazebo
 ├── talos_state_to_can.py      # Gazebo -> CAN
 ├── can_decoder.py             # CAN mesaj çözücü
@@ -77,7 +77,7 @@ docker compose down
 
 ## Parametreler
 
-`can_waypoint_follower.py` içinde ayarlanabilir:
+`control.py` içinde ayarlanabilir:
 
 ```python
 MAX_SPEED_KMH = 5.0           # Maksimum hız (km/h)
