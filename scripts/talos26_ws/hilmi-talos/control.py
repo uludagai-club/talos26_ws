@@ -855,9 +855,20 @@ class CANWaypointFollower:
                 # Fren yok, PID reset yok - akıcı geçiş
                 self.pub_gorev.publish("varildi")
                 self.dynamic_target = None  # Yeni hedef bekle (aşağıda düşük hızla devam)
+                rate.sleep()
+                continue
 
             # Açı hatasını hesapla
             heading_error = self._heading_error(target_x, target_y)
+
+            # U-dönüşü koruması: Hedef aracın arkasındaysa (>120°) ve yakınsa, atla
+            if abs(heading_error) > math.radians(120) and distance < ARRIVAL_THRESHOLD * 3:
+                self.logger.log(f"HEDEF ATLANDI (arkada): ({target_x:.2f}, {target_y:.2f}) "
+                                f"heading_err={math.degrees(heading_error):.0f}° mesafe={distance:.1f}m")
+                self.pub_gorev.publish("varildi")
+                self.dynamic_target = None
+                rate.sleep()
+                continue
 
             # Adaptif PID ayarlarını güncelle
             self._adapt_pid_gains(heading_error, distance)
