@@ -477,6 +477,13 @@ class CANWaypointFollower:
         except (ValueError, IndexError) as e:
             rospy.logwarn(f"Hedef parse hatası: {msg.data} - {e}")
 
+    def _is_in_turn(self, threshold_deg=15):
+        """Aracın aktif virajda olup olmadığını kontrol et"""
+        if self.dynamic_target is None:
+            return False
+        heading_err = abs(self._heading_error(self.dynamic_target[0], self.dynamic_target[1]))
+        return heading_err > math.radians(threshold_deg)
+
     def _karar_callback(self, msg):
         """Karar node'undan gelen durum (String: 'normal'/'slow'/'dur'/'acildurus'/'sag'/'sol')"""
         new_karar = msg.data.strip().lower()
@@ -490,15 +497,24 @@ class CANWaypointFollower:
         elif new_karar == Karar.ACIL_DURUS:
             self.logger.log("KARAR: ACIL DURUS!")
         elif new_karar == Karar.SAG and old_karar != Karar.SAG:
-            self._start_lane_change(-1)  # sağa şerit değiştir
-            self.logger.log("KARAR: SAĞ - şerit değiştirme başladı")
+            if self._is_in_turn():
+                self.logger.log(f"KARAR: SAG REDDEDILDI - virajda serit degistirme yasak")
+                new_karar = Karar.NORMAL  # SAG'ı yoksay, NORMAL olarak devam et
+            else:
+                self._start_lane_change(-1)  # sağa şerit değiştir
+                self.logger.log("KARAR: SAĞ - şerit değiştirme başladı")
         elif new_karar == Karar.SOL and old_karar != Karar.SOL:
-            self._start_lane_change(1)  # sola şerit değiştir
-            self.logger.log("KARAR: SOL - şerit değiştirme başladı")
+            if self._is_in_turn():
+                self.logger.log(f"KARAR: SOL REDDEDILDI - virajda serit degistirme yasak")
+                new_karar = Karar.NORMAL  # SOL'u yoksay, NORMAL olarak devam et
+            else:
+                self._start_lane_change(1)  # sola şerit değiştir
+                self.logger.log("KARAR: SOL - şerit değiştirme başladı")
         elif new_karar == Karar.SLOW and old_karar != Karar.SLOW:
             self.logger.log(f"KARAR: YAVAŞ - hız limiti {LIMIT_SLOW} km/h")
         elif new_karar == Karar.NORMAL and old_karar != Karar.NORMAL:
             self.dur_waiting = False
+            self.lane_change_active = False  # NORMAL gelince şerit değiştirmeyi de sıfırla
             self.logger.log("KARAR: NORMAL")
 
         self.karar = new_karar
@@ -577,12 +593,14 @@ class CANWaypointFollower:
 
     def _start_lane_change(self, direction):
         """Şerit değiştirme başlat (direction: -1=sağ, +1=sol)"""
-        # Virajda şerit değiştirmeyi engelle (heading error büyükse araç aktif dönüşte)
-        if self.dynamic_target is not None:
-            heading_err = abs(self._heading_error(self.dynamic_target[0], self.dynamic_target[1]))
-            if heading_err > math.radians(20):
-                self.logger.log(f"SERIT DEGISTIRME REDDEDILDI: Virajda (heading_error={math.degrees(heading_err):.1f}°)")
-                return
+        # Virajda şerit değiştirmeyi engelle
+        if self._is_in_turn():
+            self.logger.log(f"SERIT DEGISTIRME REDDEDILDI: Virajda")
+            return
+        # Yüksek yaw rate = aktif dönüş
+        if abs(self.yaw_rate) > 0.3:
+            self.logger.log(f"SERIT DEGISTIRME REDDEDILDI: Yuksek donus hizi (yaw_rate={math.degrees(self.yaw_rate):.1f}°/s)")
+            return
         self.lane_change_active = True
         self.lane_change_start = time.time()
         self.lane_change_dir = direction
@@ -598,13 +616,11 @@ class CANWaypointFollower:
             self.logger.log("Şerit değiştirme tamamlandı")
             return None
 
-        # Virajda şerit değiştirmeyi iptal et (hedef değişmiş olabilir)
-        if self.dynamic_target is not None:
-            heading_err = abs(self._heading_error(self.dynamic_target[0], self.dynamic_target[1]))
-            if heading_err > math.radians(25):
-                self.lane_change_active = False
-                self.logger.log(f"SERIT DEGISTIRME IPTAL: Viraj algilandi (heading_error={math.degrees(heading_err):.1f}°)")
-                return None
+        # Virajda veya yüksek dönüş hızında şerit değiştirmeyi iptal et
+        if self._is_in_turn(threshold_deg=20) or abs(self.yaw_rate) > 0.3:
+            self.lane_change_active = False
+            self.logger.log(f"SERIT DEGISTIRME IPTAL: Viraj/donus algilandi")
+            return None
 
         return self.lane_change_dir * LANE_CHANGE_STEER
 
