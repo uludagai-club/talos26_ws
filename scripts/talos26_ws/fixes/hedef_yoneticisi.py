@@ -280,7 +280,14 @@ class HedefYoneticisi:
         if self.current_wp_index >= len(self.full_path_grid): return
         gx, gy = self.full_path_grid[self.current_wp_index]
         wx, wy = self.grid_to_world(gx, gy)
-        msg = f"{wx:.2f},{wy:.2f}"
+        # Sonraki hedefi de ekle (varsa)
+        next_idx = self.current_wp_index + 1
+        if next_idx < len(self.full_path_grid):
+            gx2, gy2 = self.full_path_grid[next_idx]
+            wx2, wy2 = self.grid_to_world(gx2, gy2)
+            msg = f"{wx:.2f},{wy:.2f};{wx2:.2f},{wy2:.2f}"
+        else:
+            msg = f"{wx:.2f},{wy:.2f}"
         self.pub_hedef.publish(msg)
 
     def varildi_callback(self, msg):
