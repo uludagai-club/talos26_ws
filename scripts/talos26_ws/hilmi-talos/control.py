@@ -834,30 +834,14 @@ class CANWaypointFollower:
             target = self.dynamic_target
 
             if target is None:
-                # Hedef yok - düşük hızda mevcut yönde devam et (şerit takibi ağırlıklı)
-                cruise_speed = 2.0  # km/h düşük hız
-                current_speed_kmh = self.speed_ms * 3.6
-                speed_error = cruise_speed - current_speed_kmh
-                throttle = self.speed_pid.compute(speed_error, measurement=current_speed_kmh)
-
-                if throttle > 0:
-                    throttle_pct = min(throttle, 30.0)  # Gaz sınırlı
-                    brake_pct = 0
-                else:
-                    throttle_pct = 0
-                    brake_pct = min(30, abs(throttle) * 0.3)
-
-                # Şerit takibi düzeltmesi (hedef yok, şerit ağırlığı artık)
-                line_correction = self._get_line_correction() * 2.0
-                steer_deg = np.clip(line_correction, -MAX_STEER_ANGLE, MAX_STEER_ANGLE)
-
+                # Hedef yok - dur ve bekle (hedefsiz ilerleme kazaya yol acar)
                 self._send_can_command(
-                    throttle_pct=throttle_pct,
-                    brake_pct=brake_pct,
-                    steer_deg=steer_deg,
+                    throttle_pct=0,
+                    brake_pct=50,
+                    steer_deg=0,
                     gear=GEAR_FORWARD
                 )
-                rospy.loginfo_throttle(2.0, f"[CRUISE] Hedef bekleniyor... hız: {current_speed_kmh:.1f} km/h")
+                rospy.loginfo_throttle(2.0, f"[BEKLE] Hedef bekleniyor...")
                 rate.sleep()
                 continue
 
@@ -870,11 +854,18 @@ class CANWaypointFollower:
             if distance < ARRIVAL_THRESHOLD:
                 self.logger.log(f"HEDEF TAMAMLANDI: ({target_x:.2f}, {target_y:.2f})")
                 self.pub_gorev.publish("varildi")
-                # Sonraki hedef varsa aninda gec (gecikme yok)
+                # Sonraki hedef varsa, arkada olmadigini kontrol et
                 if self.next_target:
-                    self.dynamic_target = self.next_target
-                    self.next_target = None
-                    self.logger.log(f"SONRAKI HEDEFE GECILDI: ({self.dynamic_target[0]:.2f}, {self.dynamic_target[1]:.2f})")
+                    nh_err = abs(self._heading_error(self.next_target[0], self.next_target[1]))
+                    if nh_err < math.radians(90):
+                        self.dynamic_target = self.next_target
+                        self.next_target = None
+                        self.logger.log(f"SONRAKI HEDEFE GECILDI: ({self.dynamic_target[0]:.2f}, {self.dynamic_target[1]:.2f})")
+                    else:
+                        self.logger.log(f"SONRAKI HEDEF ARKADA: heading_err={math.degrees(nh_err):.0f}° - bekleniyor")
+                        self.pub_gorev.publish("varildi")
+                        self.dynamic_target = None
+                        self.next_target = None
                 else:
                     self.dynamic_target = None
                 rate.sleep()
@@ -883,16 +874,23 @@ class CANWaypointFollower:
             # Açı hatasını hesapla
             heading_error = self._heading_error(target_x, target_y)
 
-            # U-dönüşü koruması: Hedef aracın arkasındaysa (>120°) ve yakınsa, atla
-            if abs(heading_error) > math.radians(120) and distance < ARRIVAL_THRESHOLD * 3:
+            # U-dönüşü koruması: Hedef aracın arkasındaysa (>90°), atla
+            if abs(heading_error) > math.radians(90):
                 self.logger.log(f"HEDEF ATLANDI (arkada): ({target_x:.2f}, {target_y:.2f}) "
                                 f"heading_err={math.degrees(heading_error):.0f}° mesafe={distance:.1f}m")
                 self.pub_gorev.publish("varildi")
-                # Sonraki hedef varsa aninda gec
+                # Sonraki hedef varsa, onu da kontrol et
                 if self.next_target:
-                    self.dynamic_target = self.next_target
-                    self.next_target = None
-                    self.logger.log(f"SONRAKI HEDEFE GECILDI: ({self.dynamic_target[0]:.2f}, {self.dynamic_target[1]:.2f})")
+                    nh_err = abs(self._heading_error(self.next_target[0], self.next_target[1]))
+                    if nh_err < math.radians(90):
+                        self.dynamic_target = self.next_target
+                        self.next_target = None
+                        self.logger.log(f"SONRAKI HEDEFE GECILDI: ({self.dynamic_target[0]:.2f}, {self.dynamic_target[1]:.2f})")
+                    else:
+                        self.logger.log(f"SONRAKI HEDEF DE ARKADA: heading_err={math.degrees(nh_err):.0f}° - atlaniyor")
+                        self.pub_gorev.publish("varildi")
+                        self.dynamic_target = None
+                        self.next_target = None
                 else:
                     self.dynamic_target = None
                 rate.sleep()

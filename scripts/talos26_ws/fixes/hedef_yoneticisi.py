@@ -221,16 +221,9 @@ class HedefYoneticisi:
     def loop(self):
         rate = rospy.Rate(10)
         while not rospy.is_shutdown():
-            # Ana hedefte bekleme kontrolu
+            # Son durakta bekleme (sadece tum gorevler bittiginde)
             if self.durak_waiting:
-                import time
-                elapsed = time.time() - self.durak_wait_start
                 self.pub_karar.publish("dur")
-                if elapsed >= DURAK_BEKLEME_SURESI:
-                    self.durak_waiting = False
-                    self.pub_karar.publish("normal")
-                    print(f">>> [DURAK] Bekleme bitti, devam ediliyor.")
-                    self.recalculate_path_from_robot()
             elif self.is_path_calculated:
                 self.publish_current_waypoint()
 
@@ -291,7 +284,6 @@ class HedefYoneticisi:
         self.pub_hedef.publish(msg)
 
     def varildi_callback(self, msg):
-        import time
         if self.durak_waiting:
             return  # Bekleme sirasinda yeni varildi'lari yoksay
 
@@ -299,17 +291,20 @@ class HedefYoneticisi:
             # Ara waypoint - sadece index ilerle, durma yok
             self.current_wp_index += 1
         elif self.is_path_calculated and self.current_wp_index >= len(self.full_path_grid) - 1:
-            # ANA HEDEF tamamlandi - dur ve bekle
+            # ANA HEDEF tamamlandi
             self.current_task_index += 1
             self.is_path_calculated = False
             if self.current_task_index < len(self.geo_targets_grid):
-                gorev_no = self.current_task_index  # 0-indexed, onceki gorev
-                print(f">>> [DURAK TAMAM] Durak {gorev_no} bitti. {DURAK_BEKLEME_SURESI:.0f}s bekleniyor...")
+                # Ara durak - durma yok, hemen sonraki hedefe gec
+                gorev_no = self.current_task_index
+                print(f">>> [DURAK TAMAM] Durak {gorev_no} bitti. Devam ediliyor...")
+                self.recalculate_path_from_robot()
+            else:
+                # SON DURAK - sadece burada dur
+                import time
+                print(">>> TEBRIKLER! TUM DURAKLAR GEZILDI.")
                 self.durak_waiting = True
                 self.durak_wait_start = time.time()
-                self.pub_karar.publish("dur")
-            else:
-                print(">>> TEBRIKLER! TUM DURAKLAR GEZILDI.")
                 self.pub_karar.publish("dur")
 
     def konum_callback(self, msg):
