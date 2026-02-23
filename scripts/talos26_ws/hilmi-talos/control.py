@@ -336,11 +336,10 @@ class CANWaypointFollower:
         # Dinamik hedef (/hedef topic'inden)
         self.dynamic_target = None  # (x, y) tuple veya None
         self.next_target = None     # Sonraki hedef (gecikmeyi onlemek icin)
+        self.last_completed_target = None  # Son tamamlanan hedef (stale filtreleme)
 
         # Karar durumu
         self.karar = Karar.NORMAL
-        self.dur_waiting = False
-        self.dur_wait_start = 0
         self.lane_change_active = False
         self.lane_change_start = 0
         self.lane_change_dir = 0  # -1: sağ, +1: sol
@@ -476,6 +475,13 @@ class CANWaypointFollower:
             # Birinci hedef
             parts = segments[0].split(',')
             x, y = float(parts[0]), float(parts[1])
+
+            # Stale hedef filtresi: az once tamamlanan hedefe geri donme
+            if self.last_completed_target is not None:
+                lx, ly = self.last_completed_target
+                if abs(x - lx) < 0.5 and abs(y - ly) < 0.5:
+                    return  # Bu hedef az once tamamlandi, yoksay
+
             self.dynamic_target = (x, y)
             # Ikinci hedef (varsa)
             if len(segments) > 1:
@@ -502,10 +508,7 @@ class CANWaypointFollower:
         old_karar = self.karar
 
         if new_karar == Karar.DUR and old_karar != Karar.DUR:
-            # Dur kararı yeni geldi - bekleme başlat
-            self.dur_waiting = True
-            self.dur_wait_start = time.time()
-            self.logger.log("KARAR: DUR - bekleme başladı")
+            self.logger.log("KARAR: DUR")
         elif new_karar == Karar.ACIL_DURUS:
             self.logger.log("KARAR: ACIL DURUS!")
         elif new_karar == Karar.SAG and old_karar != Karar.SAG:
@@ -525,12 +528,6 @@ class CANWaypointFollower:
         elif new_karar == Karar.SLOW and old_karar != Karar.SLOW:
             self.logger.log(f"KARAR: YAVAŞ - hız limiti {LIMIT_SLOW} km/h")
         elif new_karar == Karar.NORMAL and old_karar != Karar.NORMAL:
-            # DUR bekleme suresi dolmadan NORMAL'e gecme (flip-flop onleme)
-            if self.dur_waiting:
-                elapsed = time.time() - self.dur_wait_start
-                if elapsed < DUR_WAIT_TIME:
-                    return  # DUR'u koru, NORMAL'i yoksay
-            self.dur_waiting = False
             self.lane_change_active = False  # NORMAL gelince şerit değiştirmeyi de sıfırla
             self.logger.log("KARAR: NORMAL")
 
@@ -813,22 +810,10 @@ class CANWaypointFollower:
 
             # ========== KARAR: DUR ==========
             if self.karar == Karar.DUR:
-                if self.dur_waiting:
-                    elapsed = time.time() - self.dur_wait_start
-                    if elapsed < DUR_WAIT_TIME:
-                        self._send_can_command(throttle_pct=0, brake_pct=80, steer_deg=0, gear=GEAR_FORWARD)
-                        rospy.loginfo_throttle(0.5, f"[DUR] Bekleniyor... {elapsed:.1f}/{DUR_WAIT_TIME:.1f}s")
-                        rate.sleep()
-                        continue
-                    else:
-                        # Bekleme bitti - normal'e dön
-                        self.dur_waiting = False
-                        self.karar = Karar.NORMAL
-                        self.logger.log("DUR bekleme süresi doldu, devam ediliyor")
-                else:
-                    self._send_can_command(throttle_pct=0, brake_pct=80, steer_deg=0, gear=GEAR_FORWARD)
-                    rate.sleep()
-                    continue
+                self._send_can_command(throttle_pct=0, brake_pct=80, steer_deg=0, gear=GEAR_FORWARD)
+                rospy.loginfo_throttle(2.0, "[DUR] Bekleniyor...")
+                rate.sleep()
+                continue
 
             # ========== HEDEF KONTROLÜ ==========
             target = self.dynamic_target
@@ -853,6 +838,7 @@ class CANWaypointFollower:
             # Hedefe ulaştık mı?
             if distance < ARRIVAL_THRESHOLD:
                 self.logger.log(f"HEDEF TAMAMLANDI: ({target_x:.2f}, {target_y:.2f})")
+                self.last_completed_target = (target_x, target_y)
                 self.pub_gorev.publish("varildi")
                 # Sonraki hedef varsa, arkada olmadigini kontrol et
                 if self.next_target:
@@ -878,6 +864,7 @@ class CANWaypointFollower:
             if abs(heading_error) > math.radians(90):
                 self.logger.log(f"HEDEF ATLANDI (arkada): ({target_x:.2f}, {target_y:.2f}) "
                                 f"heading_err={math.degrees(heading_error):.0f}° mesafe={distance:.1f}m")
+                self.last_completed_target = (target_x, target_y)
                 self.pub_gorev.publish("varildi")
                 # Sonraki hedef varsa, onu da kontrol et
                 if self.next_target:
