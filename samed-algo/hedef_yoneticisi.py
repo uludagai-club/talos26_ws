@@ -22,7 +22,7 @@ GOREV_GEOJSON = {
     {
       "type": "Feature",
       "properties": { "name": "gorev_1", "description": "1. Durak" },
-      "geometry": { "type": "Point", "coordinates": [25.0, -6.0] }
+      "geometry": { "type": "Point", "coordinates": [-5.0, -34.0] }
     },
     {
       "type": "Feature",
@@ -37,7 +37,7 @@ GOREV_GEOJSON = {
     {
       "type": "Feature",
       "properties": { "name": "gorev_4", "description": "4. Durak (FİNİSH)" },
-      "geometry": { "type": "Point", "coordinates": [-5.0, -34.0] }
+      "geometry": { "type": "Point", "coordinates": [25.0, -6.0] }
     }
   ]
 }
@@ -146,18 +146,21 @@ class HedefYoneticisi:
         self.geo_targets_grid = []
         
         self.planner = DLitePlanner()
-        
-        plt.ion() 
+        self.mission_complete = False
+        self.last_task_advance_time = 0.0
+        self.son_hesaplama_zamani = 0.0
+
+        plt.ion()
         self.fig, self.ax = plt.subplots(figsize=(10, 10))
         self.ax.set_aspect('equal')
-        
+
         self.pub_hedef = rospy.Publisher('/hedef', String, queue_size=10)
-        
+
         rospy.Subscriber('/map', OccupancyGrid, self.map_callback)
         rospy.Subscriber('/waypoint', MarkerArray, self.marker_callback)
         rospy.Subscriber('/konum', Pose2D, self.konum_callback)
         rospy.Subscriber('/gorev_durumu', String, self.varildi_callback)
-        
+
         print(">>> SISTEM HAZIR. Bekleniyor: /map, /waypoint, /konum")
 
     def loop(self):
@@ -248,68 +251,84 @@ class HedefYoneticisi:
             print(f">>> [ROTA] {len(path)} adet Waypoint oluşturuldu.")
         else:
             print("!!! [HATA] Rota bulunamadı!")
+            self.is_path_calculated = False
+            self.full_path_grid = []
 
     def publish_current_waypoint(self):
-        if not self.is_path_calculated or not self.full_path_grid: 
+        if not self.is_path_calculated or not self.full_path_grid:
             return
 
-        # 1. ADIM: WP1 (Sarı Yıldız) Seçimi
-        # Mevcut index'in bir sonrası her zaman asıl hedefimiz (WP1) olsun.
-        wp1_index = min(self.current_wp_index + 1, len(self.full_path_grid) - 1)
-
-        # 2. ADIM: WP2 (Mavi Yıldız) Seçimi
-        # WP1'in bir sonrası da her zaman bakış hedefimiz (WP2) olsun.
+        # WP1: Mevcut hedef waypoint
+        wp1_index = min(self.current_wp_index, len(self.full_path_grid) - 1)
+        # WP2: Bir sonraki waypoint (bakış hedefi)
         wp2_index = min(wp1_index + 1, len(self.full_path_grid) - 1)
 
-        # Koordinatları grid'den dünya koordinatlarına çevir
         wx1, wy1 = self.grid_to_world(self.full_path_grid[wp1_index][0], self.full_path_grid[wp1_index][1])
         wx2, wy2 = self.grid_to_world(self.full_path_grid[wp2_index][0], self.full_path_grid[wp2_index][1])
-            
-        # Mesajı gönder: "WP1_X,WP1_Y|WP2_X,WP2_Y"
+
         msg = f"{wx1:.2f},{wy1:.2f}|{wx2:.2f},{wy2:.2f}"
         self.pub_hedef.publish(msg)
 
 
     def konum_callback(self, msg):
-        
         self.robot_x = msg.x
         self.robot_y = msg.y
         self.robot_yaw = msg.theta
-
         self.robot_grid_pos = self.world_to_grid(self.robot_x, self.robot_y)
-        
+
         pos_valid = (self.robot_grid_pos is not None and self.robot_grid_pos[0] is not None)
-        if not pos_valid:
+        if not pos_valid or self.mission_complete:
+            self.new_data_available = True
             return
-            
+
         # 1. Durum: Henüz hiç rota çizilmemişse
         if not self.is_path_calculated and self.planner.nodes and self.geo_targets_grid:
-             self.recalculate_path_from_robot()
-             
-        # 2. Durum: Rota var ama araç elle taşındıysa veya rotadan koptuysa
+            self.recalculate_path_from_robot()
+
+        # 2. Durum: Rota var ama araç rotadan koptuysa
         elif self.is_path_calculated and self.full_path_grid:
-             min_dist = float('inf')
-             for i in range(self.current_wp_index, len(self.full_path_grid)):
-                 gx, gy = self.full_path_grid[i]
-                 wx, wy = self.grid_to_world(gx, gy)
-                 d = math.hypot(self.robot_x - wx, self.robot_y - wy)
-                 if d < min_dist:
-                     min_dist = d
-             
-             sapma_esigi = 2.0  
-             # YENİ: Sürekli kilitlenmeyi engellemek için 3 saniye cooldown (bekleme) eklendi
-             if min_dist > sapma_esigi and (time.time() - getattr(self, 'son_hesaplama_zamani', 0) > 3.0):
-                 print(f">>> [DİKKAT] Araç rotadan {min_dist:.1f}m uzaklaştı! Rota güncelleniyor...")
-                 self.recalculate_path_from_robot()
-                 self.son_hesaplama_zamani = time.time() # Zamanlayıcıyı sıfırla
+            min_dist = float('inf')
+            for i in range(self.current_wp_index, len(self.full_path_grid)):
+                gx, gy = self.full_path_grid[i]
+                wx, wy = self.grid_to_world(gx, gy)
+                d = math.hypot(self.robot_x - wx, self.robot_y - wy)
+                if d < min_dist:
+                    min_dist = d
+
+            sapma_esigi = 5.0
+            if min_dist > sapma_esigi and (time.time() - self.son_hesaplama_zamani > 5.0):
+                print(f">>> [DİKKAT] Araç rotadan {min_dist:.1f}m uzaklaştı! Rota güncelleniyor...")
+                self.recalculate_path_from_robot()
+                self.son_hesaplama_zamani = time.time()
 
         self.new_data_available = True
     
+    def _advance_wp_index(self):
+        """Arabanın konumuna en yakın waypoint'i bul ve 2 ileri kaydır"""
+        if not self.full_path_grid:
+            return
+        closest_idx = self.current_wp_index
+        min_dist = float('inf')
+        for i in range(self.current_wp_index, len(self.full_path_grid)):
+            gx, gy = self.full_path_grid[i]
+            wx, wy = self.grid_to_world(gx, gy)
+            d = math.hypot(self.robot_x - wx, self.robot_y - wy)
+            if d < min_dist:
+                min_dist = d
+                closest_idx = i
+        self.current_wp_index = min(closest_idx + 2, len(self.full_path_grid) - 1)
+
     def varildi_callback(self, msg):
         """
         /gorev_durumu topic'inden 'varildi' gelince:
         """
-        if not self.is_path_calculated:
+        if not self.is_path_calculated or self.mission_complete:
+            return
+
+        # Görev değişikliği cooldown - çoklu varildi ile durak atlama önleme (5 sn)
+        now = time.time()
+        if now - self.last_task_advance_time < 5.0:
+            self._advance_wp_index()
             return
 
         # Robot'un anlik hedef noktaya olan kus ucusu mesafesini kontrol et
@@ -318,34 +337,21 @@ class HedefYoneticisi:
         mesafe = math.hypot(self.robot_x - wx, self.robot_y - wy)
 
         # Hedef duraga 5.0 metreden yakinsak gercekten varildi sayilir
-        near_end = (mesafe < 5.0)
-
-        if near_end:
-            # Bir sonraki göreve (durağa) geç
+        if mesafe < 5.0:
             self.current_task_index += 1
+            self.last_task_advance_time = now
             if self.current_task_index >= len(self.geo_targets_grid):
                 print(">>> TÜM GÖREVLER TAMAMLANDI!")
                 self.is_path_calculated = False
                 self.full_path_grid = []
+                self.mission_complete = True
                 return
             next_name = GOREV_GEOJSON['features'][self.current_task_index]['properties']['name']
             print(f">>> DURAK TAMAMLANDI! Yeni hedef: {next_name} (index: {self.current_task_index})")
             self.recalculate_path_from_robot()
         else:
-            # Ara nokta (erken tetiklenme veya ara durak): arabanın konumuna en yakın waypoint'i bul ve biraz ileri kaydır
-            closest_idx = self.current_wp_index
-            min_dist = float('inf')
-            for i in range(self.current_wp_index, len(self.full_path_grid)):
-                gx, gy = self.full_path_grid[i]
-                wx, wy = self.grid_to_world(gx, gy)
-                d = math.hypot(self.robot_x - wx, self.robot_y - wy)
-                if d < min_dist:
-                    min_dist = d
-                    closest_idx = i
-                    
-            # Kör atlama (index + 10) yerine, aracın o anki konumuna en yakın waypoint'ten 2 birim sonrasını hedef seçiyoruz
-            self.current_wp_index = min(closest_idx + 2, len(self.full_path_grid) - 1)
-            print(f">>> ARA HEDEFE VARILDI: Mesafe {mesafe:.1f}m. Liste kaydırıldı (Index: {self.current_wp_index})")
+            self._advance_wp_index()
+            print(f">>> ARA HEDEFE VARILDI: Mesafe {mesafe:.1f}m. Index: {self.current_wp_index}")
 
     def map_callback(self, msg):
         self.map_info = msg.info
@@ -423,7 +429,7 @@ class HedefYoneticisi:
             self.ax.plot(px, py, color='red', linewidth=3, alpha=0.7, label='En Kısa Yol', zorder=2)
             
             # WP1 (Sarı Yıldız - Aktif Hedef)
-            wp1_idx = min(self.current_wp_index + 1, len(self.full_path_grid) - 1)
+            wp1_idx = min(self.current_wp_index, len(self.full_path_grid) - 1)
             t1 = self.full_path_grid[wp1_idx]
             self.ax.scatter(t1[0], t1[1], c='yellow', s=350, marker='*', edgecolors='red', label='WP1 (Hedef)', zorder=8)
 

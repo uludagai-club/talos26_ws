@@ -22,6 +22,8 @@ import datetime
 import numpy as np
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32, String
+from visualization_msgs.msg import Marker
+from geometry_msgs.msg import Point
 from tf.transformations import euler_from_quaternion
 
 
@@ -83,9 +85,16 @@ class Karar:
     SOL = "sol"
 
 LIMIT_SLOW = 2.5            # km/h - yavaş mod hız limiti
-DUR_WAIT_TIME = 3.0         # saniye - dur kararında bekleme süresi
+DUR_WAIT_TIME = 3.0         # saniye - dur kararında bekleme süresi (sadece son hedef icin)
+PARK_WAIT_TIMEOUT = 8.0     # saniye - hedef gelmezse son hedef kabul et ve dur
 LANE_CHANGE_STEER = 20.0    # derece - şerit değiştirme direksiyon açısı
 LANE_CHANGE_DURATION = 2.0  # saniye - şerit değiştirme süresi
+
+# Gercek gorev duraklari (hedef_yoneticisi'ndeki GeoJSON ile ayni)
+GOREV_NOKTALARI = [(-5.0, -34.0), (11.0, -25.0), (20.0, -22.0), (25.0, -6.0)]
+GOREV_THRESHOLD = 3.0       # metre - duraga varis esigi
+GOREV_COOLDOWN = 10.0       # saniye - ayni duraga tekrar varildi engeli
+WP_NEAR_DISTANCE = 1.5      # metre - WP1'e yakinken WP2'ye gec (lookahead)
 
 
 # =============================================================================
@@ -99,7 +108,7 @@ MAX_SPEED_MS = MAX_SPEED_KMH / 3.6           # Maksimum hız (m/s) - otomatik he
 MAX_STEER_ANGLE = 30.0                       # Maksimum direksiyon açısı (derece)
 
 # --- Waypoint Toleransları ---
-ARRIVAL_THRESHOLD = 1.5                      # Waypoint'e ulaşma eşiği (metre)
+ARRIVAL_THRESHOLD = 3.0                      # Waypoint'e ulaşma eşiği (metre)
 SLOWDOWN_DISTANCE = 4.0                      # Yavaşlamaya başlama mesafesi (metre)
 STOP_DISTANCE = 1.2                          # Tamamen durma mesafesi (metre)
 
@@ -335,11 +344,17 @@ class CANWaypointFollower:
 
         # Dinamik hedef (/hedef topic'inden)
         self.dynamic_target = None  # (x, y) tuple veya None
+        self.next_target = None     # Sonraki hedef (gecikmeyi onlemek icin)
+        self.target_none_since = None      # dynamic_target None olduğu an (park tespiti için)
+
+        # Gorev duragi takibi
+        self.last_gorev_varildi_time = {}  # {durak_idx: timestamp} cooldown per durak
+        self.current_stop_waiting = False   # Durakta bekleme aktif mi
+        self.current_stop_wait_start = 0.0  # Durakta bekleme baslangic zamani
+        self.last_wp_varildi_time = 0.0     # Mikro-WP varildi throttle
 
         # Karar durumu
         self.karar = Karar.NORMAL
-        self.dur_waiting = False
-        self.dur_wait_start = 0
         self.lane_change_active = False
         self.lane_change_start = 0
         self.lane_change_dir = 0  # -1: sağ, +1: sol
@@ -399,6 +414,9 @@ class CANWaypointFollower:
 
         # /gorev_durumu publisher - waypoint'e varış bildirimi
         self.pub_gorev = rospy.Publisher('/gorev_durumu', String, queue_size=10)
+
+        # Hedef visualizer marker publisher
+        self.pub_marker = rospy.Publisher('/hedef_marker', Marker, queue_size=10)
 
         # /hedef subscriber - dinamik hedef teslimi
         self.hedef_sub = rospy.Subscriber('/hedef', String, self._hedef_callback)
@@ -468,14 +486,98 @@ class CANWaypointFollower:
     # =========================================================================
 
     def _hedef_callback(self, msg):
-        """Hedef tesliminden gelen waypoint (String: 'x,y')"""
+        """Hedef tesliminden gelen mikro-waypoint (String: 'x1,y1|x2,y2')
+
+        D* Lite hedef yoneticisi 10Hz'de yuzlerce mikro-waypoint gonderir.
+        Flip-flop filtresi: Hedef 10m'den fazla ziplayip 1sn icinde geri donerse
+        (hedef_yoneticisi sapma recalculate kaynaklı) reddedilir.
+        """
         try:
-            parts = msg.data.strip().split(',')
+            raw = msg.data.strip()
+
+            if '|' in raw:
+                segments = raw.split('|')
+            else:
+                segments = raw.split(';')
+
+            parts = segments[0].split(',')
             x, y = float(parts[0]), float(parts[1])
+
+            x2, y2 = None, None
+            if len(segments) > 1:
+                parts2 = segments[1].split(',')
+                x2, y2 = float(parts2[0]), float(parts2[1])
+
+            # --- FLIP-FLOP FİLTRESİ ---
+            # Hedef >10m ziplayinca: yon kontrolu yap
+            # Aracin mevcut yonune gore >90° arkaya isaret ediyorsa REDDET
+            if self.dynamic_target is not None:
+                jump_dist = math.sqrt((x - self.dynamic_target[0])**2 + (y - self.dynamic_target[1])**2)
+                if jump_dist > 10.0:
+                    # Yeni hedefin aracin arkasinda olup olmadigini kontrol et
+                    heading_to_new = math.atan2(y - self.y, x - self.x)
+                    heading_diff = abs((heading_to_new - self.yaw + math.pi) % (2 * math.pi) - math.pi)
+                    if heading_diff > math.radians(90):
+                        # Arkaya dogru ziplama - flip-flop, reddet
+                        return
+
+            old_target = self.dynamic_target
             self.dynamic_target = (x, y)
-            self.logger.log(f"HEDEF ALINDI: ({x:.2f}, {y:.2f})")
+            if x2 is not None:
+                self.next_target = (x2, y2)
+            else:
+                self.next_target = None
+            self.target_none_since = None
+
+            # Sadece hedef belirgin degistiginde logla (spam onleme)
+            if old_target is None or self._distance_between(old_target, (x, y)) > 2.0:
+                self.logger.log(f"HEDEF: ({x:.2f}, {y:.2f})"
+                                + (f" sonraki: ({x2:.2f}, {y2:.2f})" if self.next_target else ""))
         except (ValueError, IndexError) as e:
-            rospy.logwarn(f"Hedef parse hatası: {msg.data} - {e}")
+            rospy.logwarn(f"Hedef parse hatasi: {msg.data} - {e}")
+
+    def _distance_between(self, p1, p2):
+        """Iki nokta arasi mesafe"""
+        return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+    def _publish_hedef_markers(self):
+        """Hedef noktalarini RViz'de gorsellestir"""
+        if self.dynamic_target:
+            m = Marker()
+            m.header.frame_id = "map"
+            m.header.stamp = rospy.Time.now()
+            m.ns = "hedef"
+            m.id = 0
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = self.dynamic_target[0]
+            m.pose.position.y = self.dynamic_target[1]
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 1.5
+            m.color.r = 1.0; m.color.g = 1.0; m.color.a = 1.0  # Sari
+            self.pub_marker.publish(m)
+
+        if self.next_target:
+            m2 = Marker()
+            m2.header.frame_id = "map"
+            m2.header.stamp = rospy.Time.now()
+            m2.ns = "hedef"
+            m2.id = 1
+            m2.type = Marker.SPHERE
+            m2.action = Marker.ADD
+            m2.pose.position.x = self.next_target[0]
+            m2.pose.position.y = self.next_target[1]
+            m2.pose.orientation.w = 1.0
+            m2.scale.x = m2.scale.y = m2.scale.z = 1.0
+            m2.color.b = 1.0; m2.color.a = 1.0  # Mavi
+            self.pub_marker.publish(m2)
+
+    def _is_in_turn(self, threshold_deg=15):
+        """Aracın aktif virajda olup olmadığını kontrol et"""
+        if self.dynamic_target is None:
+            return False
+        heading_err = abs(self._heading_error(self.dynamic_target[0], self.dynamic_target[1]))
+        return heading_err > math.radians(threshold_deg)
 
     def _karar_callback(self, msg):
         """Karar node'undan gelen durum (String: 'normal'/'slow'/'dur'/'acildurus'/'sag'/'sol')"""
@@ -483,22 +585,27 @@ class CANWaypointFollower:
         old_karar = self.karar
 
         if new_karar == Karar.DUR and old_karar != Karar.DUR:
-            # Dur kararı yeni geldi - bekleme başlat
-            self.dur_waiting = True
-            self.dur_wait_start = time.time()
-            self.logger.log("KARAR: DUR - bekleme başladı")
+            self.logger.log("KARAR: DUR")
         elif new_karar == Karar.ACIL_DURUS:
             self.logger.log("KARAR: ACIL DURUS!")
         elif new_karar == Karar.SAG and old_karar != Karar.SAG:
-            self._start_lane_change(-1)  # sağa şerit değiştir
-            self.logger.log("KARAR: SAĞ - şerit değiştirme başladı")
+            if self._is_in_turn():
+                self.logger.log(f"KARAR: SAG REDDEDILDI - virajda serit degistirme yasak")
+                new_karar = Karar.NORMAL  # SAG'ı yoksay, NORMAL olarak devam et
+            else:
+                self._start_lane_change(-1)  # sağa şerit değiştir
+                self.logger.log("KARAR: SAĞ - şerit değiştirme başladı")
         elif new_karar == Karar.SOL and old_karar != Karar.SOL:
-            self._start_lane_change(1)  # sola şerit değiştir
-            self.logger.log("KARAR: SOL - şerit değiştirme başladı")
+            if self._is_in_turn():
+                self.logger.log(f"KARAR: SOL REDDEDILDI - virajda serit degistirme yasak")
+                new_karar = Karar.NORMAL  # SOL'u yoksay, NORMAL olarak devam et
+            else:
+                self._start_lane_change(1)  # sola şerit değiştir
+                self.logger.log("KARAR: SOL - şerit değiştirme başladı")
         elif new_karar == Karar.SLOW and old_karar != Karar.SLOW:
             self.logger.log(f"KARAR: YAVAŞ - hız limiti {LIMIT_SLOW} km/h")
         elif new_karar == Karar.NORMAL and old_karar != Karar.NORMAL:
-            self.dur_waiting = False
+            self.lane_change_active = False  # NORMAL gelince şerit değiştirmeyi de sıfırla
             self.logger.log("KARAR: NORMAL")
 
         self.karar = new_karar
@@ -577,6 +684,14 @@ class CANWaypointFollower:
 
     def _start_lane_change(self, direction):
         """Şerit değiştirme başlat (direction: -1=sağ, +1=sol)"""
+        # Virajda şerit değiştirmeyi engelle
+        if self._is_in_turn():
+            self.logger.log(f"SERIT DEGISTIRME REDDEDILDI: Virajda")
+            return
+        # Yüksek yaw rate = aktif dönüş
+        if abs(self.yaw_rate) > 0.3:
+            self.logger.log(f"SERIT DEGISTIRME REDDEDILDI: Yuksek donus hizi (yaw_rate={math.degrees(self.yaw_rate):.1f}°/s)")
+            return
         self.lane_change_active = True
         self.lane_change_start = time.time()
         self.lane_change_dir = direction
@@ -592,7 +707,73 @@ class CANWaypointFollower:
             self.logger.log("Şerit değiştirme tamamlandı")
             return None
 
+        # Virajda veya yüksek dönüş hızında şerit değiştirmeyi iptal et
+        if self._is_in_turn(threshold_deg=20) or abs(self.yaw_rate) > 0.3:
+            self.lane_change_active = False
+            self.logger.log(f"SERIT DEGISTIRME IPTAL: Viraj/donus algilandi")
+            return None
+
         return self.lane_change_dir * LANE_CHANGE_STEER
+
+    def _check_gorev_arrival(self):
+        """Robot konumunu gercek gorev duraklarina karsi kontrol et.
+
+        Mikro-waypoint'lere degil, sadece GOREV_NOKTALARI'ndaki duraklara
+        varildiginda 'varildi' gonderir.
+
+        Returns:
+            True = durakta bekliyor (fren uygula), False = normal surus
+        """
+        now = time.time()
+
+        # Durakta bekleme aktifse
+        if self.current_stop_waiting:
+            elapsed = now - self.current_stop_wait_start
+            if elapsed < DUR_WAIT_TIME:
+                # Hala bekliyoruz
+                return True
+            else:
+                # Bekleme bitti, normal suruse don
+                self.current_stop_waiting = False
+                self.logger.log("Durak beklemesi bitti, devam ediliyor")
+                return False
+
+        # Her duraga mesafe kontrol et
+        for idx, (gx, gy) in enumerate(GOREV_NOKTALARI):
+            dist = self._distance_to(gx, gy)
+            if dist < GOREV_THRESHOLD:
+                # Cooldown kontrolu - ayni duraga tekrar varildi gondermeyi engelle
+                last_time = self.last_gorev_varildi_time.get(idx, 0.0)
+                if now - last_time < GOREV_COOLDOWN:
+                    continue
+
+                # Duraga vardik!
+                self.last_gorev_varildi_time[idx] = now
+                self.logger.log(f"GOREV DURAGI #{idx+1} VARILDI: ({gx:.1f}, {gy:.1f}) mesafe={dist:.1f}m")
+                # NOT: varildi mesaji buradan gonderilmez, sadece mikro-wp varildi (satir ~1008) gonderir.
+                # Cift varildi hedef_yoneticisi'nde durak atlama bugina neden oluyordu.
+
+                # Son durak mi?
+                if idx == len(GOREV_NOKTALARI) - 1:
+                    self.mission_complete = True
+                    self.logger.log("SON GOREV DURAGI - GOREV TAMAMLANDI!")
+
+                # Durakta kisa bekleme
+                self.current_stop_waiting = True
+                self.current_stop_wait_start = now
+                return True
+
+        return False
+
+    def _nearest_gorev_distance(self):
+        """En yakin gorev duragina mesafe (yavaslamak icin)"""
+        min_dist = float('inf')
+        for gx, gy in GOREV_NOKTALARI:
+            # Sadece henuz varilmamis veya cooldown gecmis duraklari kontrol et
+            dist = self._distance_to(gx, gy)
+            if dist < min_dist:
+                min_dist = dist
+        return min_dist
 
     def _speed_publisher(self):
         """Hız yayını thread'i - 0x301 CAN mesajı ile hızı yayınla (100ms aralık)"""
@@ -766,68 +947,112 @@ class CANWaypointFollower:
 
             # ========== KARAR: DUR ==========
             if self.karar == Karar.DUR:
-                if self.dur_waiting:
-                    elapsed = time.time() - self.dur_wait_start
-                    if elapsed < DUR_WAIT_TIME:
-                        self._send_can_command(throttle_pct=0, brake_pct=80, steer_deg=0, gear=GEAR_FORWARD)
-                        rospy.loginfo_throttle(0.5, f"[DUR] Bekleniyor... {elapsed:.1f}/{DUR_WAIT_TIME:.1f}s")
-                        rate.sleep()
-                        continue
-                    else:
-                        # Bekleme bitti - normal'e dön
-                        self.dur_waiting = False
-                        self.karar = Karar.NORMAL
-                        self.logger.log("DUR bekleme süresi doldu, devam ediliyor")
-                else:
-                    self._send_can_command(throttle_pct=0, brake_pct=80, steer_deg=0, gear=GEAR_FORWARD)
-                    rate.sleep()
-                    continue
+                self._send_can_command(throttle_pct=0, brake_pct=80, steer_deg=0, gear=GEAR_FORWARD)
+                rospy.loginfo_throttle(2.0, "[DUR] Karar: dur")
+                rate.sleep()
+                continue
+
+            # ========== GOREV DURAGI KONTROLU ==========
+            # Gercek gorev duraklarina varildi mi kontrol et
+            if self._check_gorev_arrival():
+                # Durakta bekliyoruz - fren uygula
+                self._send_can_command(throttle_pct=0, brake_pct=80, steer_deg=0, gear=GEAR_FORWARD)
+                rospy.loginfo_throttle(1.0, "[DURAK] Gorev duraginda bekleniyor...")
+                rate.sleep()
+                continue
+
+            # Mission complete ise park et
+            if self.mission_complete:
+                self._send_can_command(throttle_pct=0, brake_pct=100, steer_deg=0, gear=GEAR_FORWARD)
+                rospy.loginfo_throttle(2.0, "[PARK] Gorev tamamlandi - arac durdu")
+                rate.sleep()
+                continue
 
             # ========== HEDEF KONTROLÜ ==========
             target = self.dynamic_target
 
             if target is None:
-                # Hedef yok - düşük hızda mevcut yönde devam et (şerit takibi ağırlıklı)
-                cruise_speed = 2.0  # km/h düşük hız
-                current_speed_kmh = self.speed_ms * 3.6
-                speed_error = cruise_speed - current_speed_kmh
-                throttle = self.speed_pid.compute(speed_error, measurement=current_speed_kmh)
+                now = time.time()
+                if self.target_none_since is None:
+                    self.target_none_since = now
+                    self.logger.log("Hedef bekleniyor - yeni hedef gelecek...")
 
-                if throttle > 0:
-                    throttle_pct = min(throttle, 30.0)  # Gaz sınırlı
-                    brake_pct = 0
+                wait_elapsed = now - self.target_none_since
+
+                if wait_elapsed < PARK_WAIT_TIMEOUT:
+                    # Henüz bekleme süresi dolmadı - yavaşla ama durma
+                    slow_throttle = max(0.0, 5.0 - wait_elapsed * 1.2)
+                    brake_pct = min(40.0, wait_elapsed * 10.0)
+                    self._send_can_command(
+                        throttle_pct=slow_throttle,
+                        brake_pct=brake_pct,
+                        steer_deg=0,
+                        gear=GEAR_FORWARD
+                    )
+                    rospy.loginfo_throttle(1.0, f"[BEKLE] Yeni hedef bekleniyor... ({wait_elapsed:.1f}s)")
+                    rate.sleep()
+                    continue
                 else:
-                    throttle_pct = 0
-                    brake_pct = min(30, abs(throttle) * 0.3)
-
-                # Şerit takibi düzeltmesi (hedef yok, şerit ağırlığı artık)
-                line_correction = self._get_line_correction() * 2.0
-                steer_deg = np.clip(line_correction, -MAX_STEER_ANGLE, MAX_STEER_ANGLE)
-
-                self._send_can_command(
-                    throttle_pct=throttle_pct,
-                    brake_pct=brake_pct,
-                    steer_deg=steer_deg,
-                    gear=GEAR_FORWARD
-                )
-                rospy.loginfo_throttle(2.0, f"[CRUISE] Hedef bekleniyor... hız: {current_speed_kmh:.1f} km/h")
-                rate.sleep()
-                continue
+                    # Süre doldu - baglanti problemi, bekle + frenle
+                    if self.mission_complete:
+                        # Gercek park
+                        self.logger.log("PARK: Gorev tamamlandi")
+                    self._send_can_command(
+                        throttle_pct=0,
+                        brake_pct=80,
+                        steer_deg=0,
+                        gear=GEAR_FORWARD
+                    )
+                    rospy.loginfo_throttle(2.0, f"[BEKLE] Hedef yok - fren ({wait_elapsed:.1f}s)")
+                    rate.sleep()
+                    continue
+            else:
+                # Hedef var, bekleme sayacını sıfırla
+                self.target_none_since = None
 
             target_x, target_y = target
 
-            # Mesafe hesapla
+            # WP1'e mesafe
             distance = self._distance_to(target_x, target_y)
 
-            # Hedefe ulaştık mı?
-            if distance < ARRIVAL_THRESHOLD:
-                self.logger.log(f"HEDEF TAMAMLANDI: ({target_x:.2f}, {target_y:.2f})")
-                # Fren yok, PID reset yok - akıcı geçiş
-                self.pub_gorev.publish("varildi")
-                self.dynamic_target = None  # Yeni hedef bekle (aşağıda düşük hızla devam)
+            # WP1'e yakinken: varildi gonder (hedef yoneticisi wp_index ilerlesin) + WP2'ye lookahead
+            if distance < WP_NEAR_DISTANCE:
+                now = time.time()
+                if now - self.last_wp_varildi_time > 0.15:  # ~7Hz throttle
+                    self.pub_gorev.publish("varildi")
+                    self.last_wp_varildi_time = now
+                if self.next_target is not None:
+                    target_x, target_y = self.next_target
+                    distance = self._distance_to(target_x, target_y)
 
             # Açı hatasını hesapla
             heading_error = self._heading_error(target_x, target_y)
+
+            # U-dönüşü koruması: Hedef aracın arkasındaysa (>90°)
+            if abs(heading_error) > math.radians(90) and distance < ARRIVAL_THRESHOLD * 3:
+                resolved = False
+                if self.next_target is not None:
+                    # WP2'ye yonlenmeyi dene
+                    nx, ny = self.next_target
+                    nh = self._heading_error(nx, ny)
+                    if abs(nh) <= math.radians(90):
+                        # WP2 onde - ona yonlen
+                        target_x, target_y = nx, ny
+                        distance = self._distance_to(nx, ny)
+                        heading_error = nh
+                        resolved = True
+
+                if not resolved:
+                    # Hem WP1 hem WP2 arkada (veya WP2 yok)
+                    # Donmeye calisma, dur ve varildi gondermeye devam et
+                    now = time.time()
+                    if now - self.last_wp_varildi_time > 0.15:
+                        self.pub_gorev.publish("varildi")
+                        self.last_wp_varildi_time = now
+                    self._send_can_command(throttle_pct=0, brake_pct=40, steer_deg=0, gear=GEAR_FORWARD)
+                    rospy.loginfo_throttle(1.0, "[U-DONUS] Hedef arkada - dur + varildi gonderiliyor")
+                    rate.sleep()
+                    continue
 
             # Adaptif PID ayarlarını güncelle
             self._adapt_pid_gains(heading_error, distance)
@@ -839,9 +1064,10 @@ class CANWaypointFollower:
             max_speed = min(speed_limit, MAX_SPEED_KMH)
             base_speed = max_speed
 
-            # Yaklaşırken yavaşla
-            if distance < SLOWDOWN_DISTANCE:
-                distance_factor = max(0.3, distance / SLOWDOWN_DISTANCE)
+            # Gorev duragina yaklasirken yavasla (mikro-WP mesafesi degil)
+            gorev_dist = self._nearest_gorev_distance()
+            if gorev_dist < SLOWDOWN_DISTANCE:
+                distance_factor = max(0.3, gorev_dist / SLOWDOWN_DISTANCE)
                 base_speed *= distance_factor
 
             # Büyük açı hatasında yavaşla ama minimum hızı koru (virajda durma!)
@@ -912,6 +1138,9 @@ class CANWaypointFollower:
                 f"Dir: {steer_deg:+.1f} | {line_str}"
                 + (f" | {karar_str}" if karar_str else "")
             )
+
+            # Hedef markerlarini yayinla (RViz icin)
+            self._publish_hedef_markers()
 
             rate.sleep()
 
