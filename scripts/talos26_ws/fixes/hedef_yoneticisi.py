@@ -7,6 +7,7 @@ from nav_msgs.msg import OccupancyGrid
 from visualization_msgs.msg import MarkerArray 
 from geometry_msgs.msg import Pose2D
 import math
+import time
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as PathEffects
 import numpy as np
@@ -18,83 +19,28 @@ import heapq
 GOREV_GEOJSON = {
   "type": "FeatureCollection",
   "features": [
-    # --- GUNEY BOLGE (mevcut rota) ---
     {
       "type": "Feature",
-      "properties": { "name": "gorev_1", "description": "1. Durak - Baslangic" },
+      "properties": { "name": "gorev_1", "description": "1. Durak" },
       "geometry": { "type": "Point", "coordinates": [-5.0, -34.0] }
     },
     {
       "type": "Feature",
-      "properties": { "name": "gorev_2", "description": "2. Durak - Viraj oncesi" },
-      "geometry": { "type": "Point", "coordinates": [9.0, -34.0] }
-    },
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_3", "description": "3. Durak - Kuzey yol" },
+      "properties": { "name": "gorev_2", "description": "2. Durak" },
       "geometry": { "type": "Point", "coordinates": [11.0, -25.0] }
     },
     {
       "type": "Feature",
-      "properties": { "name": "gorev_4", "description": "4. Durak - Dogu yol" },
+      "properties": { "name": "gorev_3", "description": "3. Durak" },
       "geometry": { "type": "Point", "coordinates": [20.0, -22.0] }
     },
     {
       "type": "Feature",
-      "properties": { "name": "gorev_5", "description": "5. Durak - Kuzey viraj" },
-      "geometry": { "type": "Point", "coordinates": [25.0, -12.0] }
-    },
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_6", "description": "6. Durak - Ust yol" },
+      "properties": { "name": "gorev_4", "description": "4. Durak (FİNİSH)" },
       "geometry": { "type": "Point", "coordinates": [25.0, -6.0] }
-    },
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_7", "description": "7. Durak - Bati donus" },
-      "geometry": { "type": "Point", "coordinates": [15.0, -4.0] }
-    },
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_8", "description": "8. Durak - Orta kavsakk" },
-      "geometry": { "type": "Point", "coordinates": [11.0, -7.0] }
-    },
-    # --- KUZEY BOLGE (yeni - haritanin uzak noktalari) ---
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_9", "description": "9. Durak - Kuzeybati giris" },
-      "geometry": { "type": "Point", "coordinates": [5.0, 5.0] }
-    },
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_10", "description": "10. Durak - Bati kenar" },
-      "geometry": { "type": "Point", "coordinates": [-3.0, 15.0] }
-    },
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_11", "description": "11. Durak - Kuzeybati kose" },
-      "geometry": { "type": "Point", "coordinates": [5.0, 25.0] }
-    },
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_12", "description": "12. Durak - Kuzey merkez" },
-      "geometry": { "type": "Point", "coordinates": [15.0, 30.0] }
-    },
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_13", "description": "13. Durak - Kuzeydogu kose" },
-      "geometry": { "type": "Point", "coordinates": [25.0, 25.0] }
-    },
-    {
-      "type": "Feature",
-      "properties": { "name": "gorev_14", "description": "14. Durak - Dogu kenar (FINISH)" },
-      "geometry": { "type": "Point", "coordinates": [28.0, 8.0] }
     }
   ]
 }
-
-# Ana hedeflerde durma suresi (saniye)
-DURAK_BEKLEME_SURESI = 3.0
 
 # ==========================================
 #   D* LITE PLANNER
@@ -184,6 +130,7 @@ class DLitePlanner:
 # ==========================================
 #          YÖNETİCİ SINIFI
 # ==========================================
+
 class HedefYoneticisi:
     def __init__(self):
         rospy.init_node('hedef_yoneticisi')
@@ -199,17 +146,17 @@ class HedefYoneticisi:
         self.geo_targets_grid = []
         
         self.planner = DLitePlanner()
-        
-        plt.ion() 
+        self.mission_complete = False
+        self.last_task_advance_time = 0.0
+        self.son_hesaplama_zamani = 0.0
+        self.post_stop_grace = False  # Durak sonrası forward filtre bypass
+        self._last_wp_advance_time = 0.0  # varildi flooding throttle
+
+        plt.ion()
         self.fig, self.ax = plt.subplots(figsize=(10, 10))
         self.ax.set_aspect('equal')
-        
-        self.pub_hedef = rospy.Publisher('/hedef', String, queue_size=10)
-        self.pub_karar = rospy.Publisher('/karar', String, queue_size=10)
 
-        # Ana hedefte bekleme durumu
-        self.durak_waiting = False
-        self.durak_wait_start = 0.0
+        self.pub_hedef = rospy.Publisher('/hedef', String, queue_size=10)
 
         rospy.Subscriber('/map', OccupancyGrid, self.map_callback)
         rospy.Subscriber('/waypoint', MarkerArray, self.marker_callback)
@@ -221,12 +168,9 @@ class HedefYoneticisi:
     def loop(self):
         rate = rospy.Rate(10)
         while not rospy.is_shutdown():
-            # Son durakta bekleme (sadece tum gorevler bittiginde)
-            if self.durak_waiting:
-                self.pub_karar.publish("dur")
-            elif self.is_path_calculated:
+            if self.is_path_calculated:
                 self.publish_current_waypoint()
-
+            
             if self.new_data_available:
                 self.draw()
                 self.new_data_available = False
@@ -251,7 +195,10 @@ class HedefYoneticisi:
             else: return
         else:
             rx, ry = self.robot_grid_pos
-            start_node = min(self.planner.nodes, key=lambda n: (n[0]-rx)**2 + (n[1]-ry)**2)
+
+            # Aracin tam oldugu konuma en yakin graph dugumunu bul
+            start_node = min(self.planner.nodes,
+                             key=lambda n: (n[0] - rx)**2 + (n[1] - ry)**2)
         
         if self.current_task_index >= len(self.geo_targets_grid):
             print(">>> TÜM GÖREVLER BİTTİ!")
@@ -259,8 +206,63 @@ class HedefYoneticisi:
             return
 
         goal_node = self.geo_targets_grid[self.current_task_index]
+
+        # --- İLERİ YÖNLÜ (FORWARD-ONLY) BAŞLANGIÇ FİLTRESİ ---
+        # post_stop_grace aktifse (durak sonrası ilk hesaplama) filtreyi atla
+        removed_edges = []
+        if getattr(self, 'robot_yaw', None) is not None and not self.post_stop_grace:
+            yaw = self.robot_yaw
+            neighbors = list(self.planner.adj_list.get(start_node, []))
+
+            for n in neighbors:
+                # Düğümün araca olan açısı (grid koordinatlarında)
+                dx = n[0] - rx
+                dy = n[1] - ry
+                if dx == 0 and dy == 0: continue
+
+                angle_to_n = math.atan2(dy, dx)
+                diff = (angle_to_n - yaw + math.pi) % (2*math.pi) - math.pi
+
+                # 90 dereceden fazla fark varsa (arkasındaysa) kenarı listeye ekle
+                if abs(diff) > (math.pi / 2.0 + 0.1):
+                    removed_edges.append(n)
+
+            # Bütün komşuları silmemek şartıyla (çıkmaz sokak koruması)
+            if len(neighbors) > len(removed_edges):
+                for n in removed_edges:
+                    if n in self.planner.adj_list[start_node]:
+                        self.planner.adj_list[start_node].remove(n)
+                    if start_node in self.planner.adj_list[n]:
+                        self.planner.adj_list[n].remove(start_node)
+            else:
+                removed_edges = [] # Silme işlemi iptal
+
+        # Rotayı hesapla
         path = self.planner.find_path(start_node, goal_node)
-        
+
+        # Silinen kenarları grafiğe geri yükle
+        for n in removed_edges:
+            if n not in self.planner.adj_list[start_node]:
+                self.planner.adj_list[start_node].append(n)
+            if start_node not in self.planner.adj_list[n]:
+                self.planner.adj_list[n].append(start_node)
+
+        # Filtreyle üretilen yol hedefe yanlış yönde mi gidiyor? Fallback: filtresiz yeniden hesapla
+        if path and len(path) >= 2 and removed_edges:
+            dx_path = path[1][0] - start_node[0]
+            dy_path = path[1][1] - start_node[1]
+            dx_goal = goal_node[0] - start_node[0]
+            dy_goal = goal_node[1] - start_node[1]
+            angle_path = math.atan2(dy_path, dx_path)
+            angle_goal = math.atan2(dy_goal, dx_goal)
+            angle_diff = abs((angle_path - angle_goal + math.pi) % (2*math.pi) - math.pi)
+            if angle_diff > math.radians(120):
+                print(f">>> [FORWARD FILTER] Üretilen yol hedefe ters yönde ({math.degrees(angle_diff):.0f}°). Filtresiz yeniden hesaplanıyor.")
+                path = self.planner.find_path(start_node, goal_node)
+
+        # Grace flag'i kapat
+        self.post_stop_grace = False
+
         if path:
             self.full_path_grid = path
             self.current_wp_index = 0
@@ -268,54 +270,111 @@ class HedefYoneticisi:
             print(f">>> [ROTA] {len(path)} adet Waypoint oluşturuldu.")
         else:
             print("!!! [HATA] Rota bulunamadı!")
+            self.is_path_calculated = False
+            self.full_path_grid = []
 
     def publish_current_waypoint(self):
-        if self.current_wp_index >= len(self.full_path_grid): return
-        gx, gy = self.full_path_grid[self.current_wp_index]
-        wx, wy = self.grid_to_world(gx, gy)
-        # Sonraki hedefi de ekle (varsa)
-        next_idx = self.current_wp_index + 1
-        if next_idx < len(self.full_path_grid):
-            gx2, gy2 = self.full_path_grid[next_idx]
-            wx2, wy2 = self.grid_to_world(gx2, gy2)
-            msg = f"{wx:.2f},{wy:.2f};{wx2:.2f},{wy2:.2f}"
-        else:
-            msg = f"{wx:.2f},{wy:.2f}"
+        if not self.is_path_calculated or not self.full_path_grid:
+            return
+
+        # WP1: Mevcut hedef waypoint
+        wp1_index = min(self.current_wp_index, len(self.full_path_grid) - 1)
+        # WP2: Bir sonraki waypoint (bakış hedefi)
+        wp2_index = min(wp1_index + 1, len(self.full_path_grid) - 1)
+
+        wx1, wy1 = self.grid_to_world(self.full_path_grid[wp1_index][0], self.full_path_grid[wp1_index][1])
+        wx2, wy2 = self.grid_to_world(self.full_path_grid[wp2_index][0], self.full_path_grid[wp2_index][1])
+
+        msg = f"{wx1:.2f},{wy1:.2f}|{wx2:.2f},{wy2:.2f}"
         self.pub_hedef.publish(msg)
 
-    def varildi_callback(self, msg):
-        if self.durak_waiting:
-            return  # Bekleme sirasinda yeni varildi'lari yoksay
-
-        if self.is_path_calculated and self.current_wp_index < len(self.full_path_grid) - 1:
-            # Ara waypoint - sadece index ilerle, durma yok
-            self.current_wp_index += 1
-        elif self.is_path_calculated and self.current_wp_index >= len(self.full_path_grid) - 1:
-            # ANA HEDEF tamamlandi
-            self.current_task_index += 1
-            self.is_path_calculated = False
-            if self.current_task_index < len(self.geo_targets_grid):
-                # Ara durak - durma yok, hemen sonraki hedefe gec
-                gorev_no = self.current_task_index
-                print(f">>> [DURAK TAMAM] Durak {gorev_no} bitti. Devam ediliyor...")
-                self.recalculate_path_from_robot()
-            else:
-                # SON DURAK - sadece burada dur
-                import time
-                print(">>> TEBRIKLER! TUM DURAKLAR GEZILDI.")
-                self.durak_waiting = True
-                self.durak_wait_start = time.time()
-                self.pub_karar.publish("dur")
 
     def konum_callback(self, msg):
-        self.robot_x = msg.x; self.robot_y = msg.y; self.robot_yaw = msg.theta
+        self.robot_x = msg.x
+        self.robot_y = msg.y
+        self.robot_yaw = msg.theta
         self.robot_grid_pos = self.world_to_grid(self.robot_x, self.robot_y)
-        
+
         pos_valid = (self.robot_grid_pos is not None and self.robot_grid_pos[0] is not None)
-        
-        if not self.is_path_calculated and self.planner.nodes and self.geo_targets_grid and pos_valid:
-             self.recalculate_path_from_robot()
+        if not pos_valid or self.mission_complete:
+            self.new_data_available = True
+            return
+
+        # 1. Durum: Henüz hiç rota çizilmemişse
+        if not self.is_path_calculated and self.planner.nodes and self.geo_targets_grid:
+            self.recalculate_path_from_robot()
+
+        # 2. Durum: Rota var ama araç rotadan koptuysa
+        elif self.is_path_calculated and self.full_path_grid:
+            min_dist = float('inf')
+            for i in range(self.current_wp_index, len(self.full_path_grid)):
+                gx, gy = self.full_path_grid[i]
+                wx, wy = self.grid_to_world(gx, gy)
+                d = math.hypot(self.robot_x - wx, self.robot_y - wy)
+                if d < min_dist:
+                    min_dist = d
+
+            sapma_esigi = 15.0  # 5m→15m: viraj sırasında geçici uzaklaşma yeniden hesaplamayı tetiklemesin
+            if min_dist > sapma_esigi and (time.time() - self.son_hesaplama_zamani > 20.0):
+                print(f">>> [DİKKAT] Araç rotadan {min_dist:.1f}m uzaklaştı! Rota güncelleniyor...")
+                self.recalculate_path_from_robot()
+                self.son_hesaplama_zamani = time.time()
+
         self.new_data_available = True
+    
+    def _advance_wp_index(self):
+        """Arabanın konumuna en yakın waypoint'i bul ve 2 ileri kaydır"""
+        if not self.full_path_grid:
+            return
+        closest_idx = self.current_wp_index
+        min_dist = float('inf')
+        for i in range(self.current_wp_index, len(self.full_path_grid)):
+            gx, gy = self.full_path_grid[i]
+            wx, wy = self.grid_to_world(gx, gy)
+            d = math.hypot(self.robot_x - wx, self.robot_y - wy)
+            if d < min_dist:
+                min_dist = d
+                closest_idx = i
+        self.current_wp_index = min(closest_idx + 1, len(self.full_path_grid) - 1)
+
+    def varildi_callback(self, msg):
+        """
+        /gorev_durumu topic'inden 'varildi' gelince:
+        """
+        if not self.is_path_calculated or self.mission_complete:
+            return
+
+        # Görev değişikliği cooldown - çoklu varildi ile durak atlama önleme (5 sn)
+        now = time.time()
+        if now - self.last_task_advance_time < 5.0:
+            # varildi flooding koruması: micro-WP ilerletmeyi en fazla 1Hz'e throttle'la
+            if now - self._last_wp_advance_time > 1.0:
+                self._advance_wp_index()
+                self._last_wp_advance_time = now
+            return
+
+        # Robot'un anlik hedef noktaya olan kus ucusu mesafesini kontrol et
+        gx, gy = self.geo_targets_grid[self.current_task_index]
+        wx, wy = self.grid_to_world(gx, gy)
+        mesafe = math.hypot(self.robot_x - wx, self.robot_y - wy)
+
+        # Hedef duraga 5.0 metreden yakinsak gercekten varildi sayilir
+        if mesafe < 5.0:
+            self.current_task_index += 1
+            self.last_task_advance_time = now
+            if self.current_task_index >= len(self.geo_targets_grid):
+                print(">>> TÜM GÖREVLER TAMAMLANDI!")
+                self.is_path_calculated = False
+                self.full_path_grid = []
+                self.mission_complete = True
+                return
+            next_name = GOREV_GEOJSON['features'][self.current_task_index]['properties']['name']
+            print(f">>> DURAK TAMAMLANDI! Yeni hedef: {next_name} (index: {self.current_task_index})")
+            self.post_stop_grace = True  # Durak sonrası forward filtre bypass aktif
+            self.recalculate_path_from_robot()
+        else:
+            self._advance_wp_index()
+            print(f">>> ARA HEDEFE VARILDI: Mesafe {mesafe:.1f}m. Index: {self.current_wp_index}")
 
     def map_callback(self, msg):
         self.map_info = msg.info
@@ -327,14 +386,14 @@ class HedefYoneticisi:
     def marker_callback(self, msg):
         if self.np_map is None and 'map' not in self.viz_data: return
         updated = False
+        
         for m in msg.markers:
-            if m.ns != "edges":
-                continue
             pts = m.points
-            # LINE_LIST: noktalar cift cift gelir [start1,end1, start2,end2, ...]
+            # LINE_LIST mantığına uygun olarak 2'şerli atlayarak oku (step=2)
             for i in range(0, len(pts) - 1, 2):
                 p1 = self.world_to_grid(pts[i].x, pts[i].y)
                 p2 = self.world_to_grid(pts[i+1].x, pts[i+1].y)
+                
                 if p1[0] is not None and p2[0] is not None:
                     if p1 not in self.planner.adj_list:
                         self.planner.add_edge(p1, p2); updated = True
@@ -347,9 +406,12 @@ class HedefYoneticisi:
                 tg_grid = self.world_to_grid(coords[0], coords[1])
                 nearest = min(self.planner.nodes, key=lambda n: (n[0]-tg_grid[0])**2 + (n[1]-tg_grid[1])**2)
                 self.geo_targets_grid.append(nearest)
+                
             if self.robot_grid_pos and self.robot_grid_pos[0] is not None:
                 self.recalculate_path_from_robot()
-        if updated: self.new_data_available = True
+                
+        if updated: 
+            self.new_data_available = True
 
     # ==========================================
     #   ÇİZİM - WAYPOINT GÖRÜNÜMÜ
@@ -358,62 +420,66 @@ class HedefYoneticisi:
         if 'map' not in self.viz_data: return
         self.ax.clear()
         
-        # Harita
+        # Hata önleme için varsayılanlar
+        wp1_idx = 0
+        kalan_wp = 0
+        
+        # 1. Arka Plan Haritası
         self.ax.imshow(self.viz_data['map'], cmap='gray_r', origin='lower', vmin=0, vmax=100)
         
-        # Altyapı Graph'ı (Silik)
+        # 2. TÜM GRAPH NOKTALARI (Düğümler)
+        # Haritadaki tüm olası yol ayrım noktalarını küçük gri noktalar olarak basar
+        if self.planner.nodes:
+            nx, ny = zip(*self.planner.nodes)
+            self.ax.scatter(nx, ny, c='black', s=5, alpha=0.3, label='Yol Noktaları', zorder=1)
+        
+        # 3. Tüm Yol Ağı (Kenarlar - Silik Gri Çizgiler)
         for node, neighbors in self.planner.adj_list.items():
             for n in neighbors:
-                self.ax.plot([node[0], n[0]], [node[1], n[1]], color='gray', alpha=0.3, linewidth=1, zorder=1)
+                self.ax.plot([node[0], n[0]], [node[1], n[1]], color='gray', alpha=0.1, linewidth=0.5, zorder=1)
 
-        # Ana Görev Noktalarını Mavi Yap (Duraklar)
+        # 4. Ana Görev Durakları (GeoJSON - Hedefler)
         if self.geo_targets_grid:
             tx, ty = zip(*self.geo_targets_grid)
-            self.ax.scatter(tx, ty, c='cyan', s=120, edgecolors='black', linewidth=1.5, zorder=3)
+            self.ax.scatter(tx, ty, c='cyan', s=150, edgecolors='black', marker='o', label='Ana Duraklar', zorder=3)
 
-        # --- ROTA: NOKTA NOKTA (WAYPOINT) GÖRÜNÜMÜ ---
+        # 5. EN KISA YOL (Planlanan Rota)
         if self.is_path_calculated and self.full_path_grid:
             px, py = zip(*self.full_path_grid)
+            kalan_wp = len(self.full_path_grid) - self.current_wp_index
             
-            # 1. Rota Çizgisi (Çok silik, sadece göz takibi için)
-            self.ax.plot(px, py, color='red', linewidth=1, alpha=0.3, zorder=2)
+            # Rota Hattı: Kalın ve belirgin kırmızı
+            self.ax.plot(px, py, color='red', linewidth=3, alpha=0.7, label='En Kısa Yol', zorder=2)
             
-            # 2. Waypoint Noktaları (Belirgin Kırmızı Boncuklar)
-            self.ax.scatter(px, py, c='red', s=40, alpha=0.9, zorder=4)
-            
-            # 3. Aktif Hedef (Robot -> Sıradaki Waypoint)
-            if self.current_wp_index < len(self.full_path_grid):
-                target_node = self.full_path_grid[self.current_wp_index]
-                
-                # Başlangıç noktası belirle
-                start_node = None
-                if self.robot_grid_pos and self.robot_grid_pos[0] is not None:
-                    start_node = self.robot_grid_pos
-                elif self.current_wp_index > 0:
-                    start_node = self.full_path_grid[self.current_wp_index - 1]
-                
-                # Turuncu Çizgi ve Sarı Yıldız
-                if start_node:
-                    self.ax.plot([start_node[0], target_node[0]], 
-                                 [start_node[1], target_node[1]], 
-                                 color='orange', linewidth=4, alpha=0.9, zorder=5)
-                
-                self.ax.scatter(target_node[0], target_node[1], c='yellow', s=250, marker='*', edgecolors='red', zorder=6)
+            # WP1 (Sarı Yıldız - Aktif Hedef)
+            wp1_idx = min(self.current_wp_index, len(self.full_path_grid) - 1)
+            t1 = self.full_path_grid[wp1_idx]
+            self.ax.scatter(t1[0], t1[1], c='yellow', s=350, marker='*', edgecolors='red', label='WP1 (Hedef)', zorder=8)
 
-        # Robot
+            # WP2 (Magenta Yıldız - Bakış Hedefi)
+            wp2_idx = min(wp1_idx + 1, len(self.full_path_grid) - 1)
+            t2 = self.full_path_grid[wp2_idx]
+            if wp2_idx > wp1_idx:
+                self.ax.scatter(t2[0], t2[1], c='magenta', s=200, marker='*', edgecolors='black', label='WP2 (Bakis)', zorder=7)
+
+        # 6. Robot (ARABA)
         if self.robot_grid_pos and self.robot_grid_pos[0] is not None:
             rx, ry = self.robot_grid_pos
-            self.ax.scatter(rx, ry, c='lime', s=200, marker='s', edgecolors='black', linewidth=2, zorder=10)
-            if self.robot_yaw is not None:
-                dx = 4.0 * math.cos(self.robot_yaw)
-                dy = 4.0 * math.sin(self.robot_yaw)
-                self.ax.arrow(rx, ry, dx, dy, color='red', width=0.8, head_width=2, zorder=11)
+            self.ax.scatter(rx, ry, c='lime', s=250, marker='s', edgecolors='black', label='Araba', zorder=10)
             
-            txt = self.ax.text(rx+2, ry+2, "ARABA", color='lime', fontweight='bold', fontsize=10, zorder=12)
-            txt.set_path_effects([PathEffects.withStroke(linewidth=2, foreground='black')])
+            # Yön Oku
+            if self.robot_yaw is not None:
+                dx = 6.0 * math.cos(self.robot_yaw)
+                dy = 6.0 * math.sin(self.robot_yaw)
+                self.ax.arrow(rx, ry, dx, dy, color='red', width=1.2, head_width=4, zorder=11)
 
-        self.ax.set_title(f"Rota: {self.current_wp_index}/{len(self.full_path_grid)} Waypoint", color='black')
+        # 7. LEJANT (Grafik Notları)
+        self.ax.legend(loc='upper right', prop={'size': 7}, framealpha=0.5)
+
+        # Başlık ve Bilgi
+        self.ax.set_title(f"Rota Takibi | Hedef Index: {wp1_idx} | Kalan: {kalan_wp}", fontsize=12, fontweight='bold')
         self.ax.axis('off')
+        
         plt.draw()
 
     def grid_to_world(self, gx, gy):
