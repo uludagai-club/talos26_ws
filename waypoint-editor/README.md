@@ -4,6 +4,27 @@ Gazebo simulasyonundaki pist haritasi uzerinde interaktif waypoint olusturma ara
 
 ![Kalibrasyon Dogrulama](docs/calibration_check.png)
 
+## Projeyi Klonlama
+
+```bash
+# Repoyu klonla
+git clone git@github.com:uludagai-club/talos26_ws.git
+
+# Klasore gir
+cd talos26_ws
+```
+
+> **Not:** SSH key'in GitHub hesabina ekli olmasi gerekir. HTTPS ile klonlamak istersen:
+> ```bash
+> git clone https://github.com/uludagai-club/talos26_ws.git
+> ```
+
+Sonraki guncellemeleri almak icin:
+
+```bash
+git pull origin main
+```
+
 ## Kurulum
 
 ```bash
