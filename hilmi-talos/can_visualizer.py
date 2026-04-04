@@ -4,16 +4,20 @@ import can
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.widgets import Button
+from matplotlib.patches import Polygon as MplPolygon
 import numpy as np
 from collections import deque
 import time
 import sys
 import threading
+import json
+import os
 import rospy
 from nav_msgs.msg import Odometry, OccupancyGrid
 from std_msgs.msg import String
 from visualization_msgs.msg import MarkerArray
 from tf.transformations import euler_from_quaternion
+from PIL import Image
 # Import CANDecoder
 try:
     from can_decoder import CANDecoder, CANMessageID
@@ -24,6 +28,19 @@ except ImportError:
 # Konfigürasyon
 CAN_INTERFACE = 'vcan0'
 MAP_WINDOW_SIZE = 25.0  # Metre (Harita görüş alanı yarıçapı)
+
+# Araç boyutları (TALOS golf arabası, metre)
+VEHICLE_LENGTH = 2.5
+VEHICLE_WIDTH  = 1.2
+WHEELBASE      = 1.8
+WHEEL_LENGTH   = 0.4
+WHEEL_WIDTH    = 0.15
+
+# Pist görüntüsü yolları
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRACK_IMAGE_PATH = os.path.join(SCRIPT_DIR, '..', '..', '..', 'waypoint-editor', 'data', 'track_layout.jpg')
+TRACK_CALIB_PATH = os.path.join(SCRIPT_DIR, '..', '..', '..', 'waypoint-editor', 'track_calibration.json')
+DEFAULT_CALIB = {"x_min": -25.34, "x_max": 40.59, "y_min": -37.83, "y_max": 15.87}
 
 # Waypoints - hedef tesliminden dinamik olarak alınır
 waypoint_list = []  # [(x, y), ...]
@@ -63,6 +80,156 @@ map_image = None       # numpy array (çizim için)
 map_extent = None      # [xmin, xmax, ymin, ymax]
 map_cached = False     # Bir kez çizildikten sonra cache'le
 
+# Pist görüntüsü verileri
+track_overlay_image = None
+track_extent = None
+
+def load_track_image():
+    """Pist görüntüsünü ve kalibrasyon verilerini yükle."""
+    global track_overlay_image, track_extent
+    calib = dict(DEFAULT_CALIB)
+    calib_path = os.path.abspath(TRACK_CALIB_PATH)
+    if os.path.exists(calib_path):
+        with open(calib_path, 'r') as f:
+            calib.update(json.load(f))
+    track_extent = [calib['x_min'], calib['x_max'], calib['y_min'], calib['y_max']]
+
+    img_path = os.path.abspath(TRACK_IMAGE_PATH)
+    if not os.path.exists(img_path):
+        img_path = '/home/hilmi/talos-sim/waypoint-editor/data/track_layout.jpg'
+    if os.path.exists(img_path):
+        img = Image.open(img_path).convert('RGBA')
+        track_overlay_image = np.array(img)
+        print(f"Pist görüntüsü yüklendi: {img.size[0]}x{img.size[1]}")
+    else:
+        print(f"Pist görüntüsü bulunamadı: {img_path}")
+
+load_track_image()
+
+
+def compute_predicted_path(x, y, yaw, steer_deg, horizon=10.0, steps=60):
+    """
+    Bisiklet kinematik modeli ile tahmini dönüş yolunu hesapla.
+    horizon: ileriye kaç metre bakılsın
+    steps: örnekleme adımı
+    Dönüş: (px_array, py_array)
+    """
+    steer_rad = np.radians(steer_deg)
+    ds = horizon / steps  # her adımda kat edilen mesafe
+
+    px = np.zeros(steps + 1)
+    py = np.zeros(steps + 1)
+    heading = yaw
+    px[0], py[0] = x, y
+
+    if abs(steer_rad) < 1e-4:
+        # Düz git
+        for i in range(steps):
+            px[i + 1] = px[i] + ds * np.cos(heading)
+            py[i + 1] = py[i] + ds * np.sin(heading)
+    else:
+        # Dönüş yarıçapı (ön tekerleğe göre dingil açıklığı)
+        R = WHEELBASE / np.tan(steer_rad)
+        dtheta = ds / R  # her adımda yaw değişimi
+        for i in range(steps):
+            heading_mid = heading + dtheta / 2  # Runge-Kutta benzeri ortalam
+            px[i + 1] = px[i] + ds * np.cos(heading_mid)
+            py[i + 1] = py[i] + ds * np.sin(heading_mid)
+            heading += dtheta
+
+    return px, py
+
+
+def create_vehicle_artists(ax, x, y, yaw, steer_deg):
+    """
+    Araç boyutunda Tesla-tarzı poligon çiz.
+    Gövde, kabin, 4 tekerlek (ön tekerlekler dönük), 2 far döndürür.
+    """
+    artists = []
+    half_L = VEHICLE_LENGTH / 2
+    half_W = VEHICLE_WIDTH / 2
+
+    cos_y, sin_y = np.cos(yaw), np.sin(yaw)
+    R = np.array([[cos_y, -sin_y], [sin_y, cos_y]])
+
+    def transform(pts):
+        return pts @ R.T + np.array([x, y])
+
+    # Gövde (sivri burunlu, 7 köşe)
+    taper = 0.08
+    body_pts = np.array([
+        [-half_L,          -half_W],
+        [-half_L,           half_W],
+        [ half_L - 0.3,    half_W],
+        [ half_L,           half_W - taper],
+        [ half_L + 0.15,   0.0],
+        [ half_L,          -half_W + taper],
+        [ half_L - 0.3,   -half_W],
+    ])
+    body = MplPolygon(transform(body_pts), closed=True,
+                      facecolor='#37474F', edgecolor='#B0BEC5',
+                      linewidth=1.5, zorder=5, alpha=0.92)
+    ax.add_patch(body)
+    artists.append(body)
+
+    # Kabin
+    cabin_pts = np.array([
+        [-half_L + 0.4, -half_W + 0.15],
+        [-half_L + 0.4,  half_W - 0.15],
+        [ half_L - 0.6,  half_W - 0.15],
+        [ half_L - 0.6, -half_W + 0.15],
+    ])
+    cabin = MplPolygon(transform(cabin_pts), closed=True,
+                       facecolor='#455A64', edgecolor='none',
+                       zorder=6, alpha=0.75)
+    ax.add_patch(cabin)
+    artists.append(cabin)
+
+    # Tekerlekler
+    rear_ax_x  = -WHEELBASE / 2
+    front_ax_x =  WHEELBASE / 2
+    w_y = half_W - 0.05
+
+    steer_rad = np.radians(steer_deg)
+    cos_s, sin_s = np.cos(steer_rad), np.sin(steer_rad)
+    R_steer = np.array([[cos_s, -sin_s], [sin_s, cos_s]])
+
+    wheel_defs = [
+        (rear_ax_x,  -w_y, None),
+        (rear_ax_x,   w_y, None),
+        (front_ax_x, -w_y, R_steer),
+        (front_ax_x,  w_y, R_steer),
+    ]
+    hw, hh = WHEEL_LENGTH / 2, WHEEL_WIDTH / 2
+    base_wheel = np.array([[-hw, -hh], [-hw, hh], [hw, hh], [hw, -hh]])
+    for wx, wy, R_sw in wheel_defs:
+        wpts = base_wheel.copy()
+        if R_sw is not None:
+            wpts = wpts @ R_sw.T
+        wpts += np.array([wx, wy])
+        wpoly = MplPolygon(transform(wpts), closed=True,
+                           facecolor='#212121', edgecolor='#616161',
+                           linewidth=0.8, zorder=7)
+        ax.add_patch(wpoly)
+        artists.append(wpoly)
+
+    # Farlar
+    for sign in [-1, 1]:
+        hl_pts = np.array([
+            [half_L - 0.05, sign * (half_W - 0.30)],
+            [half_L + 0.05, sign * (half_W - 0.30)],
+            [half_L + 0.05, sign * (half_W - 0.10)],
+            [half_L - 0.05, sign * (half_W - 0.10)],
+        ])
+        hl = MplPolygon(transform(hl_pts), closed=True,
+                        facecolor='#FFEE58', edgecolor='none',
+                        zorder=8, alpha=0.95)
+        ax.add_patch(hl)
+        artists.append(hl)
+
+    return artists
+
+
 # ROS Callback
 def odom_callback(msg):
     global current_x, current_y, current_yaw
@@ -80,14 +247,16 @@ def odom_callback(msg):
         vehicle_path_y.append(current_y)
 
 def hedef_callback(msg):
-    """Hedef tesliminden gelen waypoint (String: 'x,y')"""
+    """Hedef tesliminden gelen waypoint (String: 'x,y' veya 'x1,y1;x2,y2')"""
     global waypoint_list
     try:
-        parts = msg.data.strip().split(',')
-        x, y = float(parts[0]), float(parts[1])
+        segments = msg.data.strip().split(';')
         with data_lock:
-            if (x, y) not in waypoint_list:
-                waypoint_list.append((x, y))
+            for seg in segments:
+                parts = seg.split(',')
+                x, y = float(parts[0]), float(parts[1])
+                if (x, y) not in waypoint_list:
+                    waypoint_list.append((x, y))
     except (ValueError, IndexError):
         pass
 
@@ -238,9 +407,9 @@ t.start()
 
 # --- Matplotlib Arayüzü ---
 plt.style.use('dark_background') # Navigasyon modu için karanlık tema
-fig = plt.figure(figsize=(9, 6))
+fig = plt.figure(figsize=(12, 9))
 fig.canvas.manager.set_window_title('TALOS Navigasyon')
-gs = fig.add_gridspec(2, 3, height_ratios=[2, 1])
+gs = fig.add_gridspec(2, 3, height_ratios=[3, 1])
 
 # 1. Navigasyon Haritası (Üst Kısım - Tam Genişlik)
 ax_map = fig.add_subplot(gs[0, :])
@@ -249,16 +418,26 @@ ax_map.grid(True, linestyle=':', alpha=0.3, color='gray')
 ax_map.set_aspect('equal')
 ax_map.set_facecolor('#1e1e1e') # Koyu gri arka plan
 
+# Pist görüntüsü overlay (statik, bir kez çizilir)
+track_bg_artist = None
+if track_overlay_image is not None and track_extent is not None:
+    track_bg_artist = ax_map.imshow(track_overlay_image, origin='upper',
+                                    extent=track_extent, alpha=0.85,
+                                    zorder=0, interpolation='bilinear')
+
 # Waypoint ve yol çizimleri (dinamik güncellenir)
-line_waypoints, = ax_map.plot([], [], 'ro', markersize=6, alpha=0.8, label='Hedefler', zorder=1)
-line_road_edges, = ax_map.plot([], [], 'y-', linewidth=1, alpha=0.4, label='Yol', zorder=0)
+line_waypoints, = ax_map.plot([], [], 'ro', markersize=6, alpha=0.8, label='Hedefler', zorder=3)
+line_road_edges, = ax_map.plot([], [], 'y-', linewidth=1, alpha=0.4, label='Yol', zorder=2)
 
 # Araç yolu
-line_path, = ax_map.plot([], [], 'c-', linewidth=2, alpha=0.6, label='İz', zorder=2)
+line_path, = ax_map.plot([], [], 'c-', linewidth=2, alpha=0.6, label='İz', zorder=4)
 
-# Araç (Ok işareti ile yön)
-# Başlangıçta boş, update'de güncellenecek
-arrow_vehicle = ax_map.arrow(0, 0, 0, 0, head_width=1, head_length=1, fc='lime', ec='lime', zorder=3)
+# Araç poligonu (her frame'de yeniden oluşturulur)
+vehicle_artists = []
+
+# Tesla-tarzı tahmini dönüş yolu
+line_predicted, = ax_map.plot([], [], color='#00E5FF', linewidth=2.5,
+                               alpha=0.85, linestyle='-', zorder=9)
 
 # 2. Direksiyon (Alt Sol)
 ax_steer = fig.add_subplot(gs[1, 0], projection='polar')
@@ -324,10 +503,10 @@ btn_start.on_clicked(on_start_clicked)
 plt.tight_layout()
 plt.subplots_adjust(top=0.9, hspace=0.3)
 
-map_bg_artist = None  # Cache'lenmiş harita arka plan artist
+map_bg_artist = None  # Cache'lenmiş harita arka plan artist (OccupancyGrid fallback)
 
 def update_plot(frame):
-    global arrow_vehicle, map_bg_artist, map_cached
+    global map_bg_artist, map_cached, vehicle_artists, track_bg_artist
 
     with data_lock:
         c_gear = current_gear
@@ -350,9 +529,9 @@ def update_plot(frame):
         m_ext = map_extent
         m_cached = map_cached
 
-    # --- Harita arka planı (/map) ---
-    if m_img is not None and not m_cached:
-        # Eski harita artist'ini kaldır
+    # --- Harita arka planı ---
+    # Track image statik çiziliyor; yoksa OccupancyGrid fallback kullan
+    if track_bg_artist is None and m_img is not None and not m_cached:
         if map_bg_artist is not None:
             try:
                 map_bg_artist.remove()
@@ -382,18 +561,19 @@ def update_plot(frame):
     # İz çiz
     line_path.set_data(path_x, path_y)
     
-    # Aracı Ok Olarak Çiz (Eski oku sil, yenisini çiz)
-    if arrow_vehicle:
-        arrow_vehicle.remove()
-    
-    # Ok uzunluğu ve yönü
-    arrow_len = 2.0
-    dx = arrow_len * np.cos(cyaw)
-    dy = arrow_len * np.sin(cyaw)
-    
-    arrow_vehicle = ax_map.arrow(cx, cy, dx, dy, 
-                               head_width=1.5, head_length=1.5, 
-                               fc='lime', ec='white', zorder=3, width=0.3)
+    # Araç poligonunu çiz (eski frame'dekileri kaldır)
+    for artist in vehicle_artists:
+        try:
+            artist.remove()
+        except ValueError:
+            pass
+    vehicle_artists = create_vehicle_artists(ax_map, cx, cy, cyaw, c_steer)
+
+    # Tesla-tarzı tahmini dönüş yolunu çiz (ön akstan başlat)
+    front_ax_x = cx + (WHEELBASE / 2) * np.cos(cyaw)
+    front_ax_y = cy + (WHEELBASE / 2) * np.sin(cyaw)
+    pred_x, pred_y = compute_predicted_path(front_ax_x, front_ax_y, cyaw, c_steer, horizon=12.0, steps=80)
+    line_predicted.set_data(pred_x, pred_y)
 
     # Haritayı araca ortala (Takip Modu)
     ax_map.set_xlim(cx - MAP_WINDOW_SIZE, cx + MAP_WINDOW_SIZE)

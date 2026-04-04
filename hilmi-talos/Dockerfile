@@ -1,26 +1,35 @@
 FROM ros:noetic-ros-base
 
-# Çalışma dizini
-WORKDIR /app
+LABEL maintainer="TALOS Team"
+LABEL description="TALOS Otonom Sürüş Kontrol Sistemi"
 
 # Sistem bağımlılıkları
 RUN apt-get update && apt-get install -y \
     python3-pip \
+    python3-can \
     can-utils \
     iproute2 \
+    kmod \
+    ros-noetic-tf \
+    ros-noetic-tf2-ros \
+    python3-tk \
     && rm -rf /var/lib/apt/lists/*
+
+# Çalışma dizini
+WORKDIR /app
 
 # Python bağımlılıkları
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Uygulama dosyalarını kopyala
-COPY *.py ./
-COPY *.sh ./
-RUN chmod +x *.sh *.py
+# Dosyaları kopyala
+COPY control.py .
+COPY entrypoint.sh .
+COPY talos_control.md .
 
-# ROS ortamını yükle
-RUN echo "source /opt/ros/noetic/setup.bash" >> ~/.bashrc
+# Entrypoint'i çalıştırılabilir yap
+RUN chmod +x entrypoint.sh
 
-# Varsayılan komut
-CMD ["python3", "can_waypoint_follower.py"]
+# Entrypoint
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["control.py"]

@@ -1,0 +1,34 @@
+# Docker image export'ları (~24 GB, USB/Drive ile dağıtılır)
+*.tar
+
+# ROS bag dosyaları
+*.bag
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# ROS build/devel
+build/
+devel/
+install/
+
+# Log dosyaları
+logs/
+*.log
+lane_log.txt
+hilmi-talos/logs/
+
+# Model ağırlıkları (image'larla birlikte dağıtılır)
+lane/models/*.pt
+lane/models/*.onnx
+
+# Eski arşiv dizini
+archive/
+
+# OS / editör
+.vscode/
+*.swp
+*~
+.DS_Store

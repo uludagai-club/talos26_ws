@@ -1,35 +1,16 @@
-version: '3.8'
-
 services:
-  waypoint-follower:
+  talos-control:
     build: .
-    container_name: talos-waypoint
+    image: talos-control:latest
+    container_name: talos-controller
     network_mode: host
     privileged: true
+    cap_add:
+      - NET_ADMIN
     environment:
       - ROS_MASTER_URI=http://localhost:11311
-      - DISPLAY=${DISPLAY}
+      - ROS_IP=127.0.0.1
     volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix
-    command: python3 can_waypoint_follower.py
-    restart: unless-stopped
-
-  can-bridge:
-    build: .
-    container_name: talos-can-bridge
-    network_mode: host
-    privileged: true
-    environment:
-      - ROS_MASTER_URI=http://localhost:11311
-    command: python3 can_to_talos_cart.py
-    restart: unless-stopped
-
-  state-bridge:
-    build: .
-    container_name: talos-state-bridge
-    network_mode: host
-    privileged: true
-    environment:
-      - ROS_MASTER_URI=http://localhost:11311
-    command: python3 talos_state_to_can.py
+      - ./logs:/app/logs
+      - ./control.py:/app/control.py:ro
     restart: unless-stopped

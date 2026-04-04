@@ -1,57 +1,233 @@
+# TALOS Otonom Sürüş - Tam Sistem Docker Compose
+# Kullanım:
+#   1. ./setup-vcan.sh          (vcan0 + X11, bir kez çalıştır)
+#   2. docker compose up        (tüm sistemi başlat)
+#   3. docker compose --profile gui up  (can-visualizer dahil)
+#
+# Geliştirme: Python dosyasını düzenle → docker compose restart <servis>
+# Rebuild:    docker compose build talos-controller
+
 services:
-  waypoint-follower:
-    build: .
-    container_name: talos-waypoint
+
+  # =========================================================
+  # KONUM SERVISI
+  # =========================================================
+  konum-server:
+    image: konum:latest
+    container_name: konum-server
     network_mode: host
-    privileged: true
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+    volumes:
+      - ./fixes/konum.py:/app/konum.py:ro
+    restart: "no"
+
+  # =========================================================
+  # HARITA + WAYPOINT SERVISI
+  # =========================================================
+  talos-map-server:
+    image: talos-map-server:latest
+    container_name: talos-map-server
+    network_mode: host
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+    volumes:
+      - ./fixes/waypoint_pub.py:/app/waypoint_pub.py:ro
+    restart: "no"
+
+  # =========================================================
+  # HEDEF TESLIMI (matplotlib GUI)
+  # =========================================================
+  hedef-teslimi:
+    image: hedef-yoneticisi:latest
+    container_name: hedef_teslimi
+    network_mode: host
     environment:
       - ROS_MASTER_URI=http://localhost:11311
       - DISPLAY=${DISPLAY}
-      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-sim/devel/lib/python3/dist-packages
     volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix
-      - ~/talos-sim:/talos-sim:ro
-    command: python3 control.py
-    restart: unless-stopped
+      - ./fixes/hedef_yoneticisi.py:/app/hedef_yoneticisi.py:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    restart: "no"
 
+  # =========================================================
+  # ENGEL ALGILAMA (GPU)
+  # =========================================================
+  engel-node:
+    image: otonom-arac:latest
+    container_name: engel-node
+    network_mode: host
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./fixes/engel_node_fixed.py:/app/engel_node_fixed.py:ro
+      - ./fixes/pointcloud_obstacle_publisher.py:/app/pointcloud_obstacle_publisher.py:ro
+    command: >
+      bash -c "source /opt/ros/noetic/setup.bash &&
+               source /root/catkin_ws/devel/setup.bash &&
+               rosrun pointcloud_to_laserscan pointcloud_to_laserscan_node
+                 cloud_in:=/cart/center_laser/scan
+                 scan:=/converted_scan
+                 _min_height:=-1.2
+                 _max_height:=1.0
+                 _range_min:=0.45
+                 _range_max:=100.0 &
+               sleep 2 &&
+               stdbuf -oL python3 -u /app/engel_node_fixed.py &
+               stdbuf -oL python3 -u /app/pointcloud_obstacle_publisher.py &&
+               wait"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
+
+  # =========================================================
+  # TRAFIK ISARETI ALGILAMA (GPU)
+  # =========================================================
+  traffic-node:
+    image: traffic_docker:latest
+    container_name: traffic-node
+    network_mode: host
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./fixes/yolov8_ros_node_fixed.py:/app/yolov8_ros_node_fixed.py:ro
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/yolov8_ros_node_fixed.py"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
+
+  # =========================================================
+  # SERIT TAKIP (GPU, traffic_docker tabanlı)
+  # =========================================================
+  lane-follower:
+    image: traffic_docker:latest
+    container_name: lane-follower
+    network_mode: host
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - DISPLAY=${DISPLAY}
+    volumes:
+      - ./lane/scripts/lane_follow_node.py:/app/lane_follow_node.py:ro
+      - ./lane/models:/app/models:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/lane_follow_node.py"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: "no"
+
+  # =========================================================
+  # KARAR DUGUMU
+  # =========================================================
+  karar-node:
+    image: karar-node:latest
+    container_name: karar-node
+    network_mode: host
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+    volumes:
+      - ./fixes/karar.py:/app/karar.py:ro
+    restart: "no"
+
+  # =========================================================
+  # CAN -> GAZEBO KOPRUSU
+  # talos-control:latest kullanir (python-can + rospy)
+  # ~/talos-sim/devel mount'u cart_sim.msg icin gerekli
+  # =========================================================
   can-bridge:
-    build: .
+    image: talos-control:latest
     container_name: talos-can-bridge
     network_mode: host
     privileged: true
     environment:
       - ROS_MASTER_URI=http://localhost:11311
-      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-sim/devel/lib/python3/dist-packages
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages
     volumes:
-      - ~/talos-sim:/talos-sim:ro
-    command: python3 can_to_talos_cart.py
-    restart: unless-stopped
+      - ./hilmi-talos/can_to_talos_cart.py:/app/can_to_talos_cart.py:ro
+      - ./hilmi-talos/can_decoder.py:/app/can_decoder.py:ro
+      - ~/talos-sim/devel:/talos-devel:ro
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/can_to_talos_cart.py"
+    restart: "no"
 
+  # =========================================================
+  # GAZEBO -> CAN KOPRUSU
+  # =========================================================
   state-bridge:
-    build: .
+    image: talos-control:latest
     container_name: talos-state-bridge
     network_mode: host
     privileged: true
     environment:
       - ROS_MASTER_URI=http://localhost:11311
-      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-sim/devel/lib/python3/dist-packages
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages
     volumes:
-      - ~/talos-sim:/talos-sim:ro
-    command: python3 talos_state_to_can.py
-    restart: unless-stopped
+      - ./hilmi-talos/talos_state_to_can.py:/app/talos_state_to_can.py:ro
+      - ./hilmi-talos/can_decoder.py:/app/can_decoder.py:ro
+      - ~/talos-sim/devel:/talos-devel:ro
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/talos_state_to_can.py"
+    restart: "no"
 
-  visualizer:
-    build: .
-    container_name: talos-visualizer
+  # =========================================================
+  # TALOS KONTROLCU (ana kontrol, build edilebilir)
+  # =========================================================
+  talos-controller:
+    build:
+      context: ./hilmi-talos
+    image: talos-control:latest
+    container_name: talos-controller
     network_mode: host
     privileged: true
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_IP=127.0.0.1
+    volumes:
+      - ./hilmi-talos/control.py:/app/control.py:ro
+      - ./hilmi-talos/logs:/app/logs
+    restart: "no"
+
+  # =========================================================
+  # CAN GORSELLESTIRICI (opsiyonel, --profile gui ile)
+  # =========================================================
+  can-visualizer:
+    profiles: [gui]
+    image: talos-control:latest
+    container_name: talos-can-visualizer
+    network_mode: host
     environment:
       - ROS_MASTER_URI=http://localhost:11311
       - DISPLAY=${DISPLAY}
-      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-sim/devel/lib/python3/dist-packages
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages
     volumes:
-      - /tmp/.X11-unix:/tmp/.X11-unix
-      - ~/talos-sim:/talos-sim:ro
-      - ~/.Xauthority:/root/.Xauthority:ro
-    command: python3 can_visualizer.py
-    restart: unless-stopped
+      - ./hilmi-talos/can_visualizer.py:/app/can_visualizer.py:ro
+      - ./hilmi-talos/can_decoder.py:/app/can_decoder.py:ro
+      - ~/talos-sim/devel:/talos-devel:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/can_visualizer.py"
+    restart: "no"

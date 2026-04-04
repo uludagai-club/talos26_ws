@@ -19,8 +19,8 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Uygulama dosyalarını kopyala
 COPY *.py ./
-COPY *.sh ./
-RUN chmod +x *.sh *.py
+COPY talos_control.md ./
+RUN chmod +x *.py
 
 # ROS ortamını yükle
 RUN echo "source /opt/ros/noetic/setup.bash" >> ~/.bashrc

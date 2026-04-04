@@ -91,7 +91,7 @@ LANE_CHANGE_STEER = 20.0    # derece - şerit değiştirme direksiyon açısı
 LANE_CHANGE_DURATION = 2.0  # saniye - şerit değiştirme süresi
 
 # Gercek gorev duraklari (hedef_yoneticisi'ndeki GeoJSON ile ayni)
-GOREV_NOKTALARI = [(-5.0, -34.0), (11.0, -25.0), (20.0, -22.0), (25.0, -6.0)]
+GOREV_NOKTALARI = []
 GOREV_THRESHOLD = 3.0       # metre - duraga varis esigi
 GOREV_COOLDOWN = 10.0       # saniye - ayni duraga tekrar varildi engeli
 WP_NEAR_DISTANCE = 1.5      # metre - WP1'e yakinken WP2'ye gec (lookahead)
@@ -144,7 +144,7 @@ class PIDController:
     """
 
     def __init__(self, kp=1.0, ki=0.0, kd=0.0, output_min=-1.0, output_max=1.0,
-                 integral_limit=5.0, derivative_filter=0.1, name="PID"):
+                 integral_limit=5.0, derivative_filter=0.1, name="PID", angular=False):
         """
         Args:
             kp: Proportional kazanç
@@ -164,6 +164,7 @@ class PIDController:
         self.integral_limit = integral_limit
         self.derivative_filter = derivative_filter
         self.name = name
+        self.angular = angular  # Açısal ölçüm için yaw wrap normalizasyonu
 
         # İç durum
         self.integral = 0.0
@@ -222,7 +223,12 @@ class PIDController:
         # measurement üzerinden türev al (varsa)
         if measurement is not None and self.prev_measurement is not None:
             # Measurement-based derivative (daha pürüzsüz)
-            raw_derivative = -(measurement - self.prev_measurement) / self.dt
+            meas_diff = measurement - self.prev_measurement
+            if self.angular:
+                # Yaw ±π sınırında wrap-around spike'ını önle
+                while meas_diff > math.pi:  meas_diff -= 2 * math.pi
+                while meas_diff < -math.pi: meas_diff += 2 * math.pi
+            raw_derivative = -meas_diff / self.dt
         else:
             # Error-based derivative (klasik)
             raw_derivative = (error - self.prev_error) / self.dt
@@ -349,9 +355,11 @@ class CANWaypointFollower:
 
         # Gorev duragi takibi
         self.last_gorev_varildi_time = {}  # {durak_idx: timestamp} cooldown per durak
+        self.completed_goreve = set()       # Kalıcı tamamlanan duraklar - bir daha tetiklenmez
         self.current_stop_waiting = False   # Durakta bekleme aktif mi
         self.current_stop_wait_start = 0.0  # Durakta bekleme baslangic zamani
         self.last_wp_varildi_time = 0.0     # Mikro-WP varildi throttle
+        self.post_stop_time = 0.0           # Son durak bekleme bitiş zamanı (flip-flop grace)
 
         # Karar durumu
         self.karar = Karar.NORMAL
@@ -393,7 +401,8 @@ class CANWaypointFollower:
             output_max=MAX_STEER_ANGLE,
             integral_limit=2.0,
             derivative_filter=0.2,
-            name="Steer"
+            name="Steer",
+            angular=True
         )
 
         # Adaptif PID ayarları
@@ -511,15 +520,18 @@ class CANWaypointFollower:
             # --- FLIP-FLOP FİLTRESİ ---
             # Hedef >10m ziplayinca: yon kontrolu yap
             # Aracin mevcut yonune gore >90° arkaya isaret ediyorsa REDDET
+            # İstisna: Durak sonrası 3 saniye grace period - doğru yeni hedefleri kabul et
             if self.dynamic_target is not None:
                 jump_dist = math.sqrt((x - self.dynamic_target[0])**2 + (y - self.dynamic_target[1])**2)
-                if jump_dist > 10.0:
-                    # Yeni hedefin aracin arkasinda olup olmadigini kontrol et
-                    heading_to_new = math.atan2(y - self.y, x - self.x)
-                    heading_diff = abs((heading_to_new - self.yaw + math.pi) % (2 * math.pi) - math.pi)
-                    if heading_diff > math.radians(90):
-                        # Arkaya dogru ziplama - flip-flop, reddet
-                        return
+                if jump_dist > 5.0:
+                    in_grace = (time.time() - self.post_stop_time) < 3.0
+                    if not in_grace:
+                        # Yeni hedefin aracin arkasinda olup olmadigini kontrol et
+                        heading_to_new = math.atan2(y - self.y, x - self.x)
+                        heading_diff = abs((heading_to_new - self.yaw + math.pi) % (2 * math.pi) - math.pi)
+                        if heading_diff > math.radians(90):
+                            # Arkaya/ters yonde ziplama - flip-flop, reddet
+                            return
 
             old_target = self.dynamic_target
             self.dynamic_target = (x, y)
@@ -735,11 +747,17 @@ class CANWaypointFollower:
             else:
                 # Bekleme bitti, normal suruse don
                 self.current_stop_waiting = False
-                self.logger.log("Durak beklemesi bitti, devam ediliyor")
+                self.steer_pid.reset()
+                self.speed_pid.reset()
+                self.post_stop_time = time.time()
+                self.logger.log("Durak beklemesi bitti, PID sifirlandi, devam ediliyor")
                 return False
 
         # Her duraga mesafe kontrol et
         for idx, (gx, gy) in enumerate(GOREV_NOKTALARI):
+            # Tamamlanan durakları kalıcı olarak atla
+            if idx in self.completed_goreve:
+                continue
             dist = self._distance_to(gx, gy)
             if dist < GOREV_THRESHOLD:
                 # Cooldown kontrolu - ayni duraga tekrar varildi gondermeyi engelle
@@ -747,7 +765,8 @@ class CANWaypointFollower:
                 if now - last_time < GOREV_COOLDOWN:
                     continue
 
-                # Duraga vardik!
+                # Duraga vardik! Kalıcı olarak tamamlandı işaretle
+                self.completed_goreve.add(idx)
                 self.last_gorev_varildi_time[idx] = now
                 self.logger.log(f"GOREV DURAGI #{idx+1} VARILDI: ({gx:.1f}, {gy:.1f}) mesafe={dist:.1f}m")
                 # NOT: varildi mesaji buradan gonderilmez, sadece mikro-wp varildi (satir ~1008) gonderir.
