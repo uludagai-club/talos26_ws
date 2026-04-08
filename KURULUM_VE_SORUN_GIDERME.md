@@ -9,7 +9,8 @@ Tarih: 2026-04-08
 ```
 ~/talos-sim/                      # Ana catkin workspace
 ├── src/cart_sim/                  # Gazebo simülasyonu
-│   └── msg/cart_control.msg      # Araç kontrol mesajı (handbrake dahil)
+│   ├── msg/cart_control.msg      # Araç kontrol mesajı (handbrake dahil)
+│   └── plugins/CartPlugin.cc     # Gazebo araç fiziği (handbrake desteği gerekli)
 ├── devel/                         # catkin_make çıktısı (cart_sim.msg burada)
 ├── build/
 └── scripts/
@@ -27,6 +28,8 @@ Tarih: 2026-04-08
 ---
 
 ## 2. Simülasyon Derleme (catkin_make)
+
+Temiz bir klonlama sonrası **3 düzeltme** gerekir. Hepsi yapıldıktan sonra tek bir `catkin_make` yeterlidir.
 
 ### Sorun 1: `CMP0100` Policy Hatası
 
@@ -54,9 +57,10 @@ endif()
 
 **Sebep:** `cart_control.msg` dosyasında `handbrake` alanı tanımlı değil. `can_to_talos_cart.py` ve `talos_state_to_can.py` bu alanı kullanıyor.
 
-**Çözüm:** `~/talos-sim/src/cart_sim/msg/cart_control.msg` dosyasına ekle:
+**Çözüm:** `~/talos-sim/src/cart_sim/msg/cart_control.msg` dosyasının sonuna ekle:
 
 ```
+# Range 0 to 1, 1 is handbrake fully engaged
 float64 handbrake
 ```
 
@@ -76,12 +80,47 @@ uint8 shift_gears
 float64 handbrake
 ```
 
-**Derleme (her iki düzeltmeden sonra):**
+### Sorun 3: Araç Hareket Etmiyor (El Freni Sorunu) - KRİTİK
+
+**Belirti:** Tüm servisler çalışıyor, `/cart` topic'ine mesaj gidiyor, throttle > 0 ama araç kımıldamıyor.
+
+**Sebep:** `CartPlugin.cc` dosyasında iki hata var:
+1. `handbrakePercent` başlangıç değeri `1.0` (el freni çekili başlıyor)
+2. `/cart` mesajındaki `handbrake` alanı plugin tarafından okunmuyor
+
+**Çözüm:** `~/talos-sim/src/cart_sim/plugins/CartPlugin.cc` dosyasında:
+
+**a)** Satır ~250: Başlangıç değerini değiştir:
+```cpp
+// ESKİ:
+public: double handbrakePercent = 1.0;
+
+// YENİ:
+public: double handbrakePercent = 0.0;
+```
+
+**b)** `OnCartCommand` fonksiyonunda (satır ~335), throttle okunduktan sonra handbrake okuma ekle:
+```cpp
+  // Throttle command
+  double throttle = ignition::math::clamp(msg->throttle, 0.0, 1.0);
+  this->dataPtr->gasPedalPercent = throttle;
+
+  // Handbrake command  ← BU BLOĞU EKLE
+  double handbrake = ignition::math::clamp(msg->handbrake, 0.0, 1.0);
+  this->dataPtr->handbrakePercent = handbrake;
+
+  switch (msg->shift_gears)
+```
+
+### Derleme (3 düzeltmeden sonra)
+
 ```bash
 cd ~/talos-sim
 source /opt/ros/noetic/setup.bash
 catkin_make
 ```
+
+> **ÖNEMLİ:** Plugin değişikliği sonrası Gazebo'nun yeniden başlatılması gerekir (plugin .so dosyası yeniden yüklenmeli).
 
 ---
 
@@ -157,6 +196,7 @@ bash baslat.sh
 ```
 
 > `baslat.sh` vcan0 kurulumunu, tüm Docker container'ları ve CAN köprülerini otomatik başlatır.
+> Lane follower GPU container olarak çalışır (`traffic_docker:latest`).
 
 ### Yöntem 2: Docker Compose ile
 
@@ -174,8 +214,9 @@ docker compose up
 
 | Sorun | Çözüm |
 |-------|-------|
-| `CMP0100` cmake hatası | `if(POLICY CMP0100)` koşuluna al (bkz. Bölüm 2) |
-| `handbrake` attribute hatası | `cart_control.msg`'ye `float64 handbrake` ekle + `catkin_make` (bkz. Bölüm 2) |
+| `CMP0100` cmake hatası | `if(POLICY CMP0100)` koşuluna al (bkz. Bölüm 2.1) |
+| `handbrake` attribute hatası | `cart_control.msg`'ye `float64 handbrake` ekle + `catkin_make` (bkz. Bölüm 2.2) |
+| Araç hareket etmiyor | `CartPlugin.cc`'de handbrake düzeltmeleri yap + `catkin_make` + Gazebo yeniden başlat (bkz. Bölüm 2.3) |
 | `Erişim engellendi` (logs/) | `sudo chown -R $USER:$USER hilmi-talos/logs/` |
 | vcan0 bulunamadı | `sudo bash setup-vcan.sh` |
 | ROS master'a bağlanamıyor | Host'ta `roscore` çalışıyor olmalı |
@@ -199,16 +240,23 @@ docker compose up
 | `fixes/karar.py` | karar-node | Hayır |
 | `fixes/yolov8_ros_node_fixed.py` | traffic-node | Hayır |
 | `hilmi-talos/control.py` | talos-controller | Hayır |
-| `hilmi-talos/can_to_talos_cart.py` | can-bridge | Hayır |
-| `hilmi-talos/talos_state_to_can.py` | state-bridge | Hayır |
-| `lane/scripts/lane_follow_node.py` | lane-follower | Hayır |
+| `hilmi-talos/can_to_talos_cart.py` | can-bridge (yerel python) | Hayır |
+| `hilmi-talos/talos_state_to_can.py` | state-bridge (yerel python) | Hayır |
+| `lane/scripts/lane_follow_node.py` | lane-follower (Docker GPU) | Hayır |
 | `hilmi-talos/Dockerfile` | talos-controller | **Evet** |
 | `hilmi-talos/requirements.txt` | talos-controller | **Evet** |
+| `src/cart_sim/plugins/CartPlugin.cc` | Gazebo plugin | **Evet** (`catkin_make` + Gazebo restart) |
+| `src/cart_sim/msg/cart_control.msg` | ROS mesajı | **Evet** (`catkin_make`) |
 
 Rebuild gerektiğinde:
 ```bash
+# Docker servisi için
 docker compose build talos-controller
 docker compose up talos-controller
+
+# Gazebo plugin veya msg değişikliği için
+cd ~/talos-sim && catkin_make
+# Sonra Gazebo'yu yeniden başlat
 ```
 
 Bind mount değişikliğinde sadece restart:
@@ -238,5 +286,5 @@ docker ps
 
 # ROS topic'leri
 rostopic list
-rostopic echo /cmd_vel
+rostopic echo /cart
 ```
