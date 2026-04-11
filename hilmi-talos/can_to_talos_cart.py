@@ -37,9 +37,9 @@ class CANtoTalosCart:
         self.max_steering_angle = 30.0
         
         # --- AYARLAR ---
-        self.POWER_LIMIT = 0.1 
-        self.THROTTLE_RAMP_UP = 0.02   
-        self.THROTTLE_RAMP_DOWN = 0.05 
+        self.POWER_LIMIT = 0.1
+        self.THROTTLE_RAMP_UP = 0.02
+        self.THROTTLE_RAMP_DOWN = 0.05
         
         rospy.loginfo("=" * 70)
         rospy.loginfo("      CAN-to-TALOS-Cart (DOĞAL SÜRÜŞ MODU)")

@@ -32,11 +32,10 @@ cleanup() {
     [ -n "$BRIDGE_PID" ]  && kill $BRIDGE_PID 2>/dev/null
     [ -n "$STATE_PID" ]   && kill $STATE_PID 2>/dev/null
     [ -n "$VIS_PID" ]     && kill $VIS_PID 2>/dev/null
-    [ -n "$LANE_PID" ]    && kill $LANE_PID 2>/dev/null
     docker stop talos-controller talos-map-server hedef_teslimi konum-server \
-                engel-node traffic-node karar-node 2>/dev/null
+                engel-node traffic-node karar-node lane-follower 2>/dev/null
     docker rm -f talos-controller talos-map-server hedef_teslimi konum-server \
-                 engel-node traffic-node karar-node 2>/dev/null
+                 engel-node traffic-node karar-node lane-follower 2>/dev/null
     stty sane 2>/dev/null
     echo -e "${GREEN}[+] Tum konteynerler ve islemler durduruldu${NC}"
 }
@@ -224,12 +223,26 @@ fi
 # =============================================================
 # 9) LANE FOLLOWER (Python, yerel)
 # =============================================================
-echo -e "${BLUE}[9/${TOTAL_STEPS}] Serit takip baslatiliyor (yerel python)...${NC}"
-python3 -u "$SCRIPT_DIR/lane/scripts/lane_follow_node.py" > "$SCRIPT_DIR/logs/lane_node.log" 2>&1 &
-LANE_PID=$!
-sleep 1
-if kill -0 $LANE_PID 2>/dev/null; then
-    echo -e "${GREEN}[+] Serit takip aktif (PID: $LANE_PID, log: logs/lane_node.log)${NC}"
+echo -e "${BLUE}[9/${TOTAL_STEPS}] Serit takip baslatiliyor (Docker GPU)...${NC}"
+docker rm -f lane-follower 2>/dev/null
+docker run -d --rm \
+    --name lane-follower \
+    --network host \
+    --gpus all \
+    -e ROS_MASTER_URI=http://localhost:11311 \
+    -e NVIDIA_VISIBLE_DEVICES=all \
+    -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video \
+    -e DISPLAY=$DISPLAY \
+    -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
+    -v "$SCRIPT_DIR/lane/scripts/lane_follow_node.py:/app/scripts/lane_follow_node.py:ro" \
+    -v "$SCRIPT_DIR/lane/models:/app/models:ro" \
+    --entrypoint bash \
+    traffic_docker:latest \
+    -c "source /opt/ros/noetic/setup.bash && python3 -u /app/scripts/lane_follow_node.py"
+sleep 3
+if docker ps --filter name=lane-follower --format '{{.Names}}' | grep -q lane-follower; then
+    docker logs -f lane-follower > "$SCRIPT_DIR/logs/lane_node.log" 2>&1 &
+    echo -e "${GREEN}[+] Serit takip aktif (Docker, log: logs/lane_node.log)${NC}"
 else
     echo -e "${RED}[X] Serit takip baslatilamadi!${NC}"
     exit 1
