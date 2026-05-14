@@ -11,10 +11,25 @@ Yenilikler:
   - Merkez sektor: +/- 5 derece (fren karari icin)
 """
 
+import math
+import sys
+
 import rospy
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int32, Float32
-import math
+
+sys.path.insert(0, "/app")
+try:
+    from talos_common import TalosLogger
+except Exception:
+    TalosLogger = None
+
+try:
+    from cart_sim.msg import Decision as DecisionMsg
+    _HAS_DECISION = True
+except Exception:
+    DecisionMsg = None
+    _HAS_DECISION = False
 
 
 class EngelTespitiNode:
@@ -22,12 +37,12 @@ class EngelTespitiNode:
         rospy.init_node('engel_tespiti', anonymous=True)
 
         # --- Parametreler ---
-        self.engel_mesafesi_limiti = 2.0  # metre - engel var/yok esigi
-        self.scan_half_fov = 15.0         # derece - toplam tarama: +/- 15 = 30 derece
-        self.merkez_half_fov = 5.0        # derece - merkez sektor: +/- 5 = 10 derece
-        self.min_range = 0.3              # 30cm altindaki okumalar sahte
-        self.steer_angle_deg = 0.0        # direksiyon acisi (derece)
-        self.steer_scale = 0.5            # direksiyon -> lidar offset katsayisi
+        self.engel_mesafesi_limiti = 2.0
+        self.scan_half_fov = 15.0
+        self.merkez_half_fov = 5.0
+        self.min_range = 0.3
+        self.steer_angle_deg = 0.0
+        self.steer_scale = 0.5
 
         # --- Publishers ---
         self.engel_pub = rospy.Publisher('/engel', Int32, queue_size=10)
@@ -40,10 +55,35 @@ class EngelTespitiNode:
         self.scan_sub = rospy.Subscriber('/converted_scan', LaserScan, self.scan_callback)
         self.steer_sub = rospy.Subscriber('/steer_angle', Float32, self.steer_callback)
 
+        # En son karar id'si (decision_id zinciri için).
+        # N5: ilk karar gelene kadar "pre_karar" sentinel — orphan boş string yerine.
+        self._last_decision_id = "pre_karar"
+        if _HAS_DECISION:
+            rospy.Subscriber('/karar_decision', DecisionMsg, self._decision_callback)
+
+        # P0 — yapısal CSV
+        if TalosLogger is not None:
+            self.tlog = TalosLogger(
+                component="engel",
+                schema=[
+                    "decision_id",
+                    "min_d_center", "min_d_left", "min_d_right",
+                    "min_d_overall", "min_angle_deg",
+                    "steer_offset_deg", "obstacle_present",
+                ],
+            )
+            self.tlog.event("INFO", "engel_node_started")
+            self.tlog.start_health_loop(interval_s=1.0, node="engel")
+        else:
+            self.tlog = None
+
         rospy.loginfo("Engel Tespiti Node v3 Baslatildi (dinamik tarama)")
         rospy.loginfo(f"Mesafe Limiti: {self.engel_mesafesi_limiti}m, "
                       f"Tarama: +/- {self.scan_half_fov} derece, "
                       f"Merkez: +/- {self.merkez_half_fov} derece")
+
+    def _decision_callback(self, msg):
+        self._last_decision_id = msg.decision_id or ""
 
     def steer_callback(self, msg):
         """Direksiyon acisi callback (derece, sag: pozitif, sol: negatif)"""
@@ -121,6 +161,21 @@ class EngelTespitiNode:
         self.engel_aci_pub.publish(min_mesafe_aci)
         self.sol_mesafe_pub.publish(min_sol)
         self.sag_mesafe_pub.publish(min_sag)
+
+        # Yapısal CSV — inf değerlerini -1 ile ifade et
+        if self.tlog is not None:
+            def _fin(v):
+                return v if math.isfinite(v) else -1.0
+            self.tlog.metric(
+                decision_id=self._last_decision_id,
+                min_d_center=f"{_fin(min_merkez):.3f}",
+                min_d_left=f"{_fin(min_sol):.3f}",
+                min_d_right=f"{_fin(min_sag):.3f}",
+                min_d_overall=f"{_fin(min_mesafe):.3f}",
+                min_angle_deg=f"{min_mesafe_aci:.2f}",
+                steer_offset_deg=f"{self.steer_angle_deg:.2f}",
+                obstacle_present=engel_durumu,
+            )
 
     def run(self):
         rospy.spin()

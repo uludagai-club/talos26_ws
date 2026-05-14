@@ -6,6 +6,26 @@
 #
 # Geliştirme: Python dosyasını düzenle → docker compose restart <servis>
 # Rebuild:    docker compose build talos-controller
+#
+# L1 Loglama (KTR §9.14.2): json-file 10 MB × 5 = 50 MB/servis varsayılan.
+# Yeni servisler `<<: *log-defaults` ile devralır.
+
+x-log-defaults: &log-defaults
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# Tüm servisler için ortak env (yarı uygulamayı kaldırır — M2)
+x-talos-env: &talos-env
+  ROS_MASTER_URI: http://localhost:11311
+  RUN_ID: ${RUN_ID:-dev}
+  TALOS_LOG_ROOT: /app/logs
+
+# Tüm servisler için ortak mount'lar (talos_common + per-run logs)
+x-talos-mounts: &talos-mounts
+  - ./talos_common:/app/talos_common:ro
+  - ./logs:/app/logs
 
 services:
 
@@ -18,8 +38,13 @@ services:
     network_mode: host
     environment:
       - ROS_MASTER_URI=http://localhost:11311
+      - RUN_ID=${RUN_ID:-dev}
+      - TALOS_LOG_ROOT=/app/logs
     volumes:
       - ./fixes/konum.py:/app/konum.py:ro
+      - ./talos_common:/app/talos_common:ro
+      - ./logs:/app/logs
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -31,8 +56,10 @@ services:
     network_mode: host
     environment:
       - ROS_MASTER_URI=http://localhost:11311
+      - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./fixes/waypoint_pub.py:/app/waypoint_pub.py:ro
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -45,9 +72,11 @@ services:
     environment:
       - ROS_MASTER_URI=http://localhost:11311
       - DISPLAY=${DISPLAY}
+      - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./fixes/hedef_yoneticisi.py:/app/hedef_yoneticisi.py:ro
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -61,23 +90,28 @@ services:
       - ROS_MASTER_URI=http://localhost:11311
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - RUN_ID=${RUN_ID:-dev}
+      - TALOS_LOG_ROOT=/app/logs
     volumes:
       - ./fixes/engel_node_fixed.py:/app/engel_node_fixed.py:ro
       - ./fixes/pointcloud_obstacle_publisher.py:/app/pointcloud_obstacle_publisher.py:ro
-    command: >
-      bash -c "source /opt/ros/noetic/setup.bash &&
-               source /root/catkin_ws/devel/setup.bash &&
-               rosrun pointcloud_to_laserscan pointcloud_to_laserscan_node
-                 cloud_in:=/cart/center_laser/scan
-                 scan:=/converted_scan
-                 _min_height:=-1.2
-                 _max_height:=1.0
-                 _range_min:=0.45
-                 _range_max:=100.0 &
-               sleep 2 &&
-               stdbuf -oL python3 -u /app/engel_node_fixed.py &
-               stdbuf -oL python3 -u /app/pointcloud_obstacle_publisher.py &&
-               wait"
+      - ./talos_common:/app/talos_common:ro
+      - ./logs:/app/logs
+      - ~/talos-sim/devel:/talos-devel:ro
+    # /ros_entrypoint.sh kullanılır (orijinal davranış); ROS env önceden yüklenir.
+    # Parent bash sources catkin_ws + exports PYTHONPATH, sonra background job'lar fork edilir.
+    # Böylece tüm subshell'ler aynı env'i (Decision.msg dahil) miras alır.
+    command:
+      - bash
+      - -c
+      - >-
+        set -e;
+        source /root/catkin_ws/devel/setup.bash;
+        export PYTHONPATH=/talos-devel/lib/python3/dist-packages:/app:$$PYTHONPATH;
+        (rosrun pointcloud_to_laserscan pointcloud_to_laserscan_node cloud_in:=/cart/center_laser/scan scan:=/converted_scan _min_height:=-1.2 _max_height:=1.0 _range_min:=0.45 _range_max:=100.0 &);
+        sleep 2;
+        (stdbuf -oL python3 -u /app/engel_node_fixed.py &);
+        stdbuf -oL python3 -u /app/pointcloud_obstacle_publisher.py
     deploy:
       resources:
         reservations:
@@ -85,6 +119,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -98,6 +133,7 @@ services:
       - ROS_MASTER_URI=http://localhost:11311
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./fixes/yolov8_ros_node_fixed.py:/app/yolov8_ros_node_fixed.py:ro
     entrypoint: bash
@@ -109,6 +145,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -123,6 +160,7 @@ services:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
       - DISPLAY=${DISPLAY}
+      - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./lane/scripts/lane_follow_node.py:/app/lane_follow_node.py:ro
       - ./lane/models:/app/models:ro
@@ -136,6 +174,7 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -147,8 +186,16 @@ services:
     network_mode: host
     environment:
       - ROS_MASTER_URI=http://localhost:11311
+      - RUN_ID=${RUN_ID:-dev}
+      - TALOS_LOG_ROOT=/app/logs
     volumes:
       - ./fixes/karar.py:/app/karar.py:ro
+      - ./talos_common:/app/talos_common:ro
+      - ./logs:/app/logs
+      - ~/talos-sim/devel:/talos-devel:ro
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && export PYTHONPATH=/talos-devel/lib/python3/dist-packages:/app:$$PYTHONPATH && python3 -u /app/karar.py"
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -163,13 +210,18 @@ services:
     privileged: true
     environment:
       - ROS_MASTER_URI=http://localhost:11311
-      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages
+      - RUN_ID=${RUN_ID:-dev}
+      - TALOS_LOG_ROOT=/app/logs
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
     volumes:
       - ./hilmi-talos/can_to_talos_cart.py:/app/can_to_talos_cart.py:ro
       - ./hilmi-talos/can_decoder.py:/app/can_decoder.py:ro
+      - ./talos_common:/app/talos_common:ro
+      - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/can_to_talos_cart.py"
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -182,13 +234,18 @@ services:
     privileged: true
     environment:
       - ROS_MASTER_URI=http://localhost:11311
-      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages
+      - RUN_ID=${RUN_ID:-dev}
+      - TALOS_LOG_ROOT=/app/logs
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
     volumes:
       - ./hilmi-talos/talos_state_to_can.py:/app/talos_state_to_can.py:ro
       - ./hilmi-talos/can_decoder.py:/app/can_decoder.py:ro
+      - ./talos_common:/app/talos_common:ro
+      - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/talos_state_to_can.py"
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -206,9 +263,13 @@ services:
     environment:
       - ROS_MASTER_URI=http://localhost:11311
       - ROS_IP=127.0.0.1
+      - RUN_ID=${RUN_ID:-dev}
+      - TALOS_LOG_ROOT=/app/logs
     volumes:
       - ./hilmi-talos/control.py:/app/control.py:ro
       - ./hilmi-talos/logs:/app/logs
+      - ./talos_common:/app/talos_common:ro
+    logging: *log-defaults
     restart: "no"
 
   # =========================================================
@@ -222,6 +283,7 @@ services:
     environment:
       - ROS_MASTER_URI=http://localhost:11311
       - DISPLAY=${DISPLAY}
+      - RUN_ID=${RUN_ID:-dev}
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages
     volumes:
       - ./hilmi-talos/can_visualizer.py:/app/can_visualizer.py:ro
@@ -230,4 +292,5 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/can_visualizer.py"
+    logging: *log-defaults
     restart: "no"
