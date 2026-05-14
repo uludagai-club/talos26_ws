@@ -19,6 +19,14 @@ import rospy
 import os
 import cv2
 import numpy as np
+
+# --- OpenCV 4.13 fix: copyMakeBorder float arguman hatasi ---
+# (fixes/yolov8_ros_node_fixed.py ile ayni patch — YOLO letterbox float deger gonderiyor)
+_orig_copyMakeBorder = cv2.copyMakeBorder
+def _fixed_copyMakeBorder(src, top, bottom, left, right, *args, **kwargs):
+    return _orig_copyMakeBorder(src, int(top), int(bottom), int(left), int(right), *args, **kwargs)
+cv2.copyMakeBorder = _fixed_copyMakeBorder
+
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Float32, String, Bool
 from cv_bridge import CvBridge
@@ -47,8 +55,16 @@ class LaneFollower:
         self.turn_detected_pub = rospy.Publisher('/lane/turn_detected', Bool, queue_size=10)
 
         # ==== MODEL ====
+        # Model yolu hem repo (lane/scripts/ -> ../models) hem container (/app/ -> ./models)
+        # yerlesimlerinde bulunsun diye birden fazla aday denenir.
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(current_dir, '..', 'models', 'best.pt')
+        model_candidates = [
+            os.path.join(current_dir, '..', 'models', 'best.pt'),  # repo: lane/scripts/ -> lane/models/
+            os.path.join(current_dir, 'models', 'best.pt'),        # container: /app/ -> /app/models/
+            '/models/best.pt',
+        ]
+        model_path = next((p for p in model_candidates if os.path.exists(p)), model_candidates[0])
+        rospy.loginfo(f"Lane modeli yukleniyor: {model_path}")
         self.model = YOLO(model_path)
 
         # ==== ROS ====
