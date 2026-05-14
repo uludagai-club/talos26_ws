@@ -8,6 +8,7 @@ Duzeltmeler:
     (karar_node ile uyumlu format)
   - Bbox boyutundan mesafe tahmini eklendi
 """
+import os
 import rospy
 import cv2
 
@@ -65,6 +66,14 @@ class YOLOv8Node:
         self.sub = rospy.Subscriber('/cart/front_camera/image_raw', Image, self.image_callback)
         rospy.loginfo("Subscriber and Publishers initialized")
         rospy.loginfo(f"Model siniflari: {self.model.names}")
+
+        # GUI penceresi (lane-follower ile ayni kalip) - DISPLAY varsa acilir
+        self.show_gui = bool(os.environ.get('DISPLAY'))
+        self.frame_to_show = None
+        if self.show_gui:
+            rospy.loginfo("GUI aktif: 'Levha Tespit' penceresi acilacak")
+        else:
+            rospy.loginfo("DISPLAY yok - GUI penceresi devre disi, sadece topic yayini")
 
     def bbox_mesafe_tahmin(self, y1, y2, img_h):
         """Bbox yuksekliginden kaba mesafe tahmini (metre)."""
@@ -124,12 +133,27 @@ class YOLOv8Node:
 
             # Isaretlenmis goruntu
             annotated_frame = results[0].plot()
+            self.frame_to_show = annotated_frame
             out_msg = self.bridge.cv2_to_imgmsg(annotated_frame, "bgr8")
             self.pub.publish(out_msg)
 
         except Exception as e:
             rospy.logerr(f"YOLO node error: {e}")
 
+    def run(self):
+        """GUI varsa 'Levha Tespit' penceresini ana thread'de gosterir,
+        yoksa duz rospy.spin() ile calisir (lane_follow_node.py ile ayni kalip)."""
+        if not self.show_gui:
+            rospy.spin()
+            return
+        rate = rospy.Rate(20)
+        while not rospy.is_shutdown():
+            if self.frame_to_show is not None:
+                cv2.imshow("Levha Tespit", self.frame_to_show)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+            rate.sleep()
+        cv2.destroyAllWindows()
+
 if __name__ == '__main__':
-    YOLOv8Node()
-    rospy.spin()
+    YOLOv8Node().run()

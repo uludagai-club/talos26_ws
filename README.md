@@ -132,6 +132,7 @@ git push
 | `fixes/engel_node_fixed.py` | `engel-node` | Hayır |
 | `fixes/pointcloud_obstacle_publisher.py` | `engel-node` | Hayır |
 | `fixes/yolov8_ros_node_fixed.py` | `traffic-node` | Hayır |
+| `levha_tespiti/yolov8_ros/scripts/best.pt` | `traffic-node` | Hayır (bind-mount, image içindeki modeli ezer) |
 | `fixes/karar.py` | `karar-node` | Hayır |
 | `hilmi-talos/control.py` | `talos-controller` | Hayır |
 | `hilmi-talos/can_to_talos_cart.py` | `can-bridge` | Hayır |

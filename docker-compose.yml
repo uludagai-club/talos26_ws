@@ -132,10 +132,15 @@ services:
     environment:
       - ROS_MASTER_URI=http://localhost:11311
       - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./fixes/yolov8_ros_node_fixed.py:/app/yolov8_ros_node_fixed.py:ro
+      # Levha modeli: İndirilenler'deki yolov10n best.pt (26 sınıf) image içindeki modeli ezer
+      - ./levha_tespiti/yolov8_ros/scripts/best.pt:/root/catkin_ws/src/yolov8_ros/scripts/best.pt:ro
+      # 'Levha Tespit' cv2 penceresi icin X11 (lane-follower ile ayni kalip)
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/yolov8_ros_node_fixed.py"
     deploy:

@@ -24,6 +24,10 @@ hilmi-talos/logs/
 lane/models/*.pt
 lane/models/*.onnx
 
+# Model yedekleri (eski ağırlıklar — sadece lokalde tutulur)
+*.pt.bak
+levha_tespiti/yolov8_ros/scripts/*.bak
+
 # Eski arşiv dizini
 archive/
 
