@@ -107,10 +107,23 @@ MAX_SPEED_MS = MAX_SPEED_KMH / 3.6           # Maksimum hız (m/s) - otomatik he
 # --- Direksiyon Ayarları ---
 MAX_STEER_ANGLE = 30.0                       # Maksimum direksiyon açısı (derece)
 
+# --- Pure Pursuit Direksiyon Kontrolü ---
+WHEELBASE = 1.78             # metre - ön/arka aks mesafesi (golf.urdf'ten türetildi)
+LOOKAHEAD_K = 1.0            # lookahead hız katsayısı (Ld = K*v + B, v: m/s)
+LOOKAHEAD_B = 2.5            # metre - sabit lookahead bileşeni (v=0'da Ld)
+LOOKAHEAD_MIN = 1.5          # metre - lookahead alt sınırı (aşırı direksiyon koruması)
+LOOKAHEAD_MAX = 6.0          # metre - lookahead üst sınırı
+LINE_GATE_MAX_HEADING = 12.0 # derece - /line düzeltmesi sadece bu heading hatasının altında uygulanır
+
 # --- Waypoint Toleransları ---
 ARRIVAL_THRESHOLD = 3.0                      # Waypoint'e ulaşma eşiği (metre)
 SLOWDOWN_DISTANCE = 4.0                      # Yavaşlamaya başlama mesafesi (metre)
 STOP_DISTANCE = 1.2                          # Tamamen durma mesafesi (metre)
+
+# --- Viraj Yavaşlama (ileriye bakan heading) ---
+TURN_SLOWDOWN_THRESHOLD = 10.0               # derece - bir sonraki WP'ye heading hatası bunu aşınca yavaşla
+TURN_SLOWDOWN_GAIN = 2.5                     # yavaşlama eğrisinin dikliği (büyük = daha sert yavaşlar)
+TURN_MIN_SPEED = 1.5                         # km/h - virajda minimum hedef hız (tekerlek kuvveti için)
 
 # --- CAN Bus Ayarları ---
 CAN_INTERFACE = 'vcan0'                      # CAN arayüzü
@@ -379,7 +392,6 @@ class CANWaypointFollower:
         # PID modu
         self.pid_mode = pid_mode
         speed_preset = PIDPresets.get_speed_preset(pid_mode)
-        steer_preset = PIDPresets.get_steer_preset(pid_mode)
 
         # PID Kontrolcüler
         self.speed_pid = PIDController(
@@ -393,17 +405,7 @@ class CANWaypointFollower:
             name="Speed"
         )
 
-        self.steer_pid = PIDController(
-            kp=steer_preset['kp'],
-            ki=steer_preset['ki'],
-            kd=steer_preset['kd'],
-            output_min=-MAX_STEER_ANGLE,
-            output_max=MAX_STEER_ANGLE,
-            integral_limit=2.0,
-            derivative_filter=0.2,
-            name="Steer",
-            angular=True
-        )
+        # Direksiyon kontrolü artık Pure Pursuit (geometrik) — steer PID kaldırıldı.
 
         # Adaptif PID ayarları
         self.adaptive_pid_enabled = True
@@ -747,7 +749,6 @@ class CANWaypointFollower:
             else:
                 # Bekleme bitti, normal suruse don
                 self.current_stop_waiting = False
-                self.steer_pid.reset()
                 self.speed_pid.reset()
                 self.post_stop_time = time.time()
                 self.logger.log("Durak beklemesi bitti, PID sifirlandi, devam ediliyor")
@@ -812,17 +813,18 @@ class CANWaypointFollower:
 
     def _adapt_pid_gains(self, heading_error, distance):
         """
-        Duruma göre PID kazançlarını adapte et
+        Hız PID kazançlarını duruma göre adapte et
 
-        - Büyük açı hatası: Hızı düşür, direksiyon agresif
+        - Büyük açı hatası: Hızı düşür (virajda yavaşla)
         - Küçük mesafe: Daha hassas kontrol
-        - Yüksek hız: Daha yumuşak direksiyon
+
+        Not: Direksiyon kontrolü Pure Pursuit ile yapıldığı için burada
+        yalnızca hız PID'i adapte edilir.
         """
         if not self.adaptive_pid_enabled:
             return
 
         abs_heading_error = abs(heading_error)
-        current_speed = self.speed_ms * 3.6  # km/h
 
         # === HIZ PID ADAPTASYONU ===
         if abs_heading_error > self.heading_error_threshold:
@@ -835,18 +837,6 @@ class CANWaypointFollower:
             # Normal mod
             preset = PIDPresets.get_speed_preset(self.pid_mode)
             self.speed_pid.set_gains(kp=preset['kp'], ki=preset['ki'])
-
-        # === DİREKSİYON PID ADAPTASYONU ===
-        if current_speed < 1.0:
-            # Çok düşük hız - agresif direksiyon
-            self.steer_pid.set_gains(kp=50.0, kd=8.0)
-        elif current_speed > 4.0:
-            # Yüksek hız - yumuşak direksiyon (kararlılık için)
-            self.steer_pid.set_gains(kp=30.0, kd=4.0)
-        else:
-            # Normal mod
-            preset = PIDPresets.get_steer_preset(self.pid_mode)
-            self.steer_pid.set_gains(kp=preset['kp'], kd=preset['kd'])
 
     def _can_listener(self):
         """CAN mesajlarını okuyan arka plan thread'i"""
@@ -921,6 +911,71 @@ class CANWaypointFollower:
             error += 2 * math.pi
 
         return error
+
+    def _select_lookahead_point(self, primary, secondary, ld):
+        """Pure Pursuit lookahead noktasını seç.
+
+        Araç merkezli ld yarıçaplı çember ile primary->secondary
+        segmentinin kesişimini bulur; böylece lookahead noktası ayrık
+        waypoint'ler arasında da ld mesafesinde kalır.
+
+        primary   : mevcut hedef mikro-waypoint (x, y)
+        secondary : bir sonraki waypoint (x, y) veya None
+        ld        : istenen lookahead mesafesi (metre)
+        """
+        # primary zaten yeterince uzaktaysa ya da uzatacak nokta yoksa
+        if self._distance_to(*primary) >= ld or secondary is None:
+            return primary
+
+        ax, ay = primary
+        bx, by = secondary
+        dx, dy = bx - ax, by - ay
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq < 1e-6:
+            return primary
+
+        # |A + t*(B-A) - C|^2 = ld^2  ->  a*t^2 + b*t + c = 0
+        fx, fy = ax - self.x, ay - self.y
+        a = seg_len_sq
+        b = 2.0 * (fx * dx + fy * dy)
+        c = fx * fx + fy * fy - ld * ld
+        disc = b * b - 4.0 * a * c
+        if disc < 0.0:
+            # Segment tamamen çemberin içinde - en uzak ucu kullan
+            return secondary
+        disc = math.sqrt(disc)
+        t = (-b + disc) / (2.0 * a)  # ileri yöndeki (büyük) kök
+        if t <= 0.0:
+            return primary
+        if t >= 1.0:
+            return secondary
+        return (ax + t * dx, ay + t * dy)
+
+    def _pure_pursuit_steer(self, primary, secondary):
+        """Pure Pursuit geometrik direksiyon kontrolü.
+
+            delta = atan2(2 * L * sin(alpha), Ld)
+
+        L     : dingil mesafesi (WHEELBASE)
+        alpha : araç yönü ile lookahead noktası arasındaki açı
+        Ld    : araçtan lookahead noktasına gerçek mesafe
+
+        Lookahead mesafesi hıza göre uyarlanır: Ld = K*v + B (eski KTR raporu).
+        Düşük hızda kısa, yüksek hızda uzun lookahead -> salınımsız takip.
+
+        Dönüş: direksiyon açısı (derece, + sol / - sağ).
+        """
+        ld_desired = float(np.clip(
+            LOOKAHEAD_K * self.speed_ms + LOOKAHEAD_B,
+            LOOKAHEAD_MIN, LOOKAHEAD_MAX
+        ))
+        lx, ly = self._select_lookahead_point(primary, secondary, ld_desired)
+
+        alpha = self._heading_error(lx, ly)
+        ld_actual = max(self._distance_to(lx, ly), LOOKAHEAD_MIN)
+
+        delta_rad = math.atan2(2.0 * WHEELBASE * math.sin(alpha), ld_actual)
+        return math.degrees(delta_rad)
 
     def stop(self):
         """Aracı durdur"""
@@ -1030,6 +1085,7 @@ class CANWaypointFollower:
                 self.target_none_since = None
 
             target_x, target_y = target
+            lookahead_secondary = self.next_target  # Pure Pursuit lookahead uzatması (WP2)
 
             # WP1'e mesafe
             distance = self._distance_to(target_x, target_y)
@@ -1043,6 +1099,7 @@ class CANWaypointFollower:
                 if self.next_target is not None:
                     target_x, target_y = self.next_target
                     distance = self._distance_to(target_x, target_y)
+                    lookahead_secondary = None  # zaten WP2'ye terfi edildi
 
             # Açı hatasını hesapla
             heading_error = self._heading_error(target_x, target_y)
@@ -1059,6 +1116,7 @@ class CANWaypointFollower:
                         target_x, target_y = nx, ny
                         distance = self._distance_to(nx, ny)
                         heading_error = nh
+                        lookahead_secondary = None  # WP2'ye yönlenildi
                         resolved = True
 
                 if not resolved:
@@ -1089,12 +1147,17 @@ class CANWaypointFollower:
                 distance_factor = max(0.3, gorev_dist / SLOWDOWN_DISTANCE)
                 base_speed *= distance_factor
 
-            # Büyük açı hatasında yavaşla ama minimum hızı koru (virajda durma!)
-            abs_heading_error = abs(heading_error)
-            TURN_MIN_SPEED = 1.5  # km/h - virajda minimum hız (tekerleklerin kuvvet üretmesi için)
-            if abs_heading_error > math.radians(20):
-                # 20°→%60, 45°→%40, 90°→%25 hız
-                heading_factor = max(0.25, 1.0 - (abs_heading_error / math.pi) * 1.5)
+            # Viraj öngörüsü: yavaşlamayı bir sonraki WP'ye (ileriye) bakarak tetikle.
+            # Anlık WP'ye olan açı yoğun mikro-waypoint akışında virajda bile küçük
+            # kaldığı için tek başına yavaşlatmaya yetmiyordu; next_target ~bir WP
+            # ileride olduğu için viraj çok daha erken görülür.
+            if self.next_target is not None:
+                turn_heading_error = abs(self._heading_error(*self.next_target))
+            else:
+                turn_heading_error = abs(heading_error)
+
+            if turn_heading_error > math.radians(TURN_SLOWDOWN_THRESHOLD):
+                heading_factor = max(0.25, 1.0 - (turn_heading_error / math.pi) * TURN_SLOWDOWN_GAIN)
                 base_speed *= heading_factor
 
             target_speed_kmh = max(base_speed, TURN_MIN_SPEED)
@@ -1117,17 +1180,20 @@ class CANWaypointFollower:
                 throttle_pct = 0
                 brake_pct = min(60, abs(throttle) * 0.5)
 
-            # ========== DİREKSİYON KONTROLÜ ==========
-            steer_deg = self.steer_pid.compute(heading_error, measurement=self.yaw)
+            # ========== DİREKSİYON KONTROLÜ (Pure Pursuit) ==========
+            steer_deg = self._pure_pursuit_steer((target_x, target_y), lookahead_secondary)
 
             # Şerit değiştirme override
             lane_steer = self._get_lane_change_steer()
             if lane_steer is not None:
                 steer_deg = lane_steer
             else:
-                # Şerit takip düzeltmesi ekle (sadece şerit değiştirme yoksa)
-                line_correction = self._get_line_correction()
-                steer_deg += line_correction
+                # Şerit takip düzeltmesi — sadece düz kısımlarda uygula.
+                # Virajda Pure Pursuit zaten dönüşü yönetiyor; /line düzeltmesini
+                # üstüne eklemek çift döngü çakışması ve salınım yaratıyordu.
+                if abs(heading_error) < math.radians(LINE_GATE_MAX_HEADING):
+                    line_correction = self._get_line_correction()
+                    steer_deg += line_correction
 
             # Direksiyon limitlerini uygula
             steer_deg = np.clip(steer_deg, -MAX_STEER_ANGLE, MAX_STEER_ANGLE)
@@ -1205,11 +1271,11 @@ def main():
     print(f"  Maksimum Hız: {MAX_SPEED_KMH} km/h")
     print(f"  Debug: {'Açık' if args.debug else 'Kapalı'}")
     print("-" * 60)
-    print("  PID Preset Değerleri:")
+    print("  Kontrol Ayarları:")
     speed_p = PIDPresets.get_speed_preset(args.mode)
-    steer_p = PIDPresets.get_steer_preset(args.mode)
-    print(f"    Hız: kp={speed_p['kp']}, ki={speed_p['ki']}, kd={speed_p['kd']}")
-    print(f"    Dir: kp={steer_p['kp']}, ki={steer_p['ki']}, kd={steer_p['kd']}")
+    print(f"    Hız PID: kp={speed_p['kp']}, ki={speed_p['ki']}, kd={speed_p['kd']}")
+    print(f"    Dir: Pure Pursuit | L={WHEELBASE}m, Ld={LOOKAHEAD_K}*v+{LOOKAHEAD_B} "
+          f"[{LOOKAHEAD_MIN}-{LOOKAHEAD_MAX}m]")
     print("-" * 60)
     print("  Hedef kaynağı: /hedef topic (dinamik)")
     print("  Karar kaynağı: /karar topic")
