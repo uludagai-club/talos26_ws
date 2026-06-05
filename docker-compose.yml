@@ -183,10 +183,13 @@ services:
     restart: "no"
 
   # =========================================================
-  # KARAR DUGUMU
+  # KARAR DUGUMU (Behavior Tree — karar_bt/)
+  # Eski fixes/karar.py git'te kalir; geri donus icin sadece bu blogu revert et.
   # =========================================================
   karar-node:
-    image: karar-node:latest
+    build:
+      context: ./karar_bt
+    image: karar-bt:latest
     container_name: karar-node
     network_mode: host
     environment:
@@ -194,12 +197,12 @@ services:
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
     volumes:
-      - ./fixes/karar.py:/app/karar.py:ro
+      - ./karar_bt:/app:ro
       - ./talos_common:/app/talos_common:ro
       - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
     entrypoint: bash
-    command: -c "source /opt/ros/noetic/setup.bash && export PYTHONPATH=/talos-devel/lib/python3/dist-packages:/app:$$PYTHONPATH && python3 -u /app/karar.py"
+    command: -c "source /opt/ros/noetic/setup.bash && export PYTHONPATH=/talos-devel/lib/python3/dist-packages:/app:$$PYTHONPATH && python3 -u /app/karar_bt_node.py"
     logging: *log-defaults
     restart: "no"
 

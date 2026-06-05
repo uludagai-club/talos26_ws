@@ -1,0 +1,52 @@
+# TALOS karar_bt parametreleri.
+# Eşikler ve zamanlamalar tek noktada tutulur — sahada hızlı tune için.
+
+tick_hz: 10.0
+
+# Sensor freshness — bu süreden uzun süre veri gelmemişse dal kapanır
+freshness:
+  yaya_max_age_s:   0.6
+  levha_max_age_s:  0.6
+  engel_max_age_s:  0.4
+  lane_max_age_s:   0.8
+  odom_max_age_s:   0.5
+  hedef_max_age_s:  2.0
+
+# Mesafe eşikleri (metre) — eski karar.py ile uyumlu başlangıç.
+# NOT: Yaya ve engel için ayrı acil eşik; eski karar.py yalnız yayaya bakıyordu.
+distances:
+  yaya_acil_durus_m: 2.0   # eski MESAFE_ACIL_DURUS
+  yaya_dur_m:        4.0
+  yaya_yavas_m:     12.0
+  engel_acil_m:      1.2   # bumper koruması — araç boyuna göre
+  engel_block_m:     2.0   # blokaj ama acil değil → kaçınma/dur dene
+  engel_yan_clear_m: 3.0   # yan sektörde bu kadar boşluk varsa lane change makul
+  levha_dur_m:       3.5
+  levha_oku_m:      10.0
+  yon_levha_max_m:   5.0
+
+# Zamanlayıcılar
+timers:
+  dur_levhasi_bekleme_s:    3.0
+  dur_levhasi_release_grace_s: 1.5  # bekleme bitti, levha hâlâ yakın → bu süre içinde release
+
+# Debounce — flicker önleme (tick cinsinden, 10Hz @ 0.1s/tick varsayar)
+debounce:
+  yaya_min_consecutive:     2
+  engel_min_consecutive:    2
+  levha_min_consecutive:    2
+
+# Emergency latch
+emergency:
+  release_clear_ticks: 8   # 8 tick (~0.8s) net olunca acil mühür çözülür
+
+# Lane change guard'ları (sadece BT içinde; control.py kendi guard'ını ayrı uygular)
+lane_change:
+  enabled: true
+  cooldown_s: 4.0           # ardışık lane change arası bekleme
+
+# Snapshot/debug
+debug:
+  publish_snapshot: true
+  snapshot_rate_hz: 2.0
+  ascii_tree_log_every_n_tick: 50  # 0 = kapalı
