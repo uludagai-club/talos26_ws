@@ -12,6 +12,7 @@ CAN Mesajları:
 
 import rospy
 import can
+import json
 import math
 import struct
 import sys
@@ -25,6 +26,32 @@ from std_msgs.msg import Float32, String
 from visualization_msgs.msg import Marker
 from geometry_msgs.msg import Point
 from tf.transformations import euler_from_quaternion
+
+
+# =============================================================================
+# GOREV GEOJSON YÜKLEYİCİ (FIX 2 — hedef_yoneticisi.py ile aynı format)
+# =============================================================================
+def _yukle_gorev_geojson_for_control(yol='/missions/gorev.geojson'):
+    """GeoJSON'dan gorev koordinatlarını (x, y) tuple listesi olarak yükle.
+    datum + start hariç tüm gorev_* ve park_giris noktalarını döndürür.
+    Dosya yoksa boş liste döner (mevcut davranışı korur)."""
+    if not os.path.exists(yol):
+        return []
+    try:
+        with open(yol) as f:
+            data = json.load(f)
+        out = []
+        for feat in data.get('features', []):
+            props = feat.get('properties', {})
+            name = props.get('name', '')
+            if name in ('datum', 'start'):
+                continue
+            if 'local_x' not in props or 'local_y' not in props:
+                continue
+            out.append((float(props['local_x']), float(props['local_y'])))
+        return out
+    except (OSError, ValueError, KeyError):
+        return []
 
 
 # =============================================================================
@@ -90,8 +117,15 @@ PARK_WAIT_TIMEOUT = 8.0     # saniye - hedef gelmezse son hedef kabul et ve dur
 LANE_CHANGE_STEER = 20.0    # derece - şerit değiştirme direksiyon açısı
 LANE_CHANGE_DURATION = 2.0  # saniye - şerit değiştirme süresi
 
-# Gercek gorev duraklari (hedef_yoneticisi'ndeki GeoJSON ile ayni)
-GOREV_NOKTALARI = []
+# Gercek gorev duraklari (hedef_yoneticisi'ndeki GeoJSON ile ayni).
+# FIX 2 — boş liste yerine başlangıçta GeoJSON'dan yüklenir; başarısız
+# olursa boş kalır (geriye uyum). Mount edilen yol: /missions/gorev.geojson.
+GOREV_NOKTALARI = _yukle_gorev_geojson_for_control()
+if not GOREV_NOKTALARI:
+    # rospy.init_node henüz çağrılmadı (modül load zamanı) → stderr'e yaz
+    print("[control.py][WARN] GOREV_NOKTALARI boş — /missions/gorev.geojson "
+          "okunamadı veya mount eksik. Durak ziyareti, SLOWDOWN_DISTANCE, "
+          "mission_complete devre dışı.", file=sys.stderr, flush=True)
 GOREV_THRESHOLD = 3.0       # metre - duraga varis esigi
 GOREV_COOLDOWN = 10.0       # saniye - ayni duraga tekrar varildi engeli
 WP_NEAR_DISTANCE = 1.5      # metre - WP1'e yakinken WP2'ye gec (lookahead)
@@ -131,10 +165,10 @@ CAN_INTERFACE = 'vcan0'                      # CAN arayüzü
 # --- Şerit Takip (Line Following) Ayarları ---
 LINE_TOPIC = '/line'                         # Şerit açısı topic'i
 LINE_ENABLED = True                          # Şerit takibi aktif mi?
-LINE_WEIGHT = 0.15                           # Şerit düzeltme ağırlığı (0.0-0.5)
+LINE_WEIGHT = 0.9                            # Şerit düzeltme ağırlığı
 LINE_TIMEOUT = 0.5                           # Veri timeout süresi (saniye)
 LINE_MAX_ANGLE = 25.0                        # Güvenilir maksimum açı (derece)
-LINE_OFFSET = -5.0                           # Kamera kalibrasyonu offset (derece)
+LINE_OFFSET = 0.0                            # Kamera kalibrasyonu offset (derece)
 
 # --- Vites Sabitleri (değiştirmeyin) ---
 GEAR_NEUTRAL = 1
@@ -373,6 +407,7 @@ class CANWaypointFollower:
         self.current_stop_wait_start = 0.0  # Durakta bekleme baslangic zamani
         self.last_wp_varildi_time = 0.0     # Mikro-WP varildi throttle
         self.post_stop_time = 0.0           # Son durak bekleme bitiş zamanı (flip-flop grace)
+        self._stall_start_time = None       # FIX 4: anti-stall kick-start timer
 
         # Karar durumu
         self.karar = Karar.NORMAL
@@ -786,10 +821,15 @@ class CANWaypointFollower:
         return False
 
     def _nearest_gorev_distance(self):
-        """En yakin gorev duragina mesafe (yavaslamak icin)"""
+        """En yakin **tamamlanmamış** gorev duragina mesafe (yavaslamak icin).
+        FIX 2-reviewer: completed_goreve filtresi yoktu — duragı geçtikten
+        sonra bile o duraga olan mesafe min olarak hesaplanıyordu → SLOWDOWN
+        devam ediyordu → araç çıkamıyordu. Şimdi sadece henüz varılmamış
+        durakları hesaba katar."""
         min_dist = float('inf')
-        for gx, gy in GOREV_NOKTALARI:
-            # Sadece henuz varilmamis veya cooldown gecmis duraklari kontrol et
+        for idx, (gx, gy) in enumerate(GOREV_NOKTALARI):
+            if idx in self.completed_goreve:
+                continue
             dist = self._distance_to(gx, gy)
             if dist < min_dist:
                 min_dist = dist
@@ -1168,6 +1208,42 @@ class CANWaypointFollower:
 
             # PID çıkışı
             throttle = self.speed_pid.compute(speed_error, measurement=current_speed_kmh)
+
+            # ── FIX 4: Anti-stall kick-start ─────────────────────────
+            # Bug: static friction + düşük PID throttle = araç hareket etmez.
+            # SLOWDOWN_DISTANCE içinde base_speed * 0.3 → target ~1.5 km/h →
+            # PID kp=4 × error=1.5 = ~6 throttle birim (0-100 ölçek) →
+            # static friction altı → durdu. Kalkış için kısa süreli (2 sn)
+            # min 15 throttle birim (% gibi), sonrası normal.
+            # NOT: speed_pid output_max=100 → throttle 0-100 ölçek. 15 birim
+            # ≈ %15 gaz. Reviewer-fix: önceki "0.15" 0-1 sanıldı, no-op'tu.
+            # Koşullar:
+            #   target_speed_kmh > 0.5  (hedef hız var)
+            #   speed_limit > 0         (DUR/ACIL_DURUS değil)
+            #   current < target - 0.3  (hızlanma fazı)
+            #   throttle < 15.0         (PID yetersiz, 0-100 ölçekte)
+            # Reset: current > target/2  (hızlanma başladı, %50 hedef)
+            now_ts = time.time()
+            stall_start = self._stall_start_time
+            if (target_speed_kmh > 0.5
+                    and speed_limit > 0
+                    and current_speed_kmh < target_speed_kmh - 0.3
+                    and throttle < 15.0):
+                if stall_start is None:
+                    self._stall_start_time = now_ts
+                    stall_start = now_ts
+                stall_duration = now_ts - stall_start
+                if stall_duration < 2.0:
+                    throttle = 15.0  # kick-start moment (0-100 ölçek)
+                    rospy.loginfo_throttle(
+                        1.0,
+                        f"[STALL-KICK] {stall_duration:.1f}s kick-start: "
+                        f"target={target_speed_kmh:.1f} cur={current_speed_kmh:.1f}")
+                # 2 sn sonra kick-start kapanır — gerçek engel olabilir,
+                # FIX 5 (stuck detector) bu durumda devreye girer.
+            elif current_speed_kmh > target_speed_kmh * 0.5:
+                # Araç hız aldı (hedefin yarısı üstünde) → stall timer sıfırla
+                self._stall_start_time = None
 
             # Gaz/fren kararı
             if throttle > 0:

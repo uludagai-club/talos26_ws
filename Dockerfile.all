@@ -1,0 +1,44 @@
+FROM ros:noetic-ros-base
+
+LABEL maintainer="TALOS Team"
+LABEL description="TALOS tek-imaj runtime — eksik 6 prebuilt imajin (konum, talos-map-server, hedef-yoneticisi, otonom-arac, karar-node, traffic_docker) yerini alir. Tum Python kodu compose ile bind-mount edildiginden bu imaj sadece calisma-zamani bagimliliklarini tasir."
+
+# -------------------------------------------------------------------
+# Sistem (apt) bagimliliklari
+#  - python3-can / can-utils / iproute2 : CAN katmani (kullanan servisler icin zararsiz)
+#  - ros-noetic-tf*                     : konum.py (tf.transformations)
+#  - ros-noetic-cv-bridge               : traffic-node + safe-zone-detector (cv_bridge)
+#  - ros-noetic-pointcloud-to-laserscan : engel-node (rosrun pointcloud_to_laserscan)
+#  - python3-tk                         : hedef_yoneticisi.py matplotlib GUI
+# -------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-pip \
+    python3-can \
+    can-utils \
+    iproute2 \
+    kmod \
+    ros-noetic-tf \
+    ros-noetic-tf2-ros \
+    ros-noetic-cv-bridge \
+    ros-noetic-pointcloud-to-laserscan \
+    python3-tk \
+    && rm -rf /var/lib/apt/lists/*
+
+# -------------------------------------------------------------------
+# Python (pip) bagimliliklari
+#  - ultralytics : YOLO (traffic + safe-zone). torch + opencv-python'u beraberinde ceker.
+#                  Linux'ta varsayilan torch wheel'i CUDA destekli gelir → GPU calisir.
+# -------------------------------------------------------------------
+RUN pip3 install --no-cache-dir \
+    "python-can>=4.0.0" \
+    "numpy>=1.20.0" \
+    "matplotlib>=3.4.0" \
+    "pyyaml>=5.3" \
+    "py_trees==2.2.3" \
+    ultralytics
+
+WORKDIR /app
+
+# Kod compose'da bind-mount edilir; imaja kod KOPYALANMAZ.
+# command/entrypoint her servis icin docker-compose.yml'da tanimlidir.
+CMD ["bash"]

@@ -6,7 +6,7 @@ import sys
 import uuid
 
 import rospy
-from std_msgs.msg import String
+from std_msgs.msg import String, Int32, Float32
 
 # talos_common bind-mount: /app/talos_common
 sys.path.insert(0, "/app")
@@ -30,6 +30,8 @@ MESAFE_YAYA_DUR = 4.0
 MESAFE_YAYA_YAVAS = 12.0
 MESAFE_LEVHA_DUR = 3.5
 MESAFE_LEVHA_OKU = 10.0
+MESAFE_ENGEL_YAVAS = 5.0   # bu mesafe içindeki engelde slow
+ENGEL_VERI_TIMEOUT_S = 0.5  # engel yayını bu süreden uzun susarsa veri yok say
 
 # 2. Zamanlayıcılar (Saniye)
 SURE_DUR_LEVHASI_BEKLEME = 3.0
@@ -43,6 +45,8 @@ class KararMekanizmasi:
 
         rospy.Subscriber("/trafik_levha", String, self.levha_callback)
         rospy.Subscriber("/yaya_gecidi", String, self.yaya_callback)
+        rospy.Subscriber("/engel", Int32, self.engel_callback)
+        rospy.Subscriber("/engel_distance", Float32, self.engel_mesafe_callback)
 
         # Geriye dönük uyumluluk için /karar (String) kalıyor; ek olarak yapısal /karar_decision
         self.karar_pub = rospy.Publisher('/karar', String, queue_size=10)
@@ -54,6 +58,11 @@ class KararMekanizmasi:
 
         self.yaya_verisi = "none"
         self.levha_verisi = "none"
+
+        # Engel verisi — engel_node_fixed.py publish'leri
+        self.engel_var = 0          # /engel Int32 (0/1, merkez sektörde yakın engel)
+        self.engel_mesafesi = -1.0  # /engel_distance Float32 (FOV min, inf olabilir)
+        self._engel_son_guncelleme = 0.0  # rospy time; stale veri filtresi
 
         self.dur_levhasi_aktif = False
         self.durma_baslangic_zamani = None
@@ -86,15 +95,30 @@ class KararMekanizmasi:
     def yaya_callback(self, msg):
         self.yaya_verisi = msg.data
 
+    def engel_callback(self, msg):
+        self.engel_var = int(msg.data)
+        self._engel_son_guncelleme = rospy.get_time()
+
+    def engel_mesafe_callback(self, msg):
+        d = float(msg.data)
+        # engel_node inf yayınlayabilir (engel yok): sentinel olarak -1 tut
+        self.engel_mesafesi = d if math.isfinite(d) else -1.0
+        self._engel_son_guncelleme = rospy.get_time()
+
     def mesafe_hesapla(self, x_str, y_str):
         try:
             return math.hypot(float(x_str), float(y_str))
         except ValueError:
             return -1.0
 
+    def _engel_input_str(self):
+        """Decision/CSV için kompakt engel özeti: '1:0.87' veya '0:3.34' veya '0:-1.00'."""
+        return f"{self.engel_var}:{self.engel_mesafesi:.2f}"
+
     def _publish_decision(self, karar, reason, yaya_mesafesi, levha_ismi, phase, wait_remaining):
         decision_id = uuid.uuid4().hex
         self._last_decision_id = decision_id
+        engel_input = self._engel_input_str()
 
         # 1) Geri uyumlu String
         self.karar_pub.publish(karar)
@@ -109,7 +133,7 @@ class KararMekanizmasi:
             d.reason = reason
             d.input_yaya = self.yaya_verisi
             d.input_levha = self.levha_verisi
-            d.input_engel = ""  # engel-node ayrı doldurur (rx tarafında join)
+            d.input_engel = engel_input
             d.yaya_distance = float(yaya_mesafesi if yaya_mesafesi is not None else -1.0)
             d.levha_class = levha_ismi or "none"
             d.phase = phase
@@ -124,7 +148,7 @@ class KararMekanizmasi:
                 reason=reason,
                 input_yaya=self.yaya_verisi,
                 input_levha=self.levha_verisi,
-                input_engel="",
+                input_engel=engel_input,
                 yaya_distance=f"{(yaya_mesafesi if yaya_mesafesi is not None else -1.0):.3f}",
                 levha_class=levha_ismi or "none",
                 phase=phase,
@@ -163,6 +187,33 @@ class KararMekanizmasi:
                     levha_mesafesi = self.mesafe_hesapla(parcalar[1], parcalar[2])
                 except Exception:
                     rospy.logwarn("Veri Hatasi: Levha verisi parse edilemedi!")
+
+            # ── ENGEL (en yüksek öncelikli güvenlik dalı) ───────────────
+            # NOT: engel-node /engel_distance'ı FOV içindeki minimum mesafe
+            # olarak yayınlar. Boş pistte bile yan duvarlar/zemin yansıması
+            # ~3.3 m sabit baseline veriyor. Bu yüzden "uzak yan engel için
+            # slow" mantığı tüm sürüş boyunca false-positive üretiyordu.
+            # Sadece engel_var=1 (merkez sektörde yakın engel) durumunda
+            # tepki ver; o da iki banda ayrılır: çok yakın → acildurus,
+            # yakın → slow.
+            engel_taze = (rospy.get_time() - self._engel_son_guncelleme
+                          < ENGEL_VERI_TIMEOUT_S) if self._engel_son_guncelleme > 0 else False
+            engel_d = self.engel_mesafesi if engel_taze else -1.0
+            if engel_taze and self.engel_var == 1:
+                if engel_d > 0 and engel_d < MESAFE_ACIL_DURUS:
+                    nihai_karar = "acildurus"
+                    reason = f"engel_yakin_d={engel_d:.2f}m"
+                    rospy.logerr(f"!!! ACİL DURUM !!! Engel: {engel_d:.2f}m")
+                else:
+                    nihai_karar = "slow"
+                    reason = (f"engel_orta_d={engel_d:.2f}m"
+                              if engel_d > 0 else "engel_merkez")
+                    rospy.logwarn(f"Engel merkez sektörde: "
+                                  f"{engel_d if engel_d > 0 else '?'}m → slow")
+                self._publish_decision(nihai_karar, reason, yaya_mesafesi,
+                                       levha_ismi, phase, wait_remaining)
+                self.rate.sleep()
+                continue
 
             if (yaya_mesafesi != -1 and yaya_mesafesi < MESAFE_ACIL_DURUS):
                 nihai_karar = "acildurus"

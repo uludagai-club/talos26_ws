@@ -178,38 +178,16 @@ fi
 # =============================================================
 echo -e "${BLUE}[4/8] Docker imajlari kontrol ediliyor...${NC}"
 
-load_image() {
-    local name=$1 tar=$2
-    if ! docker image inspect "$name" > /dev/null 2>&1; then
-        if [ -f "$tar" ]; then
-            echo -e "${YELLOW}  [*] $name yukleniyor ($tar)...${NC}"
-            docker load -i "$tar"
-        else
-            echo -e "${RED}  [X] $name imaji ve $tar dosyasi bulunamadi!${NC}"
-            return 1
-        fi
-    else
-        echo -e "${GREEN}  [+] $name mevcut${NC}"
-    fi
-}
-
-load_image "konum:latest"            "$SCRIPT_DIR/konum.tar"
-load_image "talos-map-server:latest" "$SCRIPT_DIR/talos-map-waypoint.tar"
-load_image "hedef-yoneticisi:latest" "$SCRIPT_DIR/hedef_yoneticisi_v1.tar"
-load_image "otonom-arac:latest"      "$SCRIPT_DIR/engel_node.tar"
-load_image "karar-node:latest"       "$SCRIPT_DIR/karar_node_x86.tar"
-load_image "traffic_docker:latest"   "$SCRIPT_DIR/traffic_docker.tar"
-
-if ! docker image inspect talos-control:latest > /dev/null 2>&1; then
-    if [ -f "$HILMI_TALOS/talos_control.tar" ]; then
-        echo -e "${YELLOW}  [*] talos-control yukleniyor...${NC}"
-        docker load -i "$HILMI_TALOS/talos_control.tar"
-    else
-        echo -e "${YELLOW}  [*] talos-control build ediliyor...${NC}"
-        docker compose -f "$SCRIPT_DIR/docker-compose.yml" build talos-controller
-    fi
+# talos-all:latest — TEK runtime imaji. TUM servisler (konum, map-server, hedef,
+# engel, karar, traffic, safe-zone, can-bridge, state-bridge, talos-controller,
+# can-visualizer) bunu kullanir. Eksikse Dockerfile.all'dan build edilir; repo
+# kendi kendine yeter, harici .tar gerektirmez. Tum Python kodu compose ile bind-mount'lu.
+if ! docker image inspect talos-all:latest > /dev/null 2>&1; then
+    echo -e "${YELLOW}  [*] talos-all build ediliyor (Dockerfile.all)...${NC}"
+    docker build -t talos-all:latest -f "$SCRIPT_DIR/Dockerfile.all" "$SCRIPT_DIR" \
+        || { echo -e "${RED}  [X] talos-all build basarisiz, cikiliyor${NC}"; exit 1; }
 else
-    echo -e "${GREEN}  [+] talos-control mevcut${NC}"
+    echo -e "${GREEN}  [+] talos-all mevcut${NC}"
 fi
 
 # =============================================================
@@ -220,7 +198,7 @@ cd "$SCRIPT_DIR" || exit 1
 
 # Eski container kalintilari (manuel docker run'dan) — temizle
 docker rm -f konum-server talos-map-server hedef_teslimi engel-node \
-              traffic-node lane-follower karar-node \
+              traffic-node safe-zone-detector karar-node \
               talos-can-bridge talos-state-bridge talos-controller \
               talos-can-visualizer 2>/dev/null
 
@@ -243,7 +221,7 @@ echo -e "${CYAN}  talos-map-server   => /map + /waypoint${NC}"
 echo -e "${CYAN}  hedef_teslimi      => /hedef (String: x,y)${NC}"
 echo -e "${CYAN}  engel-node         => /engel + obstacles.csv${NC}"
 echo -e "${CYAN}  traffic-node       => /trafik_levha${NC}"
-echo -e "${CYAN}  lane-follower      => /line${NC}"
+echo -e "${CYAN}  safe-zone-detector => /line (eski lane'in yerine)${NC}"
 echo -e "${CYAN}  karar-node         => /karar + /karar_decision (decision_id)${NC}"
 echo -e "${CYAN}  can-bridge         => CAN -> Gazebo${NC}"
 echo -e "${CYAN}  state-bridge       => Gazebo -> CAN${NC}"
@@ -255,9 +233,20 @@ echo -e "${YELLOW}  Ctrl+C => kapanis + manifest mührü + chown${NC}"
 echo -e "${CYAN}======================================================${NC}"
 
 # =============================================================
-# 7) FOREGROUND — talos-controller log akisi (Ctrl+C ile cikis)
+# 7) BACKGROUND — hedef_teslimi log arşivi (FILTER-DEBUG, U-DONUS-PLAN için)
 # =============================================================
-echo -e "${BLUE}[7/8] talos-controller log akisi (Ctrl+C => kapanis)${NC}"
+docker compose logs -f --no-color hedef-teslimi \
+    > "$RUN_DIR/system/hedef_teslimi.log" 2>&1 &
+HEDEF_LOG_PID=$!
+echo -e "${GREEN}[+] hedef_teslimi log arşivi: $RUN_DIR/system/hedef_teslimi.log${NC}"
+
+# =============================================================
+# 8) FOREGROUND — talos-controller log akisi (Ctrl+C ile cikis)
+# =============================================================
+echo -e "${BLUE}[8/8] talos-controller log akisi (Ctrl+C => kapanis)${NC}"
 docker compose logs -f --no-color talos-controller karar-node engel-node 2>&1 || true
+
+# Background hedef_teslimi log tail'ini kapat
+[ -n "${HEDEF_LOG_PID:-}" ] && kill "$HEDEF_LOG_PID" 2>/dev/null
 
 # Trap cleanup yakalar

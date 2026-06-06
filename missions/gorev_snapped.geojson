@@ -1,0 +1,123 @@
+{
+  "type": "FeatureCollection",
+  "_aciklama": "Simulasyon pisti icin gorev dosyasi. Gercek yaris dosyalarinin (birincitur/ikincitur/ucuncutur) yapisini korur ancak koordinatlar bizim track_calibration sinirlari icine (x:[-25.34,40.59], y:[-37.83,15.87]) gorsel analiz ile yerlestirilmistir. Eslemeler: gorev_1=sol-ust-kavsak, gorev_2=sag-D-duragi, gorev_3=merkez-D-duragi (gobek alti), park_giris=sol-alt-park-alani. | gorev_snapped.geojson: yeni graf node'larına snap edildi.",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "datum",
+        "description": "Referans Noktasi (simulasyon)",
+        "local_x": 0.0,
+        "local_y": 0.0,
+        "heading": 0.0
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "start",
+        "description": "Arac baslangic konumu",
+        "local_x": 0.0,
+        "local_y": 0.0,
+        "heading": 0.0
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "gorev_1",
+        "description": "1. Durak (sol-ust kavsak)",
+        "local_x": -11.0,
+        "local_y": 9.0,
+        "heading": 180.0
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "gorev_2",
+        "description": "2. Durak (sag D duragi)",
+        "local_x": 29.256873597714538,
+        "local_y": -2.2630543691568015,
+        "heading": 270.0,
+        "_snapped_from": [
+          30.0,
+          -5.0
+        ],
+        "_snap_node": 35
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "gorev_3",
+        "description": "3. Durak (merkez D duragi, gobek alti)",
+        "local_x": 7.689345861888757,
+        "local_y": -13.504544201403844,
+        "heading": 0.0,
+        "_snapped_from": [
+          6.0,
+          -13.0
+        ],
+        "_snap_node": 26
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "park_giris",
+        "description": "Park giris noktasi (sol alt park alani)",
+        "local_x": -18.254975146852846,
+        "local_y": -22.55901049996793,
+        "heading": 0.0,
+        "_snapped_from": [
+          -18.0,
+          -22.0
+        ],
+        "_snap_node": 57
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          0.0
+        ]
+      }
+    }
+  ]
+}

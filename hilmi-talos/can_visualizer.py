@@ -43,8 +43,21 @@ TRACK_CALIB_PATH = os.path.join(SCRIPT_DIR, '..', '..', '..', 'waypoint-editor',
 DEFAULT_CALIB = {"x_min": -25.34, "x_max": 40.59, "y_min": -37.83, "y_max": 15.87}
 
 # Waypoints - hedef tesliminden dinamik olarak alınır
-waypoint_list = []  # [(x, y), ...]
+waypoint_list = []  # [(x, y), ...] — sadece son alınan WP1 + WP2 (birikim yok)
 waypoint_edges = []  # /waypoint MarkerArray'den gelen yol kenarları
+
+# Karar (hedef-yoneticisi/karar-node'dan)
+current_karar = "normal"       # "normal" | "slow" | "dur" | "acildurus" | "sag" | "sol"
+karar_last_change_t = time.time()
+karar_log_path = os.environ.get("KARAR_LOG_PATH", "/tmp/karar_transitions.log")
+KARAR_COLORS = {
+    "normal":    {"bg": "#1e1e1e", "text": "#7fdb7f", "label": "NORMAL"},
+    "slow":      {"bg": "#3d2e1e", "text": "#ffb74d", "label": "YAVAS"},
+    "dur":       {"bg": "#3d1e1e", "text": "#ff6e6e", "label": "DUR"},
+    "acildurus": {"bg": "#5d0000", "text": "#ff1744", "label": "ACIL DURUS"},
+    "sag":       {"bg": "#1e2e3d", "text": "#64b5f6", "label": "SAG"},
+    "sol":       {"bg": "#1e2e3d", "text": "#64b5f6", "label": "SOL"},
+}
 
 # Veri Saklama
 current_steer = 0.0
@@ -247,18 +260,50 @@ def odom_callback(msg):
         vehicle_path_y.append(current_y)
 
 def hedef_callback(msg):
-    """Hedef tesliminden gelen waypoint (String: 'x,y' veya 'x1,y1;x2,y2')"""
+    """Hedef tesliminden gelen waypoint (String: 'x1,y1|x2,y2').
+    Sadece güncel WP1 + WP2'yi tut (birikim yok)."""
     global waypoint_list
     try:
-        segments = msg.data.strip().split(';')
+        raw = msg.data.strip()
+        # hedef-yoneticisi '|' ile ayırır; ';' geri-uyum
+        sep = '|' if '|' in raw else ';'
+        segments = raw.split(sep)
+        new_wps = []
+        for seg in segments:
+            parts = seg.split(',')
+            x, y = float(parts[0]), float(parts[1])
+            new_wps.append((x, y))
         with data_lock:
-            for seg in segments:
-                parts = seg.split(',')
-                x, y = float(parts[0]), float(parts[1])
-                if (x, y) not in waypoint_list:
-                    waypoint_list.append((x, y))
+            waypoint_list = new_wps  # önceki WP'leri at, sadece güncel olanları tut
     except (ValueError, IndexError):
         pass
+
+
+def karar_callback(msg):
+    """/karar (String) — karar-node'un yayını. Değişimi logla + arka plan rengini güncelle."""
+    global current_karar, karar_last_change_t
+    new = (msg.data or "").strip().lower()
+    if not new:
+        return
+    with data_lock:
+        if new != current_karar:
+            now = time.time()
+            dur = now - karar_last_change_t
+            entry = (
+                f"[{time.strftime('%H:%M:%S', time.localtime(now))}.{int((now%1)*1000):03d}] "
+                f"KARAR: {current_karar:>10} → {new:<10}  "
+                f"(önceki süre: {dur:6.1f}s)  "
+                f"pos=({current_x:6.2f},{current_y:6.2f}) yaw={np.degrees(current_yaw):6.1f}°  "
+                f"speed={current_speed:.2f} steer={current_steer:.1f} thr={current_throttle:.2f} brk={current_brake:.2f}"
+            )
+            print(entry, flush=True)
+            try:
+                with open(karar_log_path, "a") as f:
+                    f.write(entry + "\n")
+            except OSError:
+                pass
+            current_karar = new
+            karar_last_change_t = now
 
 def waypoint_marker_callback(msg):
     """'/waypoint' MarkerArray'den yol kenarlarını al (LINE_LIST uyumlu)"""
@@ -397,6 +442,7 @@ try:
     rospy.Subscriber('/hedef', String, hedef_callback)
     rospy.Subscriber('/waypoint', MarkerArray, waypoint_marker_callback)
     rospy.Subscriber('/map', OccupancyGrid, map_callback)
+    rospy.Subscriber('/karar', String, karar_callback)
 except rospy.exceptions.ROSInitException:
     print("ROS başlatılamadı!")
 
@@ -426,8 +472,21 @@ if track_overlay_image is not None and track_extent is not None:
                                     zorder=0, interpolation='bilinear')
 
 # Waypoint ve yol çizimleri (dinamik güncellenir)
-line_waypoints, = ax_map.plot([], [], 'ro', markersize=6, alpha=0.8, label='Hedefler', zorder=3)
+line_waypoints, = ax_map.plot([], [], '*', color='#FFD600', markersize=18,
+                              markeredgecolor='#000', markeredgewidth=1.0,
+                              alpha=0.95, label='Hedefler', zorder=10)
+line_wp_connector, = ax_map.plot([], [], '-', color='#FFD600', linewidth=2,
+                                 alpha=0.7, zorder=9)
 line_road_edges, = ax_map.plot([], [], 'y-', linewidth=1, alpha=0.4, label='Yol', zorder=2)
+
+# Karar overlay metni — ekranın sol üst köşesinde büyük etiket
+txt_karar = ax_map.text(0.02, 0.97, 'NORMAL', transform=ax_map.transAxes,
+                        fontsize=20, fontweight='bold',
+                        color=KARAR_COLORS['normal']['text'],
+                        verticalalignment='top',
+                        bbox=dict(boxstyle='round,pad=0.4',
+                                  facecolor='#000', edgecolor='#444', alpha=0.7),
+                        zorder=20)
 
 # Araç yolu
 line_path, = ax_map.plot([], [], 'c-', linewidth=2, alpha=0.6, label='İz', zorder=4)
@@ -517,7 +576,7 @@ def update_plot(frame):
         c_voltage = current_battery_voltage
         c_current = current_battery_current
         c_park = current_park_brake
-        
+
         cx = current_x
         cy = current_y
         cyaw = current_yaw
@@ -528,6 +587,7 @@ def update_plot(frame):
         m_img = map_image
         m_ext = map_extent
         m_cached = map_cached
+        c_karar = current_karar
 
     # --- Harita arka planı ---
     # Track image statik çiziliyor; yoksa OccupancyGrid fallback kullan
@@ -545,10 +605,26 @@ def update_plot(frame):
         with data_lock:
             map_cached = True
 
+    # --- Karar bazlı arka plan rengi + overlay ---
+    karar_cfg = KARAR_COLORS.get(c_karar, KARAR_COLORS['normal'])
+    ax_map.set_facecolor(karar_cfg['bg'])
+    txt_karar.set_text(karar_cfg['label'])
+    txt_karar.set_color(karar_cfg['text'])
+
     # --- Harita ve Navigasyon ---
-    # Hedef waypoint'leri çiz
+    # Hedef waypoint'leri çiz (sarı yıldız) + WP1↔WP2 çizgisi
     if wps:
-        line_waypoints.set_data([w[0] for w in wps], [w[1] for w in wps])
+        xs = [w[0] for w in wps]
+        ys = [w[1] for w in wps]
+        line_waypoints.set_data(xs, ys)
+        if len(wps) >= 2:
+            # araç → WP1 → WP2 zincirini de çiz
+            line_wp_connector.set_data([cx, xs[0], xs[1]], [cy, ys[0], ys[1]])
+        else:
+            line_wp_connector.set_data([cx, xs[0]], [cy, ys[0]])
+    else:
+        line_waypoints.set_data([], [])
+        line_wp_connector.set_data([], [])
 
     # Yol kenarlarını çiz
     if edges:
@@ -612,7 +688,9 @@ def update_plot(frame):
         txt_park.set_color('gray')
         txt_park.set_bbox(dict(boxstyle='round', facecolor='#333333', edgecolor='gray', pad=0.3))
 
-    return (line_path, line_waypoints, line_road_edges, line_steer, txt_gear, txt_speed, txt_rpm, val_soc, val_volt, val_curr, txt_park)
+    return (line_path, line_waypoints, line_wp_connector, line_road_edges,
+            line_steer, txt_gear, txt_speed, txt_rpm, val_soc, val_volt,
+            val_curr, txt_park, txt_karar)
 
 print("Navigasyon paneli açılıyor...")
 ani = animation.FuncAnimation(fig, update_plot, interval=100, blit=False)

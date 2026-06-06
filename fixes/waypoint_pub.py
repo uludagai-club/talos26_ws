@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
+import os
 import rospy
 import yaml
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 
-# YAML'daki kenarları ezip kullanılacak olan özel kenar listesi
+# YAML'daki kenarları kullan (varsa). Yoksa eski hardcoded CUSTOM_EDGES fallback.
+USE_YAML_EDGES = os.environ.get("USE_YAML_EDGES", "1") != "0"
+
 CUSTOM_EDGES = [
     (0,1),(1,2),(1,13),(2,3),(3,4),(4,12),(4,5),(5,6),(6,7),(7,11),(7,8),(8,9),
     (9,10),(13,22),(12,19),(11,16),(10,14),(14,15),(14,32),(15,16),(16,17),
@@ -33,7 +36,16 @@ def publish_waypoints():
         rospy.logerr(f"DOSYA OKUNAMADI: {e}")
         return
 
-    rospy.loginfo("Waypoint yayini basladi (Ozel Edge Listesi Kullaniliyor)...")
+    # Edge kaynagi: yaml'da 'edges' anahtari varsa onu kullan, yoksa hardcoded
+    yaml_edges = []
+    if USE_YAML_EDGES and 'edges' in data and data['edges']:
+        for e in data['edges']:
+            if isinstance(e, (list, tuple)) and len(e) == 2:
+                yaml_edges.append((int(e[0]), int(e[1])))
+    active_edges = yaml_edges if yaml_edges else CUSTOM_EDGES
+    src = "YAML" if yaml_edges else "CUSTOM_EDGES"
+    rospy.loginfo("Waypoint yayini basladi (edge kaynagi: %s, %d edge)...",
+                  src, len(active_edges))
 
     while not rospy.is_shutdown():
         marker_array = MarkerArray()
@@ -76,7 +88,7 @@ def publish_waypoints():
         line_marker.color.b = 1.0
         line_marker.color.a = 1.0
 
-        for u, v in CUSTOM_EDGES:
+        for u, v in active_edges:
             # Düğümlerin YAML'dan okunan koordinatları arasında olup olmadığını kontrol et
             if u in node_coords and v in node_coords:
                 p1 = Point(node_coords[u][0], node_coords[u][1], 0)

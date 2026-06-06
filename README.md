@@ -27,36 +27,58 @@ ssh -T git@github.com
 # "Hi kullanıcıadı! You've successfully authenticated..." yazmalı
 ```
 
-### 2. Repo'yu klonla
+### 2. `~/talos-sim` simülasyon workspace'ini kur (ZORUNLU ÖN ADIM)
+
+Bu stack, TALOS Gazebo simülasyonunu süren ayrı bir ROS workspace'ine (`~/talos-sim`)
+bağımlıdır. `cart_sim.msg` (özellikle `Decision` ve `cart_control` mesajları) buradan
+gelir; container'lar `~/talos-sim/devel`'i bind-mount eder. Bu workspace `~/talos-sim`
+yolunda kurulu ve **derlenmiş** olmadan stack çalışmaz.
+
+```bash
+# TALOS simülasyon workspace'i ~/talos-sim altında olmalı (takım ana deposundan edinilir).
+# Yerleştirdikten sonra mesajları derle:
+cd ~/talos-sim
+catkin_make
+source devel/setup.bash
+```
+
+> `~/talos-sim/devel/lib/python3/dist-packages/cart_sim/msg/_Decision.py` oluştuysa
+> mesajlar derlenmiş demektir. Bu dosya yoksa `karar-node`/`engel-node` `/karar_decision`
+> topic'ini yayınlamaz (sadece `/karar` String).
+
+### 3. Bu repo'yu klonla
 
 ```bash
 cd ~
 git clone git@github.com:uludagai-club/talos26_ws.git
 ```
 
-> `talos26_ws/` klasörü oluşur. `~/talos-sim` ayrı bir repo, karıştırma.
+> `~/talos26_ws/` klasörü oluşur. `~/talos-sim` ile karıştırma; container mount'ları
+> `~/talos-sim/devel`'i mutlak yolla bulur, bu repo nereye klonlanırsa klonlansın çalışır.
 
-### 3. Docker image'larını yükle
+### 4. Docker image (TEK image)
 
-Image'lar `.tar` dosyaları ile dağıtılır (USB/Google Drive). Hepsini aynı klasöre koy, sonra:
+Image'ı elle yüklemen **gerekmez** — `.tar` dağıtımı kaldırıldı. **Tüm servisler tek bir
+`talos-all:latest` image'ını kullanır** ve ilk `./baslat.sh` çalıştığında `Dockerfile.all`'dan
+otomatik **build** edilir (repo kendi kendine yeter):
+
+`talos-all:latest` (`Dockerfile.all`) — `konum`, `talos-map-server`, `hedef-teslimi`,
+`engel-node`, `karar-node`, `traffic-node`, `safe-zone-detector`, `can-bridge`,
+`state-bridge`, `talos-controller`, `can-visualizer` — **11 servisin hepsi**. Eski 6
+prebuilt imajın (`konum`, `talos-map-server`, `hedef-yoneticisi`, `otonom-arac`,
+`karar-node`, `traffic_docker`) ve `talos-control:latest`'in yerini alır. Tüm Python kodu
+bind-mount edildiğinden imaj sadece ROS/pip çalışma-zamanı bağımlılıklarını taşır; kod
+değişince rebuild gerekmez, `docker compose restart <servis>` yeter.
+
+İstersen baştan elle build edebilirsin:
 
 ```bash
-docker load -i konum.tar
-docker load -i talos-map-waypoint.tar
-docker load -i hedef_yoneticisi_v1.tar
-docker load -i engel_node.tar
-docker load -i karar_node_x86.tar
-docker load -i traffic_docker.tar
+docker build -t talos-all:latest -f Dockerfile.all .
 ```
 
-`talos-control` image'ı yoksa ilk `docker compose up`'ta otomatik build edilir.
-
-### 4. `~/talos-sim` workspace'i build et (cart_sim.msg için)
-
-```bash
-cd ~/talos-sim
-catkin_make
-```
+> Not: `talos-all` `ultralytics` (torch + opencv) içerdiğinden ilk build birkaç GB indirir.
+> GPU servisleri (`engel-node`, `traffic-node`, `safe-zone-detector`) için NVIDIA Container
+> Toolkit kurulu olmalı.
 
 ---
 
@@ -65,21 +87,13 @@ catkin_make
 ```bash
 cd ~/talos26_ws
 
-# 1. vcan0 ve X11 hazırla (her oturumda bir kez)
-./setup-vcan.sh
-
-# 2. Host'ta roscore başlat
-source ~/talos-sim/devel/setup.bash
-roscore &
-
-# 3. Sistemi başlat
-docker compose up
-
-# Görselleştirici de istersen
-docker compose --profile gui up
+# Tek komut: vcan0 + X11 + roscore + eksik image build + tüm servisler.
+./baslat.sh
 ```
 
-Durdurmak için `Ctrl+C`.
+`baslat.sh` kanonik giriş noktasıdır — `setup-vcan.sh`, host `roscore`, image build,
+`docker compose --profile gui up -d` ve log streaming'i kendisi yapar; `Ctrl+C` ile
+her şeyi temizleyerek kapatır. `docker compose up` zincirini elle kurmana gerek yok.
 
 ---
 
@@ -137,33 +151,34 @@ git push
 | `hilmi-talos/control.py` | `talos-controller` | Hayır |
 | `hilmi-talos/can_to_talos_cart.py` | `can-bridge` | Hayır |
 | `hilmi-talos/talos_state_to_can.py` | `state-bridge` | Hayır |
-| `lane/scripts/lane_follow_node.py` | `lane-follower` | Hayır |
-| `hilmi-talos/Dockerfile` | `talos-controller` | **Evet** |
-| `hilmi-talos/requirements.txt` | `talos-controller` | **Evet** |
+| `prototip-1/safe_zone_detector.py` | `safe-zone-detector` | Hayır |
+| `Dockerfile.all` | **tüm 11 servis** | **Evet** (`docker build -t talos-all:latest -f Dockerfile.all .`) |
 
-Rebuild gereken durum:
+Rebuild yalnızca `Dockerfile.all` değişince gerekir:
 ```bash
-docker compose build talos-controller
-docker compose up talos-controller
+docker build -t talos-all:latest -f Dockerfile.all .
+docker compose down && ./baslat.sh
 ```
 
 ---
 
 ## Bileşenler
 
-| Servis | Image | Açıklama |
-|--------|-------|----------|
-| `konum-server` | `konum:latest` | Konum/lokalizasyon |
-| `talos-map-server` | `talos-map-server:latest` | Harita + waypoint yayıcı |
-| `hedef-teslimi` | `hedef-yoneticisi:latest` | Hedef yöneticisi (GUI) |
-| `engel-node` | `otonom-arac:latest` | Engel algılama (GPU) |
-| `traffic-node` | `traffic_docker:latest` | Trafik işareti algılama (GPU) |
-| `lane-follower` | `traffic_docker:latest` | Şerit takip (GPU) |
-| `karar-node` | `karar-node:latest` | Karar düğümü |
-| `can-bridge` | `talos-control:latest` | CAN → Gazebo köprüsü |
-| `state-bridge` | `talos-control:latest` | Gazebo → CAN köprüsü |
-| `talos-controller` | `talos-control:latest` | Ana sürüş kontrolcüsü |
-| `can-visualizer` *(opsiyonel)* | `talos-control:latest` | CAN görselleştirici |
+Tüm servisler tek `talos-all:latest` image'ını kullanır; ayrım `command` ile yapılır.
+
+| Servis | Açıklama |
+|--------|----------|
+| `konum-server` | Konum/lokalizasyon |
+| `talos-map-server` | Harita + waypoint yayıcı (`/waypoint`) |
+| `hedef-teslimi` | Hedef yöneticisi (GUI) |
+| `engel-node` | Engel algılama + `pointcloud_to_laserscan` (GPU) |
+| `traffic-node` | Trafik işareti algılama (GPU) |
+| `safe-zone-detector` | Güvenli alan tespiti (GPU, prototip) |
+| `karar-node` | Karar düğümü |
+| `can-bridge` | CAN → Gazebo köprüsü |
+| `state-bridge` | Gazebo → CAN köprüsü |
+| `talos-controller` | Ana sürüş kontrolcüsü |
+| `can-visualizer` *(opsiyonel, `--profile gui`)* | CAN görselleştirici |
 
 ---
 
