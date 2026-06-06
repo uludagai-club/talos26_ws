@@ -107,13 +107,20 @@ write_manifest
 # 1) ROS ORTAMI
 # =============================================================
 echo -e "${BLUE}[1/8] ROS ortami yukleniyor...${NC}"
+# ROS setup.bash, set -u (nounset) altinda cokuyor: catkin profile.d scriptleri
+# ROS_DISTRO/CMAKE_PREFIX_PATH gibi degiskenleri default'suz expand ediyor → temiz
+# bir shell'de (ROS_DISTRO .bashrc'de export edilmemisse) "unbound variable" ile
+# non-interactive shell aninda EXIT eder. Bu yuzden source'lari set +u ile sariyoruz.
+set +u
 if [ -f "$PROJECT_ROOT/devel/setup.bash" ]; then
     # shellcheck disable=SC1091
     source "$PROJECT_ROOT/devel/setup.bash"
+    set -u
     echo -e "${GREEN}[+] ROS ortami yuklendi (devel)${NC}"
 else
     # shellcheck disable=SC1091
-    source /opt/ros/noetic/setup.bash 2>/dev/null
+    source /opt/ros/noetic/setup.bash
+    set -u
     echo -e "${YELLOW}[!] devel/setup.bash bulunamadi, sistem ROS kullaniliyor${NC}"
 fi
 
