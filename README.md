@@ -134,6 +134,32 @@ git push
 > Birden fazla kişi aynı dosyayı değiştirdiyse `git pull` sırasında conflict çıkabilir.
 > O zaman dosyayı aç, `<<<<<<` işaretli kısımları çöz, `git add` + `git commit` yap.
 
+### Node ekleme / arkadaş node'unu güncelleme (TEK İMAJ KURALI)
+
+Bu repo **tek `talos-all:latest` imajı** kullanır. Bir node'u güncellerken/eklerken
+**ayrı `Dockerfile` veya yeni image OLUŞTURMA** — aksi halde repo tekrar çok-imaja döner.
+Kurala göre:
+
+1. **Sadece Python kodu değiştiyse** (mantık/parametre/fix): hiçbir şey yapma.
+   Kod bind-mount'lu → `git pull` + `docker compose restart <servis>`. Rebuild yok.
+
+2. **Node'a YENİ bir bağımlılık (pip/apt) gerekiyorsa**: paketi `Dockerfile.all`'a ekle,
+   sonra `talos-all`'ı yeniden build et:
+   ```bash
+   docker build -t talos-all:latest -f Dockerfile.all .
+   docker compose down && ./baslat.sh
+   ```
+   (Örnek: `karar_bt` `py_trees` gerektirdi → `Dockerfile.all`'a `py_trees==2.2.3` eklendi,
+   ayrı `karar-bt` imajı kullanılmadı.)
+
+3. **Yeni servis ekliyorsan** `docker-compose.yml`'a şu kalıpla ekle — `image: talos-all:latest`
+   + `entrypoint: bash` + `command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/<node>.py"`,
+   ve node'unu `volumes` ile `/app` altına bind-mount et.
+
+> **Arkadaşın node'unu kendi `Dockerfile`'ı ile push ettiyse** (örn. `karar_bt/Dockerfile`):
+> merge sırasında o servisin `build:`/ayrı image'ını kaldır, `image: talos-all:latest` yap;
+> bağımlılıklarını `Dockerfile.all`'a taşı. Kod ve `command`'ı aynen koru.
+
 ---
 
 ## Hangi Dosyayı Değiştirince Ne Olur
