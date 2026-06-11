@@ -52,8 +52,13 @@ services:
   # =========================================================
   # HARITA + WAYPOINT SERVISI
   # =========================================================
+  # Eski hazir imaj: hem map_server (/map, my_map.yaml) hem waypoint_pub
+  # (/waypoint, gomulu final_graph.yaml — CUSTOM_EDGES ile uyumlu eski sema)
+  # calistirir. hedef_yoneticisi.py /map gelmeden cizim yapmaz; talos-all'a
+  # gecis map_server'i dusurdugu icin GUI bos kaliyordu. Yeni graph yapisi
+  # ekipten gelince tek-imaj (talos-all + ros-noetic-map-server) donusu yapilacak.
   talos-map-server:
-    image: talos-all:latest
+    image: talos-map-server:latest
     container_name: talos-map-server
     network_mode: host
     environment:
@@ -61,10 +66,6 @@ services:
       - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./fixes/waypoint_pub.py:/app/waypoint_pub.py:ro
-      # dual_lane_graph.yaml'ı /app/final_graph.yaml olarak bind-mount
-      - ./missions/dual_lane_graph.yaml:/app/final_graph.yaml:ro
-    entrypoint: bash
-    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/waypoint_pub.py"
     logging: *log-defaults
     restart: "no"
 
