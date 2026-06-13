@@ -39,6 +39,8 @@ class Observations:
     engel_d_overall: float = _INF
     engel_angle_deg: float = 0.0
     engel_last_seen: float = 0.0
+    engel_left_last_seen:  float = 0.0   # yan sektör ayrı tazelik (lane-change güvenliği)
+    engel_right_last_seen: float = 0.0
 
     # --- Şerit ---
     lane_offset_px: float = 0.0

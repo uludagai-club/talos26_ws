@@ -34,6 +34,8 @@ def fresh_now(bb: Blackboard):
     bb.obs.yaya_last_seen = t
     bb.obs.levha_last_seen = t
     bb.obs.engel_last_seen = t
+    bb.obs.engel_left_last_seen = t
+    bb.obs.engel_right_last_seen = t
     bb.obs.odom_last_seen = t
 
 
@@ -199,6 +201,91 @@ def run_scenarios():
     bb.obs.yaya_last_seen = time.time() - 5.0  # 5 saniye eski
     tick_n(tree, 1)
     assert_karar("S12", "normal")
+
+    # -----------------------------------------------------------------
+    # S13: Engel acil (merkez < engel_acil_m) → acildurus
+    # -----------------------------------------------------------------
+    print("\nS13: Engel 0.8m merkez → acildurus")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 0.8  # engel_acil_m (1.2) altında
+    bb.obs.engel_d_left = 1.0
+    bb.obs.engel_d_right = 1.0
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S13", "acildurus")
+
+    # -----------------------------------------------------------------
+    # S14: Emergency latch RELEASE — tehlike geçince mühür çözülür → normal
+    # -----------------------------------------------------------------
+    print("\nS14: Acil mühür sonra temiz → release")
+    # S13'ün mührü hâlâ kapalı; ortamı temizle ve release_clear_ticks kadar tick'le
+    n_release = cfg["emergency"]["release_clear_ticks"]
+    bb.obs.engel_present = False
+    bb.obs.engel_d_center = float("inf")
+    bb.obs.yaya_present = False
+    bb.obs.yaya_distance = -1.0
+    for _ in range(n_release + 2):
+        fresh_now(bb); tree.tick()
+    assert_karar("S14", "normal")
+
+    # -----------------------------------------------------------------
+    # S15: Trafik ışığı KIRMIZI → dur
+    # -----------------------------------------------------------------
+    print("\nS15: KIRMIZI ışık 6m → dur")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.levha_isim = "KIRMIZI"
+    bb.obs.levha_distance = 6.0
+    tick_n(tree, 1)
+    assert_karar("S15", "dur")
+
+    # -----------------------------------------------------------------
+    # S16: Trafik ışığı YAVAS (sarı) → slow
+    # -----------------------------------------------------------------
+    print("\nS16: YAVAS ışık 6m → slow")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.levha_isim = "YAVAS"
+    bb.obs.levha_distance = 6.0
+    tick_n(tree, 1)
+    assert_karar("S16", "slow")
+
+    # -----------------------------------------------------------------
+    # S17: Lane-change cooldown — ikinci kaçış cooldown içinde bloklanır → dur
+    # -----------------------------------------------------------------
+    print("\nS17: Cooldown içinde 2. engel → dur (kaçış yok)")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 1.5
+    bb.obs.engel_d_left = 5.0   # sol boş
+    bb.obs.engel_d_right = 1.0
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S17a (ilk kaçış)", "sol")
+    # cooldown henüz dolmadı → sol boş olsa bile kaçamaz, dur'a düşer
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S17b (cooldown blok)", "dur")
+
+    # -----------------------------------------------------------------
+    # S18: Yan sektör verisi bayat → kaçış yapma, dur
+    # -----------------------------------------------------------------
+    print("\nS18: Sol sektör bayat → kaçış yok → dur")
+    bb.obs.__init__(); bb.state.__init__()
+    t = time.time()
+    bb.obs.engel_last_seen = t
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 1.5
+    bb.obs.engel_d_left = 5.0   # değer boş gösteriyor AMA timestamp eski
+    bb.obs.engel_d_right = 5.0
+    bb.obs.engel_left_last_seen = t - 5.0   # bayat
+    bb.obs.engel_right_last_seen = t - 5.0  # bayat
+    for _ in range(n_engel):
+        bb.obs.engel_last_seen = time.time(); tree.tick()
+    assert_karar("S18", "dur")
 
     print("\n" + "=" * 50)
     if failures:

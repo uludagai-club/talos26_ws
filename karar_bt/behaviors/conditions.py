@@ -150,15 +150,31 @@ class EngelMerkezBlokaj(_Cond):
 
 
 class YanSektorBos(_Cond):
-    """Sol veya sağ sektörde belirli mesafeden uzakta engel yok mu?"""
-    def __init__(self, bb, taraf: str, esik_m: float):
+    """Sol veya sağ sektörde belirli mesafeden uzakta engel yok mu?
+
+    Güvenlik: yan sektör sensörü `max_age_s` içinde veri vermediyse FAILURE
+    döner — bilinmeyen yöne şerit değiştirmeyiz (eski davranış: veri yokken
+    'boş' kabul ediyordu, bu riskliydi).
+    """
+    def __init__(self, bb, taraf: str, esik_m: float, max_age_s: float):
         assert taraf in ("sol", "sag")
         super().__init__(f"{taraf.upper()}Bos(>{esik_m}m)?", bb)
         self.taraf = taraf
         self.esik_m = esik_m
+        self.max_age_s = max_age_s
 
     def update(self):
-        d = self.bb.obs.engel_d_left if self.taraf == "sol" else self.bb.obs.engel_d_right
+        if self.taraf == "sol":
+            d = self.bb.obs.engel_d_left
+            last_seen = self.bb.obs.engel_left_last_seen
+        else:
+            d = self.bb.obs.engel_d_right
+            last_seen = self.bb.obs.engel_right_last_seen
+
+        # Yan sektör tazeliği yoksa güvenli tarafta kal: kaçış yapma
+        if not _is_fresh(last_seen, self.max_age_s):
+            return Status.FAILURE
+
         # inf veya eşikten büyük → boş
         if d is None or not math.isfinite(d):
             return Status.SUCCESS

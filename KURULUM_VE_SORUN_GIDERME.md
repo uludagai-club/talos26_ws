@@ -237,7 +237,7 @@ docker compose up
 | `fixes/konum.py` | konum-server | Hayır |
 | `fixes/waypoint_pub.py` | talos-map-server | Hayır |
 | `fixes/engel_node_fixed.py` | engel-node | Hayır |
-| `fixes/karar.py` | karar-node | Hayır |
+| `karar_bt/` (BT karar düğümü) | karar-node | Hayır |
 | `fixes/yolov8_ros_node_fixed.py` | traffic-node | Hayır |
 | `hilmi-talos/control.py` | talos-controller | Hayır |
 | `hilmi-talos/can_to_talos_cart.py` | can-bridge (yerel python) | Hayır |

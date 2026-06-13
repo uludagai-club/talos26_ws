@@ -22,9 +22,8 @@ from bb import Blackboard
 from behaviors.conditions import (
     YayaFresh, LevhaFresh, EngelFresh,
     YayaVarMi, YayaCokYakin, YayaYakin, YayaOrtaMesafe,
-    EngelVar, EngelCokYakin, EngelMerkezBlokaj, YanSektorBos,
+    EngelCokYakin, EngelMerkezBlokaj, YanSektorBos,
     LevhaIs, LevhaIcindeMesafe,
-    EmergencyLatched,
     LaneChangeCooldownOk,
 )
 from behaviors.actions import (
@@ -142,13 +141,13 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     # 5. Engelden kaçınma
     # ============================================================
     avoid_left = Sequence("AvoidLeft", memory=False, children=[
-        YanSektorBos(bb, "sol", dist["engel_yan_clear_m"]),
+        YanSektorBos(bb, "sol", dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
         LaneChangeCooldownOk(bb, lc["cooldown_s"]),
         LaneChangeStamp(bb),
         SetKarar("Karar=SOL(engel)", bb, karar="sol", reason="engel_sol_kacis"),
     ])
     avoid_right = Sequence("AvoidRight", memory=False, children=[
-        YanSektorBos(bb, "sag", dist["engel_yan_clear_m"]),
+        YanSektorBos(bb, "sag", dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
         LaneChangeCooldownOk(bb, lc["cooldown_s"]),
         LaneChangeStamp(bb),
         SetKarar("Karar=SAG(engel)", bb, karar="sag", reason="engel_sag_kacis"),

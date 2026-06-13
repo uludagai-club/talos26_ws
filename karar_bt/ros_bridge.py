@@ -116,11 +116,13 @@ class RosBridge:
 
     def _on_engel_sol(self, msg: Float32):
         v = msg.data if math.isfinite(msg.data) else float("inf")
-        self.bb.write(engel_d_left=v, engel_last_seen=time.time())
+        now = time.time()
+        self.bb.write(engel_d_left=v, engel_left_last_seen=now, engel_last_seen=now)
 
     def _on_engel_sag(self, msg: Float32):
         v = msg.data if math.isfinite(msg.data) else float("inf")
-        self.bb.write(engel_d_right=v, engel_last_seen=time.time())
+        now = time.time()
+        self.bb.write(engel_d_right=v, engel_right_last_seen=now, engel_last_seen=now)
 
     def _on_line(self, msg: Float32):
         self.bb.write(line_angle_deg=float(msg.data), lane_last_seen=time.time())
