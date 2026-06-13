@@ -31,6 +31,25 @@ def _is_fresh(last_seen: float, max_age_s: float) -> bool:
     return (time.time() - last_seen) <= max_age_s
 
 
+# ============================================================
+# Hıza-duyarlı eşik yardımcıları
+# ============================================================
+def _speed_mps(bb: Blackboard, odom_max_age_s: float) -> float:
+    """Taze odom varsa hız (m/s); yoksa 0.0 (güvenli: eşik tabana iner)."""
+    if not _is_fresh(bb.obs.odom_last_seen, odom_max_age_s):
+        return 0.0
+    return max(0.0, bb.obs.speed_kmh / 3.6)
+
+
+def _adaptive_esik(base_m: float, bb: Blackboard, gain_s: float,
+                   max_extra_m: float, odom_max_age_s: float) -> float:
+    """Hıza göre genişleyen eşik. gain_s<=0 → taban eşik (değişiklik yok)."""
+    if gain_s <= 0.0:
+        return base_m
+    extra = min(gain_s * _speed_mps(bb, odom_max_age_s), max_extra_m)
+    return base_m + extra
+
+
 class YayaFresh(_Cond):
     def __init__(self, bb, max_age_s):
         super().__init__("YayaFresh?", bb)
@@ -91,25 +110,33 @@ class YayaCokYakin(_Cond):
 
 
 class YayaYakin(_Cond):
-    """Tam duruş eşiği."""
-    def __init__(self, bb, esik_m):
-        super().__init__(f"YayaYakin(<{esik_m}m)?", bb)
+    """Tam duruş eşiği (hıza-duyarlı)."""
+    def __init__(self, bb, esik_m, gain_s=0.0, max_extra_m=0.0, odom_max_age_s=0.5):
+        super().__init__(f"YayaYakin(<{esik_m}m+v)?", bb)
         self.esik_m = esik_m
+        self.gain_s = gain_s
+        self.max_extra_m = max_extra_m
+        self.odom_max_age_s = odom_max_age_s
 
     def update(self):
         d = self.bb.obs.yaya_distance
-        return Status.SUCCESS if (d is not None and 0 < d < self.esik_m) else Status.FAILURE
+        esik = _adaptive_esik(self.esik_m, self.bb, self.gain_s, self.max_extra_m, self.odom_max_age_s)
+        return Status.SUCCESS if (d is not None and 0 < d < esik) else Status.FAILURE
 
 
 class YayaOrtaMesafe(_Cond):
-    """Yavaşlama eşiği."""
-    def __init__(self, bb, esik_m):
-        super().__init__(f"YayaOrta(<{esik_m}m)?", bb)
+    """Yavaşlama eşiği (hıza-duyarlı)."""
+    def __init__(self, bb, esik_m, gain_s=0.0, max_extra_m=0.0, odom_max_age_s=0.5):
+        super().__init__(f"YayaOrta(<{esik_m}m+v)?", bb)
         self.esik_m = esik_m
+        self.gain_s = gain_s
+        self.max_extra_m = max_extra_m
+        self.odom_max_age_s = odom_max_age_s
 
     def update(self):
         d = self.bb.obs.yaya_distance
-        return Status.SUCCESS if (d is not None and 0 < d < self.esik_m) else Status.FAILURE
+        esik = _adaptive_esik(self.esik_m, self.bb, self.gain_s, self.max_extra_m, self.odom_max_age_s)
+        return Status.SUCCESS if (d is not None and 0 < d < esik) else Status.FAILURE
 
 
 # ============================================================
@@ -137,16 +164,20 @@ class EngelCokYakin(_Cond):
 
 
 class EngelMerkezBlokaj(_Cond):
-    """Merkez sektörde sürüş engelleyici mesafede engel var mı?"""
-    def __init__(self, bb, esik_m):
-        super().__init__(f"EngelMerkezBlokaj(<{esik_m}m)?", bb)
+    """Merkez sektörde sürüş engelleyici mesafede engel var mı? (hıza-duyarlı)"""
+    def __init__(self, bb, esik_m, gain_s=0.0, max_extra_m=0.0, odom_max_age_s=0.5):
+        super().__init__(f"EngelMerkezBlokaj(<{esik_m}m+v)?", bb)
         self.esik_m = esik_m
+        self.gain_s = gain_s
+        self.max_extra_m = max_extra_m
+        self.odom_max_age_s = odom_max_age_s
 
     def update(self):
         d = self.bb.obs.engel_d_center
         if d is None or not math.isfinite(d):
             return Status.FAILURE
-        return Status.SUCCESS if d < self.esik_m else Status.FAILURE
+        esik = _adaptive_esik(self.esik_m, self.bb, self.gain_s, self.max_extra_m, self.odom_max_age_s)
+        return Status.SUCCESS if d < esik else Status.FAILURE
 
 
 class YanSektorBos(_Cond):

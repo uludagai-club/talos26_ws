@@ -25,6 +25,17 @@ distances:
   levha_oku_m:      10.0
   yon_levha_max_m:   5.0
 
+# Hıza-duyarlı tepki mesafesi.
+# efektif_esik = taban_esik + gain_s * hiz_mps  (max_extra_m ile sınırlı)
+# gain_s ≈ "ileriye bakış / reaksiyon süresi" (saniye): bu kadar saniyelik
+# yolu eşiğe ekler. Odom bayatsa veya hız 0 ise eşik tabanda kalır (güvenli).
+speed_adaptive:
+  enabled: true
+  yaya_dur_gain_s:    0.5   # tam duruş eşiği büyümesi
+  yaya_yavas_gain_s:  0.8   # yavaşlama eşiği büyümesi
+  engel_block_gain_s: 0.4   # engel blokaj eşiği büyümesi
+  max_extra_m:        6.0   # hız katkısının üst sınırı
+
 # Zamanlayıcılar
 timers:
   dur_levhasi_bekleme_s:    3.0

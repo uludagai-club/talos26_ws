@@ -41,6 +41,14 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     deb = p["debounce"]
     emer = p["emergency"]
     lc = p["lane_change"]
+    sa = p.get("speed_adaptive", {})
+    # Hız-uyumu kapalıysa gain'leri 0'la → eşikler tabanda kalır
+    sa_on = bool(sa.get("enabled", False))
+    sa_max_extra = sa.get("max_extra_m", 0.0)
+    odom_age = fresh["odom_max_age_s"]
+
+    def _gain(key: str) -> float:
+        return sa.get(key, 0.0) if sa_on else 0.0
 
     # ============================================================
     # 0. Safety: önce latch'i çözmeyi dene; çözüldüyse FAILURE
@@ -92,7 +100,9 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         Selector("YayaAksiyon", memory=False, children=[
             Sequence("YayaDur", memory=False, children=[
                 Debounce("YayaYakinDeb",
-                         YayaYakin(bb, dist["yaya_dur_m"]),
+                         YayaYakin(bb, dist["yaya_dur_m"],
+                                   gain_s=_gain("yaya_dur_gain_s"),
+                                   max_extra_m=sa_max_extra, odom_max_age_s=odom_age),
                          bb, key="yaya_yakin",
                          min_consecutive=deb["yaya_min_consecutive"]),
                 SetKarar("Karar=DUR(yaya)", bb, karar="dur",
@@ -100,7 +110,9 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
             ]),
             Sequence("YayaSlow", memory=False, children=[
                 Debounce("YayaOrtaDeb",
-                         YayaOrtaMesafe(bb, dist["yaya_yavas_m"]),
+                         YayaOrtaMesafe(bb, dist["yaya_yavas_m"],
+                                        gain_s=_gain("yaya_yavas_gain_s"),
+                                        max_extra_m=sa_max_extra, odom_max_age_s=odom_age),
                          bb, key="yaya_orta",
                          min_consecutive=deb["yaya_min_consecutive"]),
                 SetKarar("Karar=SLOW(yaya)", bb, karar="slow",
@@ -155,7 +167,9 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     obstacle_avoidance = Sequence("ObstacleAvoidance", memory=False, children=[
         EngelFresh(bb, fresh["engel_max_age_s"]),
         Debounce("EngelMerkezDeb",
-                 EngelMerkezBlokaj(bb, dist["engel_block_m"]),
+                 EngelMerkezBlokaj(bb, dist["engel_block_m"],
+                                   gain_s=_gain("engel_block_gain_s"),
+                                   max_extra_m=sa_max_extra, odom_max_age_s=odom_age),
                  bb, key="engel_blokaj",
                  min_consecutive=deb["engel_min_consecutive"]),
         Selector("AvoidOrStop", memory=False, children=(

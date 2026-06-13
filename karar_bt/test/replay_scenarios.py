@@ -287,6 +287,35 @@ def run_scenarios():
         bb.obs.engel_last_seen = time.time(); tree.tick()
     assert_karar("S18", "dur")
 
+    # -----------------------------------------------------------------
+    # S19: Yüksek hızda yaya 5m → hız eşiği genişler → erken DUR
+    #      (taban dur eşiği 4.0m; 5m normalde 'slow' olurdu)
+    # -----------------------------------------------------------------
+    print("\nS19: 30km/h'de yaya 5m → erken dur")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.speed_kmh = 30.0          # ~8.3 m/s
+    bb.obs.yaya_present = True
+    bb.obs.yaya_distance = 5.0
+    for _ in range(n_yaya):
+        fresh_now(bb); bb.obs.speed_kmh = 30.0; tree.tick()
+    assert_karar("S19", "dur")
+
+    # -----------------------------------------------------------------
+    # S20: Aynı 5m ama ODOM BAYAT → hız 0 sayılır → taban eşik → slow
+    #      (güvenli fallback: hızı bilmiyorsak eşik büyütme)
+    # -----------------------------------------------------------------
+    print("\nS20: yaya 5m ama odom bayat → taban eşik → slow")
+    bb.obs.__init__(); bb.state.__init__()
+    bb.obs.yaya_present = True
+    bb.obs.yaya_distance = 5.0
+    bb.obs.speed_kmh = 30.0
+    for _ in range(n_yaya):
+        bb.obs.yaya_last_seen = time.time()        # yaya taze
+        bb.obs.odom_last_seen = time.time() - 5.0  # odom bayat
+        tree.tick()
+    assert_karar("S20", "slow")
+
     print("\n" + "=" * 50)
     if failures:
         print(f"FAIL: {len(failures)} senaryo başarısız")
