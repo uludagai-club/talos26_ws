@@ -438,6 +438,26 @@ def run_scenarios():
     tick_n(tree, 1)
     assert_karar("S26c (grace sonrası tekrar dur)", "dur")
 
+    # -----------------------------------------------------------------
+    # S27: Sarı ışık aksiyonu paramı — yellow_action="dur" iken YAVAS → dur
+    #      (varsayılan "slow" davranışı S16'da doğrulanıyor).
+    # -----------------------------------------------------------------
+    print("\nS27: traffic_light.yellow_action='dur' → YAVAS ışık → dur")
+    cfg_dur = load_cfg()
+    cfg_dur.setdefault("traffic_light", {})["yellow_action"] = "dur"
+    bb2 = Blackboard()
+    tree2 = py_trees.trees.BehaviourTree(build_root(bb2, cfg_dur))
+    fresh_now(bb2)
+    bb2.obs.levha_isim = "YAVAS"
+    bb2.obs.levha_distance = 6.0
+    tree2.tick()
+    got = bb2.last_decision.get("karar")
+    if got != "dur":
+        failures.append(f"[S27] beklenen=dur ama={got}")
+        print(f"  ✗ S27: beklenen=dur ama={got}")
+    else:
+        print(f"  ✓ S27: {got}  (reason: {bb2.last_decision.get('reason')})")
+
     print("\n" + "=" * 50)
     if failures:
         print(f"FAIL: {len(failures)} senaryo başarısız")

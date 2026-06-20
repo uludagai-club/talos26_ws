@@ -36,6 +36,12 @@ speed_adaptive:
   engel_block_gain_s: 0.4   # engel blokaj eşiği büyümesi
   max_extra_m:        6.0   # hız katkısının üst sınırı
 
+# Trafik ışığı davranışı
+traffic_light:
+  # Sarı (YAVAS) ışıkta ne yapılsın: "slow" (yavaşla, varsayılan) | "dur" (tam dur).
+  # KTR §7.5.5 "kırmızı veya sarı → tam dur" istiyor; sahada flip için param.
+  yellow_action: slow
+
 # Zamanlayıcılar
 timers:
   dur_levhasi_bekleme_s:    3.0

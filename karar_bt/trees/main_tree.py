@@ -144,10 +144,13 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         LevhaIs(bb, ("KIRMIZI",), max_mesafe_m=dist["levha_oku_m"]),
         SetKarar("Karar=DUR(kirmizi)", bb, karar="dur", reason="trafik_kirmizi"),
     ])
+    # Sarı (YAVAS) ışık aksiyonu paramla seçilir: "slow" (varsayılan) | "dur".
+    _yellow = str(p.get("traffic_light", {}).get("yellow_action", "slow")).lower()
+    _yellow = _yellow if _yellow in ("slow", "dur") else "slow"
     traffic_light_yellow = Sequence("TrafficLightYellow", memory=False, children=[
         LevhaFresh(bb, fresh["levha_max_age_s"]),
         LevhaIs(bb, ("YAVAS",), max_mesafe_m=dist["levha_oku_m"]),
-        SetKarar("Karar=SLOW(sari)", bb, karar="slow", reason="trafik_sari"),
+        SetKarar(f"Karar={_yellow.upper()}(sari)", bb, karar=_yellow, reason="trafik_sari"),
     ])
 
     # ============================================================
