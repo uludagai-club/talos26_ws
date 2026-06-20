@@ -123,6 +123,10 @@ class DurLevhasiFSM(py_trees.behaviour.Behaviour):
       kadar yeniden tetiklenmesin (FSM 'released' kalır).
 
     Yeniden silahlanma: levha "NONE" olur veya mesafe >> esik → 'idle'.
+
+    release_grace_s: Bekleme bittikten (release) sonra bu süre boyunca aynı DUR
+    levhasının (algı titremesi ya da araç hâlâ levhaya yakınken yeniden görünmesi)
+    yeniden tetiklenip İKİNCİ bir duruşa yol açması engellenir.
     """
 
     def __init__(self, bb: Blackboard, stop_esik_m: float, oku_esik_m: float,
@@ -151,6 +155,10 @@ class DurLevhasiFSM(py_trees.behaviour.Behaviour):
 
         # APPROACH
         if s.stop_sign_phase == "idle":
+            # Release grace: yeni durulan levhanın çift tetiklenmesini önle
+            if (self.release_grace_s > 0.0 and s.stop_sign_released_s > 0.0
+                    and (time.time() - s.stop_sign_released_s) < self.release_grace_s):
+                return Status.FAILURE
             if d >= self.stop_esik_m and d <= self.oku_esik_m:
                 self.bb.last_decision = {
                     "karar": "slow",
@@ -180,6 +188,7 @@ class DurLevhasiFSM(py_trees.behaviour.Behaviour):
                 return Status.SUCCESS
             else:
                 s.stop_sign_phase = "released"
+                s.stop_sign_released_s = time.time()
 
         # RELEASED: bu tick'te SUCCESS dönmeyelim ki üst selector
         # cruise'a düşsün; levha görüşten çıkınca 'idle'a sıfırlanır.
@@ -190,12 +199,44 @@ class DurLevhasiFSM(py_trees.behaviour.Behaviour):
 # Şerit değiştirme bildirimi (cooldown güncelle)
 # ============================================================
 class LaneChangeStamp(py_trees.behaviour.Behaviour):
-    """Lane change tetiklendi — cooldown sayacını başlat ve SUCCESS dön."""
+    """Lane change tetiklendi — cooldown sayacını başlat, yönü kilitle, SUCCESS dön.
 
-    def __init__(self, bb: Blackboard):
-        super().__init__("LaneChangeStamp")
+    `direction` ("sol"/"sag") manevra penceresi boyunca LaneChangeHold dalı
+    tarafından yeniden yayınlanır (control.py manevrayı kesmesin diye).
+    """
+
+    def __init__(self, bb: Blackboard, direction: str):
+        super().__init__(f"LaneChangeStamp({direction})")
+        assert direction in ("sol", "sag")
         self.bb = bb
+        self.direction = direction
 
     def update(self):
         self.bb.state.last_lane_change_s = time.time()
+        self.bb.state.lane_change_dir = self.direction
+        return Status.SUCCESS
+
+
+class HoldLaneChange(py_trees.behaviour.Behaviour):
+    """Devam eden şerit değişiminin yön komutunu yeniden yayınlar.
+
+    LaneChangeInProgress koşulu SUCCESS verdiğinde çağrılır; kilitli yönü
+    (`bb.state.lane_change_dir`) aynen "sol"/"sag" olarak basar. Böylece
+    control.py'nin başlattığı manevra (LANE_CHANGE_DURATION) kesintisiz tamamlanır.
+    """
+
+    def __init__(self, bb: Blackboard):
+        super().__init__("HoldLaneChange")
+        self.bb = bb
+
+    def update(self):
+        d = self.bb.state.lane_change_dir
+        if d not in ("sol", "sag"):
+            return Status.FAILURE
+        self.bb.last_decision = {
+            "karar": d,
+            "reason": f"lane_change_hold:{d}",
+            "phase": "lane_change",
+            "wait_remaining_s": 0.0,
+        }
         return Status.SUCCESS

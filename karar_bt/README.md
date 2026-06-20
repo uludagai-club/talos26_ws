@@ -69,6 +69,7 @@ Root (Selector)
 ├── 2. Pedestrian                (yaya<4m → "dur", yaya<12m → "slow") + debounce
 ├── 3. StopSign FSM              (approach="slow" → hold="dur" 3s → released)
 ├── 4. TrafficLight              ("KIRMIZI"→dur, "YAVAS"→slow)
+├── 5a.LaneChangeHold            (başlayan manevrayı maneuver_hold_s boyunca tut — control.py senkronu)
 ├── 5. Obstacle avoidance        (lane change varsa "sol"/"sag", yoksa "dur")
 ├── 6. DirectionSign             (SAG/SOL<5m → "sag"/"sol")
 ├── 7. SpeedLimit                ("30"/"OKUL"<10m → "slow")
@@ -149,8 +150,9 @@ cd ~/talos26_ws/karar_bt
 python3 -m test.replay_scenarios
 ```
 
-23 senaryo (yaya yakın/orta/uzak, DUR levhası 3-faz, engel kaçınma, hız sınırı,
-sensör stale, **yeni PoseArray detektörü S21-S23**) tek seferde çalışır.
+26 senaryo (yaya yakın/orta/uzak, DUR levhası 3-faz, engel kaçınma, hız sınırı,
+sensör stale, **yeni PoseArray detektörü S21-S23**, **şerit-değişimi manevra
+kilidi S17/S24/S25**, **DUR release_grace çift-duruş S26**) tek seferde çalışır.
 Çıkış kodu 0 = hepsi geçti.
 
 Engel füzyon geometrisini ayrıca test et (ROS yok):

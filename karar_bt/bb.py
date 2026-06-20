@@ -81,9 +81,13 @@ class StatePersist:
     # DUR levhası FSM: "idle" | "holding" | "released"
     stop_sign_phase: str = "idle"
     stop_sign_hold_start_s: float = 0.0
+    stop_sign_released_s: float = 0.0   # son release zamanı — release_grace_s ile çift duruşu önler
 
-    # Lane change cooldown
+    # Lane change cooldown + manevra kilidi (control.py edge-tetiklemeli, manevrayı
+    # kendi LANE_CHANGE_DURATION süresince sürdürür → BT aynı yönü o pencere boyunca
+    # tutmalı; aksi halde "dur"/"normal" manevrayı keser).
     last_lane_change_s: float = 0.0
+    lane_change_dir: str = ""          # "sol" | "sag" | "" — devam eden manevranın yönü
 
     # Debounce sayaçları (key -> ardışık true tick sayısı)
     debounce: dict = field(default_factory=dict)

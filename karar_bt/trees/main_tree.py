@@ -6,6 +6,7 @@
   2. Yaya geçidi (yakın → dur, orta → slow)
   3. DUR levhası (approach → slow, hold → dur 3s, released → cruise'a düşer)
   4. Trafik ışığı (KIRMIZI/YAVAS)
+  5a. Şerit değişimi kilidi (devam eden manevrayı control.py senkronuyla tut)
   5. Engelden kaçınma (lane change varsa, yoksa dur)
   6. Yön levhası (SAG/SOL)
   7. Hız sınırı (30/OKUL)
@@ -24,11 +25,11 @@ from behaviors.conditions import (
     YayaVarMi, YayaCokYakin, YayaYakin, YayaOrtaMesafe,
     EngelCokYakin, EngelMerkezBlokaj, YanSektorBos,
     LevhaIs, LevhaIcindeMesafe,
-    LaneChangeCooldownOk,
+    LaneChangeCooldownOk, LaneChangeInProgress,
 )
 from behaviors.actions import (
     SetKarar, LatchEmergency, ReleaseEmergencyIfClear,
-    DurLevhasiFSM, LaneChangeStamp,
+    DurLevhasiFSM, LaneChangeStamp, HoldLaneChange,
 )
 from behaviors.decorators import Debounce
 
@@ -155,13 +156,13 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     avoid_left = Sequence("AvoidLeft", memory=False, children=[
         YanSektorBos(bb, "sol", dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
         LaneChangeCooldownOk(bb, lc["cooldown_s"]),
-        LaneChangeStamp(bb),
+        LaneChangeStamp(bb, "sol"),
         SetKarar("Karar=SOL(engel)", bb, karar="sol", reason="engel_sol_kacis"),
     ])
     avoid_right = Sequence("AvoidRight", memory=False, children=[
         YanSektorBos(bb, "sag", dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
         LaneChangeCooldownOk(bb, lc["cooldown_s"]),
-        LaneChangeStamp(bb),
+        LaneChangeStamp(bb, "sag"),
         SetKarar("Karar=SAG(engel)", bb, karar="sag", reason="engel_sag_kacis"),
     ])
     obstacle_avoidance = Sequence("ObstacleAvoidance", memory=False, children=[
@@ -180,20 +181,32 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     ])
 
     # ============================================================
+    # 5b. Şerit değişimi kilidi (control.py manevra senkronu)
+    #     Bir kaçış/yön-levhası şerit değişimi başlatıldıysa, control.py o
+    #     manevrayı LANE_CHANGE_DURATION (~2s) boyunca kendi sürer. Bu pencerede
+    #     aynı yön komutunu tutarız; aksi halde "dur"/"normal" manevrayı keser.
+    #     Emergency/yaya/dur-levhası/kırmızı bu dalın ÜZERİNDE → her zaman önceliklidir.
+    # ============================================================
+    lane_change_hold = Sequence("LaneChangeHold", memory=False, children=[
+        LaneChangeInProgress(bb, lc.get("maneuver_hold_s", 2.0)),
+        HoldLaneChange(bb),
+    ])
+
+    # ============================================================
     # 6. Yön levhaları (SAG/SOL)
     # ============================================================
     direction_right = Sequence("DirectionRight", memory=False, children=[
         LevhaFresh(bb, fresh["levha_max_age_s"]),
         LevhaIcindeMesafe(bb, "SAG", dist["yon_levha_max_m"]),
         LaneChangeCooldownOk(bb, lc["cooldown_s"]),
-        LaneChangeStamp(bb),
+        LaneChangeStamp(bb, "sag"),
         SetKarar("Karar=SAG(levha)", bb, karar="sag", reason="yon_levhasi_sag"),
     ])
     direction_left = Sequence("DirectionLeft", memory=False, children=[
         LevhaFresh(bb, fresh["levha_max_age_s"]),
         LevhaIcindeMesafe(bb, "SOL", dist["yon_levha_max_m"]),
         LaneChangeCooldownOk(bb, lc["cooldown_s"]),
-        LaneChangeStamp(bb),
+        LaneChangeStamp(bb, "sol"),
         SetKarar("Karar=SOL(levha)", bb, karar="sol", reason="yon_levhasi_sol"),
     ])
 
@@ -221,6 +234,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         stop_sign,
         traffic_light_red,
         traffic_light_yellow,
+        lane_change_hold,      # devam eden manevrayı tut (control.py senkronu)
         obstacle_avoidance,
         direction_right,
         direction_left,

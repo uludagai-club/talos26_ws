@@ -75,6 +75,10 @@ obstacle:
 lane_change:
   enabled: true
   cooldown_s: 4.0           # ardışık lane change arası bekleme
+  # control.py şerit değişimini kenar-tetiklemeli başlatıp LANE_CHANGE_DURATION
+  # süresince kendi sürer. BT bu süre boyunca aynı yön komutunu tutar (yoksa
+  # "dur"/"normal" manevrayı keser). control.py LANE_CHANGE_DURATION ile eşit tut.
+  maneuver_hold_s: 2.0
 
 # Snapshot/debug
 debug:

@@ -269,3 +269,23 @@ class LaneChangeCooldownOk(_Cond):
         if last <= 0.0:
             return Status.SUCCESS
         return Status.SUCCESS if (time.time() - last) >= self.cooldown_s else Status.FAILURE
+
+
+class LaneChangeInProgress(_Cond):
+    """Bir şerit değişimi başlatıldı ve manevra penceresi (hold_s) henüz dolmadı mı?
+
+    control.py şerit değişimini kenar-tetiklemeli başlatıp LANE_CHANGE_DURATION
+    süresince kendi sürer. Bu pencerede BT aynı yön komutunu tutmalı — yoksa
+    "dur" (fren) veya "normal" (manevrayı iptal) komutu manevrayı keser.
+    """
+    def __init__(self, bb, hold_s: float):
+        super().__init__(f"LaneChangeInProgress(<{hold_s}s)?", bb)
+        self.hold_s = hold_s
+
+    def update(self):
+        s = self.bb.state
+        if not s.lane_change_dir:
+            return Status.FAILURE
+        if s.last_lane_change_s <= 0.0:
+            return Status.FAILURE
+        return Status.SUCCESS if (time.time() - s.last_lane_change_s) < self.hold_s else Status.FAILURE

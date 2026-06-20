@@ -270,9 +270,12 @@ def run_scenarios():
     assert_karar("S16", "slow")
 
     # -----------------------------------------------------------------
-    # S17: Lane-change cooldown — ikinci kaçış cooldown içinde bloklanır → dur
+    # S17: Şerit değişimi manevra kilidi — başlatılan kaçış, manevra penceresi
+    #      (maneuver_hold_s) boyunca aynı yönde TUTULUR. control.py manevrayı
+    #      kenar-tetiklemeli başlatıp kendi sürdüğü için BT "dur"a düşmemeli;
+    #      yoksa fren manevrayı keser.
     # -----------------------------------------------------------------
-    print("\nS17: Cooldown içinde 2. engel → dur (kaçış yok)")
+    print("\nS17: Engel kaçışı başlayınca manevra penceresinde 'sol' tutulur")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.engel_present = True
@@ -282,10 +285,10 @@ def run_scenarios():
     for _ in range(n_engel):
         fresh_now(bb); tree.tick()
     assert_karar("S17a (ilk kaçış)", "sol")
-    # cooldown henüz dolmadı → sol boş olsa bile kaçamaz, dur'a düşer
+    # Manevra penceresi içinde: engel hâlâ merkezde olsa da aynı yön tutulur
     for _ in range(n_engel):
         fresh_now(bb); tree.tick()
-    assert_karar("S17b (cooldown blok)", "dur")
+    assert_karar("S17b (manevra kilidi)", "sol")
 
     # -----------------------------------------------------------------
     # S18: Yan sektör verisi bayat → kaçış yapma, dur
@@ -367,6 +370,73 @@ def run_scenarios():
         apply_fused(bb, [(0.8, 0.0)])
         tree.tick()
     assert_karar("S23", "acildurus")
+
+    # -----------------------------------------------------------------
+    # S24: Manevra penceresi DOLDUKTAN sonra engel hâlâ merkezde ve iki yan da
+    #      kapalı/cooldown → artık tutma yok → dur.
+    # -----------------------------------------------------------------
+    print("\nS24: Manevra penceresi bitince engel sürüyor + yan kapalı → dur")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 1.5
+    bb.obs.engel_d_left = 1.0   # sol dolu
+    bb.obs.engel_d_right = 1.0  # sağ dolu
+    # Eski bir şerit değişimi başlatılmış gibi yap ama penceresi çoktan dolmuş
+    hold_s = cfg["lane_change"].get("maneuver_hold_s", 2.0)
+    bb.state.lane_change_dir = "sol"
+    bb.state.last_lane_change_s = time.time() - (hold_s + 1.0)
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S24", "dur")
+
+    # -----------------------------------------------------------------
+    # S25: Yön levhası SAG — ilk tick "sag", sonraki tick'te de "sag" tutulur
+    #      (eski hata: 2. tick'te cooldown nedeniyle "normal"e düşüp control.py'de
+    #       manevrayı iptal ediyordu).
+    # -----------------------------------------------------------------
+    print("\nS25: SAG levhası — manevra penceresinde 'sag' tutulur ('normal' değil)")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.levha_isim = "SAG"
+    bb.obs.levha_distance = 3.0
+    tick_n(tree, 1)
+    assert_karar("S25a (ilk)", "sag")
+    # Sonraki tick: levha hâlâ görünür; cooldown başladı ama manevra kilidi tutar
+    fresh_now(bb)
+    bb.obs.levha_isim = "SAG"
+    bb.obs.levha_distance = 3.0
+    tick_n(tree, 1)
+    assert_karar("S25b (manevra kilidi)", "sag")
+
+    # -----------------------------------------------------------------
+    # S26: DUR levhası release_grace — bekleme bitip release olduktan sonra,
+    #      levha kısa süre sonra tekrar yakın görünse bile İKİNCİ duruş tetiklenmez
+    #      (grace içinde). Grace dolunca yeniden tetiklenir.
+    # -----------------------------------------------------------------
+    print("\nS26: DUR release_grace — çift duruş engellenir, grace sonrası tekrar dur")
+    grace_s = cfg["timers"].get("dur_levhasi_release_grace_s", 1.5)
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.levha_isim = "DUR"
+    bb.obs.levha_distance = 2.5  # < stop_esik → holding
+    # Beklemeyi çoktan tamamlanmış say → bu tick release olur
+    bb.state.stop_sign_phase = "holding"
+    bb.state.stop_sign_hold_start_s = time.time() - (cfg["timers"]["dur_levhasi_bekleme_s"] + 0.5)
+    tick_n(tree, 1)
+    assert_karar("S26a (release)", "normal")
+    # Levha görüşten çıkıp idle'a sıfırlansın
+    fresh_now(bb); bb.obs.levha_isim = "NONE"; bb.obs.levha_distance = -1.0
+    tick_n(tree, 1)
+    # Levha grace içinde tekrar yakın görünür → çift duruş YOK → normal
+    fresh_now(bb); bb.obs.levha_isim = "DUR"; bb.obs.levha_distance = 2.5
+    tick_n(tree, 1)
+    assert_karar("S26b (grace içinde, çift duruş yok)", "normal")
+    # Grace dolduktan sonra aynı levha → yeniden duruş tetiklenir
+    bb.state.stop_sign_released_s = time.time() - (grace_s + 0.5)
+    fresh_now(bb); bb.obs.levha_isim = "DUR"; bb.obs.levha_distance = 2.5
+    tick_n(tree, 1)
+    assert_karar("S26c (grace sonrası tekrar dur)", "dur")
 
     print("\n" + "=" * 50)
     if failures:
