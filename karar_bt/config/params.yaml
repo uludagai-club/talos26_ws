@@ -51,6 +51,26 @@ debounce:
 emergency:
   release_clear_ticks: 8   # 8 tick (~0.8s) net olunca acil mühür çözülür
 
+# Engel kaynağı — iki arayüz desteklenir, otomatik failover ile:
+#   1) YENI: talos_obstacle_detector → /obstacles/poses (geometry_msgs/PoseArray)
+#            DBSCAN + PCA OBB engel konumları. Varsa BT bunu kullanır.
+#   2) ESKI: engel_node_fixed.py → /engel,/engel_distance,/engel_angle,
+#            /engel_sol_mesafe,/engel_sag_mesafe (skaler). Yeni kaynak yoksa bu.
+# source: "auto" (yeni varsa onu, yoksa eskiyi) | "legacy" | "poses"
+obstacle:
+  source: auto
+  new_source_max_age_s: 0.5     # /obstacles/poses bu süre içinde geldiyse "aktif" → skaler topic'ler yok sayılır
+  corridor_half_width_m: 1.0    # araç koridoru yarı genişliği (merkez sektör eşiği)
+  forward_min_m: 0.0            # bu değerden ileri engeller sayılır (önümüz)
+  forward_max_m: 30.0           # merkez/açı için ileri bakış sınırı (m)
+  side_forward_max_m: 8.0       # yan sektör (lane-change güvenliği) ileri sınırı (m)
+  # PoseArray eksen eşlemesi (sensör frame → araç gövdesi). Sim'de velodyne
+  # genelde REP-103: x ileri, y sol. Sensör farklıysa burada düzelt.
+  axis_forward: x               # x | y | z  → "ileri" hangi eksen
+  axis_left: y                  # x | y | z  → "sol" hangi eksen
+  invert_forward: false
+  invert_left: false
+
 # Lane change guard'ları (sadece BT içinde; control.py kendi guard'ını ayrı uygular)
 lane_change:
   enabled: true

@@ -41,6 +41,8 @@ class Observations:
     engel_last_seen: float = 0.0
     engel_left_last_seen:  float = 0.0   # yan sektör ayrı tazelik (lane-change güvenliği)
     engel_right_last_seen: float = 0.0
+    engel_source: str = "none"           # "poses" (yeni detektör) | "legacy" | "none" — debug
+    engel_count: int = 0                 # ileri bakış içindeki engel sayısı — debug
 
     # --- Şerit ---
     lane_offset_px: float = 0.0
@@ -124,6 +126,8 @@ class Blackboard:
                 "d_right":  _fin(o.engel_d_right),
                 "angle_deg": o.engel_angle_deg,
                 "age_s": _age(o.engel_last_seen),
+                "source": o.engel_source,
+                "count": o.engel_count,
             },
             "speed_kmh": o.speed_kmh,
             "state": {

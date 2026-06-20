@@ -50,7 +50,7 @@ def main():
     rospy.loginfo(f"[karar_bt] config: {cfg_path} | tick={tick_hz}Hz")
 
     bb = Blackboard()
-    bridge = RosBridge(bb)
+    bridge = RosBridge(bb, p)
 
     root = build_root(bb, p)
     tree = py_trees.trees.BehaviourTree(root)

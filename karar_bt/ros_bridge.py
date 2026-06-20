@@ -13,9 +13,11 @@ import math
 import rospy
 from std_msgs.msg import String, Int32, Float32
 from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseArray
 from tf.transformations import euler_from_quaternion
 
 from bb import Blackboard
+from obstacle_fusion import ObstacleFusionParams, fuse_obstacles
 
 try:
     from cart_sim.msg import Decision as DecisionMsg
@@ -25,19 +27,42 @@ except Exception:
     _HAS_DECISION = False
 
 
+# Pose pozisyonundan eksen seçici (axis_forward/axis_left config'i için)
+def _axis_get(position, axis: str) -> float:
+    return float(getattr(position, axis))
+
+
 class RosBridge:
-    def __init__(self, bb: Blackboard):
+    def __init__(self, bb: Blackboard, params: dict | None = None):
         self.bb = bb
+        params = params or {}
+
+        # --- Engel kaynağı yapılandırması ---
+        oc = params.get("obstacle", {}) or {}
+        self._obs_source = str(oc.get("source", "auto")).lower()
+        self._new_obs_max_age_s = float(oc.get("new_source_max_age_s", 0.5))
+        self._fusion_p = ObstacleFusionParams.from_cfg(oc)
+        self._axis_fwd = str(oc.get("axis_forward", "x")).lower()
+        self._axis_left = str(oc.get("axis_left", "y")).lower()
+        self._inv_fwd = -1.0 if bool(oc.get("invert_forward", False)) else 1.0
+        self._inv_left = -1.0 if bool(oc.get("invert_left", False)) else 1.0
+        self._new_obs_last = 0.0   # /obstacles/poses son geliş zamanı (failover için)
 
         # --- Subscribers (yalnız okuma) ---
         rospy.Subscriber("/trafik_levha", String, self._on_levha, queue_size=10)
         rospy.Subscriber("/yaya_gecidi",   String, self._on_yaya,   queue_size=10)
 
-        rospy.Subscriber("/engel",            Int32,   self._on_engel,        queue_size=10)
-        rospy.Subscriber("/engel_distance",   Float32, self._on_engel_dist,   queue_size=10)
-        rospy.Subscriber("/engel_angle",      Float32, self._on_engel_angle,  queue_size=10)
-        rospy.Subscriber("/engel_sol_mesafe", Float32, self._on_engel_sol,    queue_size=10)
-        rospy.Subscriber("/engel_sag_mesafe", Float32, self._on_engel_sag,    queue_size=10)
+        # YENI engel arayüzü: talos_obstacle_detector → /obstacles/poses (PoseArray)
+        if self._obs_source in ("auto", "poses"):
+            rospy.Subscriber("/obstacles/poses", PoseArray, self._on_obstacles_poses, queue_size=5)
+
+        # ESKI skaler engel arayüzü (auto: yeni kaynak yoksa devreye girer)
+        if self._obs_source in ("auto", "legacy"):
+            rospy.Subscriber("/engel",            Int32,   self._on_engel,        queue_size=10)
+            rospy.Subscriber("/engel_distance",   Float32, self._on_engel_dist,   queue_size=10)
+            rospy.Subscriber("/engel_angle",      Float32, self._on_engel_angle,  queue_size=10)
+            rospy.Subscriber("/engel_sol_mesafe", Float32, self._on_engel_sol,    queue_size=10)
+            rospy.Subscriber("/engel_sag_mesafe", Float32, self._on_engel_sag,    queue_size=10)
 
         rospy.Subscriber("/line",        Float32, self._on_line,   queue_size=10)
         rospy.Subscriber("/lane_offset", Float32, self._on_offset, queue_size=10)
@@ -104,22 +129,74 @@ class RosBridge:
         except Exception:
             rospy.logwarn_throttle(5.0, f"[karar_bt] yaya parse hatası: {raw!r}")
 
+    # --- YENI engel kaynağı: /obstacles/poses (talos_obstacle_detector) ---
+    def _on_obstacles_poses(self, msg: PoseArray):
+        """PoseArray engel konumlarını sektör skalerlerine indirger.
+
+        Boş array de geçerlidir → "temiz" (engel yok) anlamına gelir; tazelik
+        damgası yine de güncellenir ki BT 'temiz'e güvenebilsin.
+        """
+        now = time.time()
+        points = []
+        for ps in msg.poses:
+            pos = ps.position
+            try:
+                fwd = _axis_get(pos, self._axis_fwd) * self._inv_fwd
+                lat = _axis_get(pos, self._axis_left) * self._inv_left
+            except AttributeError:
+                continue
+            points.append((fwd, lat, 0.0))  # PoseArray boyut taşımaz → half_width=0
+
+        fused = fuse_obstacles(points, self._fusion_p)
+        self._new_obs_last = now
+        self.bb.write(
+            engel_present=fused.present,
+            engel_d_center=fused.d_center,
+            engel_d_overall=fused.d_overall,
+            engel_d_left=fused.d_left,
+            engel_d_right=fused.d_right,
+            engel_angle_deg=fused.angle_deg,
+            engel_count=fused.count,
+            engel_source="poses",
+            engel_last_seen=now,
+            engel_left_last_seen=now,
+            engel_right_last_seen=now,
+        )
+
+    # --- Failover: yeni kaynak tazeyse eski skaler topic'ler yok sayılır ---
+    def _legacy_suppressed(self) -> bool:
+        if self._obs_source == "legacy":
+            return False
+        return (time.time() - self._new_obs_last) < self._new_obs_max_age_s
+
     def _on_engel(self, msg: Int32):
-        self.bb.write(engel_present=bool(msg.data), engel_last_seen=time.time())
+        if self._legacy_suppressed():
+            return
+        self.bb.write(engel_present=bool(msg.data), engel_source="legacy",
+                      engel_last_seen=time.time())
 
     def _on_engel_dist(self, msg: Float32):
+        if self._legacy_suppressed():
+            return
         v = msg.data if math.isfinite(msg.data) else float("inf")
-        self.bb.write(engel_d_overall=v, engel_d_center=v, engel_last_seen=time.time())
+        self.bb.write(engel_d_overall=v, engel_d_center=v, engel_source="legacy",
+                      engel_last_seen=time.time())
 
     def _on_engel_angle(self, msg: Float32):
+        if self._legacy_suppressed():
+            return
         self.bb.write(engel_angle_deg=float(msg.data), engel_last_seen=time.time())
 
     def _on_engel_sol(self, msg: Float32):
+        if self._legacy_suppressed():
+            return
         v = msg.data if math.isfinite(msg.data) else float("inf")
         now = time.time()
         self.bb.write(engel_d_left=v, engel_left_last_seen=now, engel_last_seen=now)
 
     def _on_engel_sag(self, msg: Float32):
+        if self._legacy_suppressed():
+            return
         v = msg.data if math.isfinite(msg.data) else float("inf")
         now = time.time()
         self.bb.write(engel_d_right=v, engel_right_last_seen=now, engel_last_seen=now)

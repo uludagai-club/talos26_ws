@@ -22,6 +22,23 @@ sys.path.insert(0, ROOT)
 
 from bb import Blackboard
 from trees.main_tree import build_root
+from obstacle_fusion import ObstacleFusionParams, fuse_obstacles
+
+
+def apply_fused(bb: Blackboard, points):
+    """Yeni detektör boru hattını taklit et: noktalar → füzyon → blackboard."""
+    f = fuse_obstacles(points, ObstacleFusionParams())
+    t = time.time()
+    bb.obs.engel_present = f.present
+    bb.obs.engel_d_center = f.d_center
+    bb.obs.engel_d_overall = f.d_overall
+    bb.obs.engel_d_left = f.d_left
+    bb.obs.engel_d_right = f.d_right
+    bb.obs.engel_angle_deg = f.angle_deg
+    bb.obs.engel_source = "poses"
+    bb.obs.engel_last_seen = t
+    bb.obs.engel_left_last_seen = t
+    bb.obs.engel_right_last_seen = t
 
 
 def load_cfg():
@@ -315,6 +332,41 @@ def run_scenarios():
         bb.obs.odom_last_seen = time.time() - 5.0  # odom bayat
         tree.tick()
     assert_karar("S20", "slow")
+
+    # -----------------------------------------------------------------
+    # S21: YENI detektör (PoseArray) — tam önde engel, sol şerit boş → sol
+    # -----------------------------------------------------------------
+    print("\nS21: Yeni detektör, merkez engel 1.5m, sağda engel → sol kaçış")
+    bb.obs.__init__(); bb.state.__init__()
+    bb.obs.odom_last_seen = time.time()
+    # merkez engel (1.5m önde) + sağ şeritte engel (sol boş kalsın)
+    for _ in range(n_engel):
+        apply_fused(bb, [(1.5, 0.1), (4.0, -2.0)])
+        tree.tick()
+    assert_karar("S21", "sol")
+
+    # -----------------------------------------------------------------
+    # S22: YENI detektör — merkez engel, her iki şerit de dolu → dur
+    # -----------------------------------------------------------------
+    print("\nS22: Yeni detektör, merkez engel + iki şerit dolu → dur")
+    bb.obs.__init__(); bb.state.__init__()
+    bb.obs.odom_last_seen = time.time()
+    for _ in range(n_engel):
+        # yan engeller yan_clear (3m) içinde → her iki şerit kapalı
+        apply_fused(bb, [(1.5, 0.1), (1.8, 1.5), (1.8, -1.5)])
+        tree.tick()
+    assert_karar("S22", "dur")
+
+    # -----------------------------------------------------------------
+    # S23: YENI detektör — merkez engel 0.8m (acil eşik altı) → acildurus
+    # -----------------------------------------------------------------
+    print("\nS23: Yeni detektör, merkez engel 0.8m → acildurus")
+    bb.obs.__init__(); bb.state.__init__()
+    bb.obs.odom_last_seen = time.time()
+    for _ in range(n_engel):
+        apply_fused(bb, [(0.8, 0.0)])
+        tree.tick()
+    assert_karar("S23", "acildurus")
 
     print("\n" + "=" * 50)
     if failures:
