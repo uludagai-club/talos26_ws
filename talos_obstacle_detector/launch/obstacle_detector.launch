@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<!--
+  DBSCAN + PCA OBB engel tespiti.
+
+  Akis (cart_sim.launch + perception.launch zaten ayakta iken):
+    /cart/points_noground  (Patchwork++ engel adaylari)
+      obstacle_detector_node:
+        DBSCAN kumeleme + PCA OBB cikarimi
+      => /obstacles            (jsk BoundingBoxArray, oriented)
+      => /obstacles/poses      (PoseArray)
+      => /obstacles/markers    (RViz TEXT id'ler)
+      => /obstacles/clusters   (renkli debug bulutu)
+
+  Calistirma:
+    roslaunch talos_obstacle_detector obstacle_detector.launch
+-->
+<launch>
+  <node pkg="talos_obstacle_detector" type="obstacle_detector_node"
+        name="obstacle_detector" output="screen">
+    <rosparam command="load" file="$(find talos_obstacle_detector)/config/params.yaml"/>
+  </node>
+</launch>
