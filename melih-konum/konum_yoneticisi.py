@@ -60,15 +60,26 @@ class KonumYoneticisi:
         self.current_yaw = yaw
 
     def hedef_callback(self, msg):
-        """ Samed'den gelen hedef """
+        """ Samed'den gelen hedef veya hedef_yoneticisi'nden gelen waypoint """
         try:
+            # Önce eski json formatını dene
             data = json.loads(msg.data)
             self.target_x = data['coordinates'][0]
             self.target_y = data['coordinates'][1]
             self.target_name = data.get('target_name', 'Bilinmeyen')
             self.is_mission_active = True
         except:
-            pass
+            # Yeni formatı dene: wx1,wy1|wx2,wy2
+            try:
+                if '|' in msg.data:
+                    wp1_str, _ = msg.data.split('|')
+                    parts = wp1_str.split(',')
+                    self.target_x = float(parts[0].strip())
+                    self.target_y = float(parts[1].strip())
+                    self.target_name = "Waypoint"
+                    self.is_mission_active = True
+            except:
+                pass
 
     def publish_pose(self):
         """ Sensor Fusion (Odom + IMU) ciktisini yayinla """
