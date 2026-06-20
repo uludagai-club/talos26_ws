@@ -37,7 +37,7 @@ class EngelTespitiNode:
         rospy.init_node('engel_tespiti', anonymous=True)
 
         # --- Parametreler ---
-        self.engel_mesafesi_limiti = 2.0
+        self.engel_mesafesi_limiti = 3.0  # BT kendi eşiklerini uygular; burada geniş tut
         self.scan_half_fov = 15.0
         self.merkez_half_fov = 5.0
         self.min_range = 0.3
@@ -157,7 +157,8 @@ class EngelTespitiNode:
 
         # Yayinla
         self.engel_pub.publish(engel_durumu)
-        self.mesafe_pub.publish(min_mesafe)
+        # /engel_distance → merkez sektör minimumu (BT engel_d_center olarak kullanır)
+        self.mesafe_pub.publish(min_merkez)
         self.engel_aci_pub.publish(min_mesafe_aci)
         self.sol_mesafe_pub.publish(min_sol)
         self.sag_mesafe_pub.publish(min_sag)

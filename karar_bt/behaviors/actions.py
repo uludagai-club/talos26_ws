@@ -8,6 +8,7 @@ Karar üretimi: bir action tick'te `bb.last_decision`'u günceller ve SUCCESS d�
 """
 from __future__ import annotations
 
+import math
 import time
 
 import py_trees
@@ -85,7 +86,9 @@ class ReleaseEmergencyIfClear(py_trees.behaviour.Behaviour):
 
         o = self.bb.obs
         yaya_clear = (not o.yaya_present) or (o.yaya_distance < 0) or (o.yaya_distance >= self.yaya_esik)
-        engel_clear = (not o.engel_present) or (o.engel_d_center >= self.engel_esik)
+        # Engel present ama mesafe inf ise sensör verisi eksik → güvenli tarafta kal
+        engel_d_valid = math.isfinite(o.engel_d_center)
+        engel_clear = (not o.engel_present) or (engel_d_valid and o.engel_d_center >= self.engel_esik)
 
         if yaya_clear and engel_clear:
             self.bb.state.emergency_clear_streak += 1
