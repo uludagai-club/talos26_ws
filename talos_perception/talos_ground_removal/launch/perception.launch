@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<!--
+  Tum LiDAR algilama on-isleme zinciri tek launch'ta:
+    pass_filter -> voxel_filter -> ground_removal (+ opsiyonel outlier_remove)
+
+  Akis:
+    /cart/center_laser/scan
+      => /cart/points_filtered  (pass)
+      => /cart/points_voxel     (voxel)
+      => /cart/points_noground  (RANSAC engeller) + /cart/points_ground (zemin)
+
+  Calistirma (cart_sim.launch zaten ayakta iken):
+    roslaunch talos_ground_removal perception.launch
+-->
+<launch>
+  <arg name="outlier" default="false"/>
+
+  <include file="$(find talos_lidar_filter)/launch/lidar_filter.launch">
+    <arg name="outlier" value="$(arg outlier)"/>
+  </include>
+
+  <include file="$(find talos_ground_removal)/launch/ground_removal.launch"/>
+</launch>

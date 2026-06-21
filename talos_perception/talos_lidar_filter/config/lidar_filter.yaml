@@ -1,0 +1,24 @@
+# talos_lidar_filter parametreleri
+# Velodyne frame'inde LiDAR orijinde; chassis uzerinde z=0.92'de monteli
+# oldugundan zemin ~z=-0.92 civarina duser.
+
+pass_filter:
+  input_topic:  /cart/center_laser/scan
+  output_topic: /cart/points_filtered
+  filter_field: z
+  z_min: -0.7      # zemin yansimalarini kes
+  z_max:  1.0      # arac tavani / ust gecis ustunu kes
+  negative: false
+
+voxel_filter:
+  input_topic:  /cart/points_filtered
+  output_topic: /cart/points_voxel
+  leaf_x: 0.10
+  leaf_y: 0.10
+  leaf_z: 0.10
+
+outlier_remove:
+  input_topic:  /cart/points_voxel
+  output_topic: /cart/points_clean
+  mean_k: 50       # k: komsu sayisi
+  stddev_mul: 1.0  # alpha: std sapma carpani

@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>talos_lidar_filter</name>
+  <version>0.1.0</version>
+  <description>
+    TALOS LiDAR ön-işleme filtreleri: pass-through (Z kırpma), voxel grid
+    seyreltme ve istatistiksel aykırı değer (SOR) temizleme. Ham Velodyne
+    bulutunu sonraki algılama adımları için hafifletir ve temizler.
+  </description>
+
+  <maintainer email="keremenon@gmail.com">Kerem</maintainer>
+  <license>BSD</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>pcl_ros</depend>
+  <depend>pcl_conversions</depend>
+</package>

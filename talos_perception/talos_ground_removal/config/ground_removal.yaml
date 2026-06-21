@@ -1,0 +1,65 @@
+# talos_ground_removal (Patchwork++ zemin ayiklama) parametreleri
+#
+# NOT: Bu degerler bu sim'in VLP-16'sina gore ayarlanmistir (cart_sim/golf.urdf):
+#   16 ring, 360 deg, +-15 deg dikey, range 0.9-130 m, frame "velodyne".
+# Patchwork++ varsayilanlari KITTI HDL-64 icindir; asagisi sim'e uyarlanmistir.
+
+# --- Node I/O (talos_ground_removal node'u okur) ---
+input_topic:    /cart/points_voxel     # voxel_filter ciktisi (velodyne frame)
+obstacle_topic: /cart/points_noground  # zemin cikarilmis (engeller)
+ground_topic:   /cart/points_ground    # ayiklanan zemin (gorsellestirme)
+
+# Ego (arac) yaricap kirpmasi (node icinde, Patchwork++'a verilmeden once):
+# LiDAR'a XY'de bu mesafeden yakin noktalar (aracin kendi govdesi) tamamen atilir.
+min_range:      2.5    # [m]
+max_range:      0.0    # [m] 0 = sinirsiz (uzak gurultu kirpma)
+
+# ============================================================================
+# Patchwork++ cekirdek parametreleri (PatchWorkpp sinifi ~ namespace'ten okur)
+# ============================================================================
+
+# Sensor yuksekligi: velodyne frame'inin zemine gore Z'si.
+# golf.urdf: chassis->lidar (0.92) + base_mount (0.05) + base_scan (0.0377)
+#   = 1.0077; zemin chassis'e gore +0.0146 (arka teker merkezi 0.272108 - r 0.2575)
+#   => sensor_height ~= 1.0077 - 0.0146 = 0.99 m
+sensor_height:  0.99
+
+mode: "czm"
+verbose:   false
+visualize: false   # jsk PolygonArray / debug bulutlari (kapali = daha hizli)
+
+# --- Ground Plane Fitting (R-GPF) ---
+num_iter:    3        # hucre basina PCA iterasyonu (RANSAC'in 200'u yerine 3 yeter)
+num_lpr:     10       # en alcak temsilci nokta sayisi (VLP-16 sparse -> dusuruldu)
+num_min_pts: 5        # bir hucreyi zemin saymak icin asgari nokta (sparse -> dusuk)
+th_seeds:    0.3      # baslangic tohum noktalari icin esik [m]
+th_dist:     0.125    # zemin "kalinlik" esigi (eski distance_threshold karsiligi) [m]
+th_seeds_v:  0.25     # dikey yapi tohum esigi [m]
+th_dist_v:   0.10     # dikey yapi kalinlik esigi [m]
+max_r:       60.0     # zemin tahmini azami menzil [m] (sim sahnesi; 130'a kadar artirilabilir)
+min_r:       2.5      # zemin tahmini asgari menzil [m] (ego kirpma ile uyumlu)
+
+# uprightness_thr: eski use_perpendicular/eps_angle KARSILIGI. Hucre normalinin
+# +Z ile yakinligi; buyuk = daha dik zemin kabul. (cos(45)=0.707)
+uprightness_thr: 0.707
+adaptive_seed_selection_margin: -1.2  # sensor_height * bu degerin altindaki noktalar elenir
+
+# --- Concentric Zone Model (CZM) ---
+# DIKKAT: upstream'de "mum_rings_each_zone" yazim hatasi var; aynen korunmali.
+czm:
+    num_zones: 4
+    num_sectors_each_zone: [16, 16, 16, 16]   # VLP-16 icin KITTI'den coarser
+    mum_rings_each_zone:    [2, 4, 4, 4]       # (sic) upstream key adi
+    elevation_thresholds:   [0.0, 0.0, 0.0, 0.0]  # adaptif guncellenir (A-GLE)
+    flatness_thresholds:    [0.0, 0.0, 0.0, 0.0]  # adaptif guncellenir (A-GLE)
+
+# --- TGR: eski plane_smooth (EMA) KARSILIGI; kare-arasi zemin titremesini bastirir ---
+enable_TGR:  true
+enable_RVPF: true      # Reflected Vertical Plane Fitting (dik yapi ayrimi)
+
+# RNR: gercek LiDAR'da yansima gurultusu silme. Sim'de gurultu cok dusuk
+# (stddev 0.008) ve intensity ~0 olabilecegi icin alt ring'leri yanlislikla
+# silmemek adina KAPALI. Gercek sensore gecince acip RNR_intensity_thr ayarla.
+enable_RNR:  false
+RNR_ver_angle_thr: -15.0   # asagi bakan isinlar icin dikey aci esigi [derece]
+RNR_intensity_thr: 0.2     # gurultu noktasi intensity esigi

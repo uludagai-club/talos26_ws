@@ -1,0 +1,75 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+Visualization Manager:
+  Displays:
+    - Class: rviz/Grid
+      Enabled: true
+      Color: 80; 80; 80
+      Cell Size: 1
+      Plane Cell Count: 40
+      Name: Grid
+      Value: true
+    - Alpha: 1
+      Class: rviz/PointCloud2
+      Color: 130; 130; 130
+      Color Transformer: FlatColor
+      Enabled: true
+      Name: ZEMIN (points_ground)
+      Size (m): 0.05
+      Style: Flat Squares
+      Topic: /cart/points_ground
+      Unreliable: false
+      Value: true
+    - Alpha: 1
+      Class: rviz/PointCloud2
+      Color: 255; 40; 40
+      Color Transformer: FlatColor
+      Enabled: true
+      Name: ENGEL (points_noground)
+      Size (m): 0.12
+      Style: Boxes
+      Topic: /cart/points_noground
+      Unreliable: false
+      Value: true
+    - Alpha: 0.25
+      Class: rviz/PointCloud2
+      Color: 60; 120; 255
+      Color Transformer: FlatColor
+      Enabled: false
+      Name: VOXEL (points_voxel)
+      Size (m): 0.05
+      Style: Flat Squares
+      Topic: /cart/points_voxel
+      Unreliable: false
+      Value: true
+  Global Options:
+    Background Color: 20; 20; 25
+    Fixed Frame: velodyne
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/MoveCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 28
+      Focal Point:
+        X: 4
+        Y: 0
+        Z: 0
+      Name: Current View
+      Pitch: 0.62
+      Yaw: 0.78
+      Target Frame: velodyne
+    Saved: ~
+Window Geometry:
+  Height: 1040
+  Width: 1900
+  X: 0
+  Y: 0
+  Displays:
+    collapsed: false

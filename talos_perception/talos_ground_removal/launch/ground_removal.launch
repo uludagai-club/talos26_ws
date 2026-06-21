@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--
+  RANSAC zemin ayiklama.
+
+  Akis (talos_lidar_filter ile zincirleme):
+    /cart/points_voxel  (voxel_filter ciktisi)
+      ground_removal (RANSAC duzlem, zemin ayiklama) iki cikti uretir:
+        /cart/points_noground  (engeller)
+        /cart/points_ground    (zemin)
+
+  Calistirma:
+    roslaunch talos_ground_removal ground_removal.launch
+-->
+<launch>
+  <node pkg="talos_ground_removal" type="ground_removal" name="ground_removal" output="screen">
+    <rosparam command="load" file="$(find talos_ground_removal)/config/ground_removal.yaml"/>
+  </node>
+</launch>

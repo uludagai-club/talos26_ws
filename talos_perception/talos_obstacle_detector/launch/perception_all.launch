@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!--
+  Tum engel-tespiti zinciri tek launch'ta:
+    pass_filter -> voxel_filter -> ground_removal (Patchwork++) -> obstacle_detector
+
+  Akis:
+    /cart/center_laser/scan
+      => /cart/points_filtered  (pass)
+      => /cart/points_voxel     (voxel)
+      => /cart/points_noground  (engeller) + /cart/points_ground (zemin)
+      => /obstacles             (DBSCAN + PCA OBB + takip)
+
+  Calistirma (simulasyon ayaktayken, /cart/center_laser/scan yayinlaniyorken):
+    roslaunch talos_obstacle_detector perception_all.launch
+-->
+<launch>
+  <arg name="outlier" default="false"/>
+
+  <!-- on-isleme: pass + voxel filtre -->
+  <include file="$(find talos_lidar_filter)/launch/lidar_filter.launch">
+    <arg name="outlier" value="$(arg outlier)"/>
+  </include>
+
+  <!-- zemin ayiklama: Patchwork++ -->
+  <include file="$(find talos_ground_removal)/launch/ground_removal.launch"/>
+
+  <!-- engel tespiti: DBSCAN + PCA OBB + takip -->
+  <include file="$(find talos_obstacle_detector)/launch/obstacle_detector.launch"/>
+</launch>

@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<!--
+  TALOS LiDAR on-isleme filtre zinciri.
+
+  Akis:
+    /cart/center_laser/scan  (ham Velodyne bulutu)
+        |  pass_filter   (Z eksen kirpma)
+        v
+    /cart/points_filtered
+        |  voxel_filter  (voxel grid seyreltme)
+        v
+    /cart/points_voxel
+        |  outlier_remove (istatistiksel aykiri deger - SOR)
+        v
+    /cart/points_clean
+
+  Calistirma:
+    roslaunch talos_lidar_filter lidar_filter.launch
+  outlier adimini kapatmak icin:
+    roslaunch talos_lidar_filter lidar_filter.launch outlier:=false
+-->
+<launch>
+  <arg name="outlier" default="true"/>
+
+  <node pkg="talos_lidar_filter" type="pass_filter" name="pass_filter" output="screen">
+    <param name="input_topic"  value="/cart/center_laser/scan"/>
+    <param name="output_topic" value="/cart/points_filtered"/>
+    <param name="filter_field" value="z"/>
+    <param name="z_min" value="-0.7"/>
+    <param name="z_max" value="1.0"/>
+    <param name="negative" value="false"/>
+  </node>
+
+  <node pkg="talos_lidar_filter" type="voxel_filter" name="voxel_filter" output="screen">
+    <param name="input_topic"  value="/cart/points_filtered"/>
+    <param name="output_topic" value="/cart/points_voxel"/>
+    <param name="leaf_x" value="0.10"/>
+    <param name="leaf_y" value="0.10"/>
+    <param name="leaf_z" value="0.10"/>
+  </node>
+
+  <node if="$(arg outlier)" pkg="talos_lidar_filter" type="outlier_remove" name="outlier_remove" output="screen">
+    <param name="input_topic"  value="/cart/points_voxel"/>
+    <param name="output_topic" value="/cart/points_clean"/>
+    <param name="mean_k" value="50"/>
+    <param name="stddev_mul" value="1.0"/>
+  </node>
+</launch>
