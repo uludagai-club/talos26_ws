@@ -4,6 +4,7 @@ Bu proje, Gazebo simülasyon ortamındaki araç için konum takibi sağlayan Pyt
 
 ## Dosyalar
 * **konum_yoneticisi.py:** Aracın konum verilerini işleyen ve yönlendiren ana Python kodu.
+* **arac_hud.py:** Aracın konum verilerini (X, Y) ve yönelimini (Pusula/YAW) görselleştiren grafik arayüz (HUD).
 
 ## Gereksinimler
 Bu kodun çalışması için aşağıdaki ortamların hazır olması gerekmektedir:
@@ -21,3 +22,11 @@ Bu kodun çalışması için aşağıdaki ortamların hazır olması gerekmekted
 
    ```bash
    python3 konum_yoneticisi.py
+   ```
+
+3. **HUD (Arayüz) Çalıştırın (Opsiyonel):**
+   Aracın konum ve yönelimini anlık olarak grafiksel bir ekranda takip etmek için yeni bir terminal açıp dosyanın bulunduğu dizine gelin ve şu komutu girin:
+
+   ```bash
+   python3 arac_hud.py
+   ```
