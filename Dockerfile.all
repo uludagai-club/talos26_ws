@@ -7,7 +7,7 @@ LABEL description="TALOS tek-imaj runtime — eksik 6 prebuilt imajin (konum, ta
 # Sistem (apt) bagimliliklari
 #  - python3-can / can-utils / iproute2 : CAN katmani (kullanan servisler icin zararsiz)
 #  - ros-noetic-tf*                     : konum.py (tf.transformations)
-#  - ros-noetic-cv-bridge               : traffic-node + safe-zone-detector (cv_bridge)
+#  - ros-noetic-cv-bridge               : traffic/levha/yaya/park kamera node'lari (cv_bridge)
 #  - ros-noetic-pointcloud-to-laserscan : engel-node (rosrun pointcloud_to_laserscan)
 #  - python3-tk                         : hedef_yoneticisi.py matplotlib GUI
 # -------------------------------------------------------------------
@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     kmod \
     ros-noetic-tf \
     ros-noetic-tf2-ros \
+    ros-noetic-visualization-msgs \
     ros-noetic-cv-bridge \
     ros-noetic-pointcloud-to-laserscan \
     python3-tk \

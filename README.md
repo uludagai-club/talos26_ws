@@ -58,13 +58,15 @@ git clone git@github.com:uludagai-club/talos26_ws.git
 
 ### 4. Docker image (TEK image)
 
-Image'ı elle yüklemen **gerekmez** — `.tar` dağıtımı kaldırıldı. **Tüm servisler tek bir
-`talos-all:latest` image'ını kullanır** ve ilk `./baslat.sh` çalıştığında `Dockerfile.all`'dan
-otomatik **build** edilir (repo kendi kendine yeter):
+**13 servisin 12'si** tek `talos-all:latest` image'ını kullanır ve ilk `./baslat.sh`
+çalıştığında `Dockerfile.all`'dan otomatik **build** edilir (repo kendi kendine yeter).
+**İstisna:** `talos-map-server` geçici olarak ayrı `talos-map-server:latest` prebuilt imajını
+kullanır (yeni graph gelince talos-all'a dönülecek); o imaj takımdan `.tar` ile edinilir
+(`docker load -i talos-map-server.tar`), yoksa `/map`+`/waypoint` yayınlanmaz.
 
-`talos-all:latest` (`Dockerfile.all`) — `konum`, `talos-map-server`, `hedef-teslimi`,
-`engel-node`, `karar-node`, `traffic-node`, `safe-zone-detector`, `can-bridge`,
-`state-bridge`, `talos-controller`, `can-visualizer` — **11 servisin hepsi**. Eski 6
+`talos-all:latest` (`Dockerfile.all`) — `konum`, `hedef-teslimi`,
+`engel-node`, `traffic-node`, `lane-follower`, `yaya-gecidi-node`, `park-durak-node`,
+`karar-node`, `can-bridge`, `state-bridge`, `talos-controller`, `can-visualizer` — **12 servis**. Eski 6
 prebuilt imajın (`konum`, `talos-map-server`, `hedef-yoneticisi`, `otonom-arac`,
 `karar-node`, `traffic_docker`) ve `talos-control:latest`'in yerini alır. Tüm Python kodu
 bind-mount edildiğinden imaj sadece ROS/pip çalışma-zamanı bağımlılıklarını taşır; kod
@@ -77,7 +79,7 @@ docker build -t talos-all:latest -f Dockerfile.all .
 ```
 
 > Not: `talos-all` `ultralytics` (torch + opencv) içerdiğinden ilk build birkaç GB indirir.
-> GPU servisleri (`engel-node`, `traffic-node`, `safe-zone-detector`) için NVIDIA Container
+> GPU servisleri (`engel-node`, `traffic-node`, `lane-follower`, `yaya-gecidi-node`) için NVIDIA Container
 > Toolkit kurulu olmalı.
 
 ---
@@ -122,7 +124,7 @@ cd ~/talos26_ws
 git status
 
 # Değişiklikleri stage'le
-git add fixes/hedef_yoneticisi.py   # hangi dosyaysa
+git add hedef/hedef_yoneticisi.py   # hangi dosyaysa
 
 # Commit
 git commit -m "fix: kısa açıklama"
@@ -166,19 +168,21 @@ Kurala göre:
 
 | Değişen Dosya | İlgili Servis | Rebuild Gerekir mi? |
 |---------------|---------------|---------------------|
-| `fixes/hedef_yoneticisi.py` | `hedef-teslimi` | Hayır |
-| `fixes/konum.py` | `konum-server` | Hayır |
-| `fixes/waypoint_pub.py` | `talos-map-server` | Hayır |
-| `fixes/engel_node_fixed.py` | `engel-node` | Hayır |
-| `fixes/pointcloud_obstacle_publisher.py` | `engel-node` | Hayır |
-| `fixes/yolov8_ros_node_fixed.py` | `traffic-node` | Hayır |
-| `levha_tespiti/yolov8_ros/scripts/best.pt` | `traffic-node` | Hayır (bind-mount, image içindeki modeli ezer) |
-| `karar_bt/` (BT karar düğümü) | `karar-node` | Hayır |
-| `hilmi-talos/control.py` | `talos-controller` | Hayır |
-| `hilmi-talos/can_to_talos_cart.py` | `can-bridge` | Hayır |
-| `hilmi-talos/talos_state_to_can.py` | `state-bridge` | Hayır |
-| `prototip-1/safe_zone_detector.py` | `safe-zone-detector` | Hayır |
-| `Dockerfile.all` | **tüm 11 servis** | **Evet** (`docker build -t talos-all:latest -f Dockerfile.all .`) |
+| `hedef/hedef_yoneticisi.py` | `hedef-teslimi` | Hayır |
+| `konum/konum.py` | `konum-server` | Hayır |
+| `maps/waypoint_pub.py` | `talos-map-server` | Hayır |
+| `lidar/engel_node_fixed.py` | `engel-node` | Hayır |
+| `lidar/pointcloud_obstacle_publisher.py` | `engel-node` | Hayır |
+| `algi/levha/yolov8_ros_node_fixed.py` | `traffic-node` | Hayır |
+| `algi/levha/yolov8_ros/scripts/best.pt` | `traffic-node` | Hayır (bind-mount, image içindeki modeli ezer) |
+| `algi/serit/lane_follow_node_fixed.py` | `lane-follower` | Hayır |
+| `algi/yaya_gecidi/yaya_gecidi_node.py` | `yaya-gecidi-node` | Hayır |
+| `algi/park_durak/park_durak_node.py` | `park-durak-node` | Hayır |
+| `karar/` (BT karar düğümü) | `karar-node` | Hayır |
+| `control/control.py` | `talos-controller` | Hayır |
+| `control/can_to_talos_cart.py` | `can-bridge` | Hayır |
+| `control/talos_state_to_can.py` | `state-bridge` | Hayır |
+| `Dockerfile.all` | **tüm 13 servis** | **Evet** (`docker build -t talos-all:latest -f Dockerfile.all .`) |
 
 Rebuild yalnızca `Dockerfile.all` değişince gerekir:
 ```bash
@@ -190,21 +194,23 @@ docker compose down && ./baslat.sh
 
 ## Bileşenler
 
-Tüm servisler tek `talos-all:latest` image'ını kullanır; ayrım `command` ile yapılır.
+Servislerin 12'si tek `talos-all:latest` image'ını kullanır (ayrım `command` ile); `talos-map-server` geçici olarak ayrı prebuilt imaj kullanır.
 
 | Servis | Açıklama |
 |--------|----------|
-| `konum-server` | Konum/lokalizasyon |
-| `talos-map-server` | Harita + waypoint yayıcı (`/waypoint`) |
-| `hedef-teslimi` | Hedef yöneticisi (GUI) |
-| `engel-node` | Engel algılama + `pointcloud_to_laserscan` (GPU) |
-| `traffic-node` | Trafik işareti algılama (GPU) |
-| `safe-zone-detector` | Güvenli alan tespiti (GPU, prototip) |
-| `karar-node` | Karar düğümü |
-| `can-bridge` | CAN → Gazebo köprüsü |
-| `state-bridge` | Gazebo → CAN köprüsü |
-| `talos-controller` | Ana sürüş kontrolcüsü |
-| `can-visualizer` *(opsiyonel, `--profile gui`)* | CAN görselleştirici |
+| `konum-server` | Konum/lokalizasyon (`konum/`) |
+| `talos-map-server` | Harita + waypoint yayıcı `/waypoint` (`maps/`) |
+| `hedef-teslimi` | Hedef yöneticisi / D* planlama, GUI (`hedef/`) |
+| `engel-node` | Engel algılama + `pointcloud_to_laserscan` (GPU, `lidar/`) |
+| `traffic-node` | Trafik levha/ışık algılama (GPU, `algi/levha/`) |
+| `lane-follower` | Şerit takip (GPU, `algi/serit/`) |
+| `yaya-gecidi-node` | Yaya geçidi algılama (GPU, `algi/yaya_gecidi/`) |
+| `park-durak-node` | Park/durak alanı algılama (`algi/park_durak/`) |
+| `karar-node` | Behavior Tree karar düğümü (`karar/`) |
+| `can-bridge` | CAN → Gazebo köprüsü (`control/`) |
+| `state-bridge` | Gazebo → CAN köprüsü (`control/`) |
+| `talos-controller` | Ana sürüş kontrolcüsü (`control/`) |
+| `can-visualizer` *(opsiyonel, `--profile gui`)* | CAN görselleştirici (`control/`) |
 
 ---
 

@@ -14,19 +14,16 @@ build/
 devel/
 install/
 
-# Log dosyaları
+# Log dosyaları (control/logs, karar/logs dahil hepsi)
 logs/
 *.log
 lane_log.txt
-hilmi-talos/logs/
 
-# Model ağırlıkları (image'larla birlikte dağıtılır)
-lane/models/*.pt
-lane/models/*.onnx
-
-# Model yedekleri (eski ağırlıklar — sadece lokalde tutulur)
-*.pt.bak
-levha_tespiti/yolov8_ros/scripts/*.bak
+# Model ağırlıkları: AKTİF modeller (algi/*/best.pt, algi/serit/models/best.pt,
+# algi/levha/yolov8_ros/scripts/best.pt) artık git'e DAHİLDİR — fresh-clone = her şey
+# hazır, arkadaşlar ayrı model indirmeden kurabilsin. Sadece YEDEK ağırlıklar dışlanır.
+*.bak
+*.onnx
 
 # Eski arşiv dizini
 archive/

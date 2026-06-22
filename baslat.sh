@@ -10,7 +10,6 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HILMI_TALOS="$SCRIPT_DIR/hilmi-talos"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 GREEN='\033[0;32m'
@@ -55,6 +54,10 @@ cleanup() {
         kill -INT "$ROSBAG_PID" 2>/dev/null
         wait "$ROSBAG_PID" 2>/dev/null
     fi
+
+    # Engel algilama host node'lari (kerem detector + ground_filter)
+    [ -n "${DETECTOR_PID:-}" ]     && kill -INT "$DETECTOR_PID"     2>/dev/null
+    [ -n "${GROUNDFILTER_PID:-}" ] && kill "$GROUNDFILTER_PID" 2>/dev/null
 
     # Compose down (degişiklik yapilmiş volume mount'lari da kapsar)
     (cd "$SCRIPT_DIR" && docker compose down --remove-orphans 2>/dev/null) || true
@@ -167,9 +170,11 @@ if command -v rosbag >/dev/null 2>&1; then
         /cart /konum /imu /base_pose_ground_truth
         /hedef /waypoint /gorev_durumu /map_metadata
         /karar /karar_decision
-        /trafik_levha /yaya_gecidi
+        /trafik_levha /yaya_gecidi /park_alani /durak_alani /yaya_gecidi/model
         /engel /engel_distance /engel_angle /engel_sol_mesafe /engel_sag_mesafe
+        /obstacles/poses
         /battery_state /steer_angle /line
+        /lane_offset /lane/turn_type /lane/confidence
     )
     rosbag record --lz4 -O "$RUN_DIR/rosbag/light_${RUN_ID}" \
         --split --duration=15m --max-splits=8 \
@@ -178,6 +183,29 @@ if command -v rosbag >/dev/null 2>&1; then
     echo -e "${GREEN}[+] rosbag (hafif profil) aktif (PID=$ROSBAG_PID)${NC}"
 else
     echo -e "${YELLOW}[!] rosbag yok — atlandi${NC}"
+fi
+
+# =============================================================
+# 3b) ENGEL ALGILAMA (kerem talos_obstacle_detector) — HOST node'lari
+# C++ binary host catkin'inde (devel) derli; talos-all imajinda pcl/jsk runtime
+# olmadigindan container yerine host'ta calistirilir. Girdi /cart/points_noground
+# icin minimal zemin-ayiklama (ground_filter.py) onunde kosar. Binary yoksa
+# (kerem branch build edilmemis) sessizce atlanir — baslat.sh akisi bozulmaz.
+# Kapatmak: OBSTACLE_DETECTOR=off ./baslat.sh
+# =============================================================
+OBSTACLE_DETECTOR="${OBSTACLE_DETECTOR:-auto}"
+DET_BIN="$PROJECT_ROOT/devel/lib/talos_obstacle_detector/obstacle_detector_node"
+if [ "$OBSTACLE_DETECTOR" != "off" ] && [ -x "$DET_BIN" ] && [ -f "$SCRIPT_DIR/lidar/ground_filter.py" ]; then
+    nohup python3 "$SCRIPT_DIR/lidar/ground_filter.py" \
+        > "$RUN_DIR/system/ground_filter.log" 2>&1 &
+    GROUNDFILTER_PID=$!
+    nohup roslaunch talos_obstacle_detector obstacle_detector.launch \
+        > "$RUN_DIR/system/obstacle_detector.log" 2>&1 &
+    DETECTOR_PID=$!
+    echo -e "${GREEN}[+] engel algilama aktif — ground_filter (PID=$GROUNDFILTER_PID) + obstacle_detector (PID=$DETECTOR_PID)${NC}"
+    echo -e "${CYAN}    /cart/center_laser/scan → /cart/points_noground → /obstacles/poses${NC}"
+else
+    echo -e "${YELLOW}[!] talos_obstacle_detector binary yok veya OBSTACLE_DETECTOR=off — engel algilama atlandi (legacy /engel* kullanilir)${NC}"
 fi
 
 # =============================================================
@@ -205,7 +233,7 @@ cd "$SCRIPT_DIR" || exit 1
 
 # Eski container kalintilari (manuel docker run'dan) — temizle
 docker rm -f konum-server talos-map-server hedef_teslimi engel-node \
-              traffic-node safe-zone-detector karar-node \
+              traffic-node park-durak-node lane-follower yaya-gecidi-node karar-node \
               talos-can-bridge talos-state-bridge talos-controller \
               talos-can-visualizer 2>/dev/null
 
@@ -228,7 +256,9 @@ echo -e "${CYAN}  talos-map-server   => /map + /waypoint${NC}"
 echo -e "${CYAN}  hedef_teslimi      => /hedef (String: x,y)${NC}"
 echo -e "${CYAN}  engel-node         => /engel + obstacles.csv${NC}"
 echo -e "${CYAN}  traffic-node       => /trafik_levha${NC}"
-echo -e "${CYAN}  safe-zone-detector => /line (eski lane'in yerine)${NC}"
+echo -e "${CYAN}  park-durak-node    => /park_alani + /durak_alani${NC}"
+echo -e "${CYAN}  lane-follower      => /line + /lane/* (serit takip)${NC}"
+echo -e "${CYAN}  yaya-gecidi-node   => /yaya_gecidi/model + image_annotated (adanmis)${NC}"
 echo -e "${CYAN}  karar-node         => /karar + /karar_decision (decision_id)${NC}"
 echo -e "${CYAN}  can-bridge         => CAN -> Gazebo${NC}"
 echo -e "${CYAN}  state-bridge       => Gazebo -> CAN${NC}"
@@ -251,7 +281,7 @@ echo -e "${GREEN}[+] hedef_teslimi log arşivi: $RUN_DIR/system/hedef_teslimi.lo
 # 8) FOREGROUND — talos-controller log akisi (Ctrl+C ile cikis)
 # =============================================================
 echo -e "${BLUE}[8/8] talos-controller log akisi (Ctrl+C => kapanis)${NC}"
-docker compose logs -f --no-color talos-controller karar-node engel-node 2>&1 || true
+docker compose logs -f --no-color talos-controller karar-node engel-node park-durak-node lane-follower yaya-gecidi-node 2>&1 || true
 
 # Background hedef_teslimi log tail'ini kapat
 [ -n "${HEDEF_LOG_PID:-}" ] && kill "$HEDEF_LOG_PID" 2>/dev/null
