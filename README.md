@@ -64,15 +64,18 @@ source devel/setup.bash
 > mesajlar derlenmiş demektir. Bu dosya yoksa `karar-node`/`engel-node` `/karar_decision`
 > topic'ini yayınlamaz (sadece `/karar` String).
 
-### 3. Bu repo'yu klonla
+### 3. Bu repo'yu klonla (`~/talos-sim/scripts/` altına — ZORUNLU)
 
 ```bash
-cd ~
+mkdir -p ~/talos-sim/scripts
+cd ~/talos-sim/scripts
 git clone git@github.com:uludagai-club/talos26_ws.git
 ```
 
-> `~/talos26_ws/` klasörü oluşur. `~/talos-sim` ile karıştırma; container mount'ları
-> `~/talos-sim/devel`'i mutlak yolla bulur, bu repo nereye klonlanırsa klonlansın çalışır.
+> **ÖNEMLİ:** Repo MUTLAKA `~/talos-sim/scripts/talos26_ws/` altında olmalı. `baslat.sh`,
+> `~/talos-sim`'i (dolayısıyla `~/talos-sim/devel`'i) `SCRIPT_DIR/../..` ile bulur — repo
+> başka yere (örn. `~/talos26_ws`) klonlanırsa `devel`/`cart_sim.msg` bulunamaz, köprü
+> container'ları (`can-bridge`, `state-bridge`, `karar-node`) ImportError ile çöker.
 
 ### 4. Docker image (TEK image)
 
@@ -104,7 +107,7 @@ docker build -t talos-all:latest -f Dockerfile.all .
 ## Her Oturumda Sistemi Başlatma
 
 ```bash
-cd ~/talos26_ws
+cd ~/talos-sim/scripts/talos26_ws
 
 # Tek komut: vcan0 + X11 + roscore + eksik image build + tüm servisler.
 ./baslat.sh
@@ -121,7 +124,7 @@ her şeyi temizleyerek kapatır. `docker compose up` zincirini elle kurmana gere
 ### Başkasının değişikliklerini almak
 
 ```bash
-cd ~/talos26_ws
+cd ~/talos-sim/scripts/talos26_ws
 git pull
 ```
 
@@ -135,7 +138,7 @@ docker compose restart hedef-teslimi
 ### Kendi değişikliğini göndermek
 
 ```bash
-cd ~/talos26_ws
+cd ~/talos-sim/scripts/talos26_ws
 
 # Hangi dosyaları değiştirdiğine bak
 git status
