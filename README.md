@@ -12,7 +12,7 @@ Toplumun, devletin ve sanayinin yapay zeka alanındaki sorunlarına çözüm ort
 
 - **Instagram:** [@talos.team](https://instagram.com/talos.team) / [@uludagaiclub](https://instagram.com/uludagaiclub)
 - **LinkedIn:** https://www.linkedin.com/company/talosteam/
-- **Web Sitemiz:** yapayzekatoplulugu.uludag.edu.tr
+- **Web Sitemiz:** https://www.yapayzekatoplulugu.uludag.edu.tr
 
 ---
 
