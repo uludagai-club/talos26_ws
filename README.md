@@ -1,3 +1,21 @@
+# YZT | TALOS Otonom Araç Takımı
+
+Bursa Uludağ Üniversitesi Yapay Zeka Topluluğu çatısı altında faaliyet gösteren **YZT | TALOS Otonom Araç Takımı** olarak, Robotaksi-Binek Otonom Araç Yarışması — Hazır Araç Kategorisi için hazırladığımız repoyu paylaşmaktan büyük gurur duyuyoruz.
+
+2020 yılından 2025 yılına kadar her yıl kesintisiz olarak Teknofest Robotaksi Binek Otonom Araç Yarışması Finalisti olma başarısını göstermiş köklü bir ekip olarak, edindiğimiz tüm tecrübe ve mühendislik becerilerini bu yılki simülasyon mimarimize yansıttık. Geliştirdiğimiz sistemde makine öğrenmesi algoritmalarını; ZED 2 Kamera, LiDAR, GPS ve IMU gibi zengin sensör füzyonları ile besleyerek uluslararası standartlarda güvenli sürüş çözümleri üretiyoruz.
+
+## 🎯 Misyonumuz ve Vizyonumuz
+
+Toplumun, devletin ve sanayinin yapay zeka alanındaki sorunlarına çözüm ortağı olmak amacıyla, yerli ve milli teknoloji hamlesine katkıda bulunmak en büyük motivasyonumuz. Simülasyon aşamasında başarıyla tamamladığımız bu görevleri, gerçek piste taşımak için sabırsızlanıyoruz!
+
+## 🔗 YZT-TALOS Takımını Sosyal Medyada Takip Edin
+
+- **Instagram:** [@talos.team](https://instagram.com/talos.team) / [@uludagaiclub](https://instagram.com/uludagaiclub)
+- **LinkedIn:** https://www.linkedin.com/company/talosteam/
+- **Web Sitemiz:** yapayzekatoplulugu.uludag.edu.tr
+
+---
+
 # TALOS Otonom Sürüş - Tam Sistem
 
 Gazebo simülasyonunda TALOS aracını kontrol eden tam otonom sürüş sistemi.
