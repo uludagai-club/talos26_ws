@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
+import os
 import rospy
 import yaml
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 
-# YAML'daki kenarları ezip kullanılacak olan özel kenar listesi
-CUSTOM_EDGES = [
-    (0,1),(1,2),(1,13),(2,3),(3,4),(4,12),(4,5),(5,6),(6,7),(7,11),(7,8),(8,9),
-    (9,10),(13,22),(12,19),(11,16),(10,14),(14,15),(14,32),(15,16),(16,17),
-    (16,27),(17,18),(18,19),(20,21),(21,22),(22,23),(19,24),(24,26),(26,25),
-    (23,53),(53,54),(54,55),(55,56),(56,57),(57,58),(58,59),(59,60),(27,28),
-    (28,29),(29,36),(36,37),(23,39),(39,38),(39,40),(40,52),(52,51),(51,50),
-    (50,49),(49,41),(49,48),(48,47),(47,46),(46,42),(42,36),(32,31),(31,30),
-    (30,33),(33,34),(30,34),(34,35),(34,43),(19,20),(24,25),(35,36),(43,44),
-    (44,45),(45,46),(25,38),(38,41),(41,37),(37,25),(25,41),(38,37)
-]
+# NOT: Eski 60-node hardcoded CUSTOM_EDGES kaldirildi. Graf artik hedef_yoneticisi'nin
+# build_track_graph() ciktisindan uretilir (maps/gen_track_graph.py -> final_graph.yaml,
+# 644 node + edges). Hem node hem edge dosyadan okunur — guncel grafla daima senkron.
 
 def publish_waypoints():
     rospy.init_node('waypoint_publisher')
-    
+
     # Topic ismi: /waypoint
     marker_pub = rospy.Publisher('/waypoint', MarkerArray, queue_size=10, latch=True)
     rate = rospy.Rate(1)
-    
-    # Docker içindeki tam yol
-    graph_path = '/app/final_graph.yaml'
-    
+
+    # Container'da /app/final_graph.yaml (maps/final_graph.yaml mount edilir);
+    # yerelde script yanindaki final_graph.yaml.
+    here = os.path.dirname(os.path.abspath(__file__))
+    graph_path = next((p for p in ('/app/final_graph.yaml',
+                                   os.path.join(here, 'final_graph.yaml'))
+                       if os.path.exists(p)), '/app/final_graph.yaml')
+
     try:
         with open(graph_path, "r") as file:
             data = yaml.safe_load(file)
@@ -33,7 +30,8 @@ def publish_waypoints():
         rospy.logerr(f"DOSYA OKUNAMADI: {e}")
         return
 
-    rospy.loginfo("Waypoint yayini basladi (Ozel Edge Listesi Kullaniliyor)...")
+    rospy.loginfo(f"Waypoint yayini basladi — {len(data.get('nodes', []))} node, "
+                  f"{len(data.get('edges', []))} edge ({graph_path}).")
 
     while not rospy.is_shutdown():
         marker_array = MarkerArray()
@@ -76,7 +74,7 @@ def publish_waypoints():
         line_marker.color.b = 1.0
         line_marker.color.a = 1.0
 
-        for u, v in CUSTOM_EDGES:
+        for u, v in data.get('edges', []):
             # Düğümlerin YAML'dan okunan koordinatları arasında olup olmadığını kontrol et
             if u in node_coords and v in node_coords:
                 p1 = Point(node_coords[u][0], node_coords[u][1], 0)

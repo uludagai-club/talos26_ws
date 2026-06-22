@@ -35,9 +35,9 @@ Tarih: 2026-04-08
 ```
 
 > **Not:** `fixes/` ve `hilmi-talos/` kaldırıldı (2026-06-22); node'lar iş-alanı klasörlerine,
-> `hilmi-talos/` → `control/`, `algi/engel/` → `lidar/` taşındı. 13 servisin **12'si** tek
-> `talos-all:latest` imajını kullanır (ayrım `command`'la); **`talos-map-server` geçici olarak
-> ayrı `talos-map-server:latest` prebuilt imajını** kullanır (bkz. 3.2).
+> `hilmi-talos/` → `control/`, `algi/engel/` → `lidar/` taşındı. **13 servisin hepsi** tek
+> `talos-all:latest` imajını kullanır (ayrım `command`'la). map-server da Kerem'in eski prebuilt
+> imajından talos-all'a taşındı (2026-06-22) — artık harici imaj/`.tar` gerekmez.
 
 ---
 
@@ -176,14 +176,10 @@ docker build -t talos-all:latest -f Dockerfile.all .
 docker images --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
 ```
 
-Beklenen image'lar: `talos-all:latest` (13 servisin 12'si) + **`talos-map-server:latest`**
-(geçici istisna — `talos-all` build etmiyor). Map-server imajı takımdan `.tar` ile edinilir:
-```bash
-docker load -i talos-map-server.tar   # takım ana deposundan/Drive'dan al
-```
-Bu imaj yoksa `talos-map-server` servisi düşer → `/map`+`/waypoint` yayınlanmaz → hedef GUI boş kalır.
-(Yeni graph yapısı ekipten gelince map-server da `talos-all`'a taşınacak.) Kod compose'da
-bind-mount'lu olduğundan imajlar yalnızca ROS/pip çalışma-zamanı bağımlılıklarını taşır.
+Beklenen **tek** image: `talos-all:latest` (13 servisin hepsi; map-server dahil — 2026-06-22'de
+talos-all'a taşındı: `ros-noetic-map-server` + `maps/my_map.*` + `maps/final_graph.yaml`). Harici
+`.tar` GEREKMEZ. Kod compose'da bind-mount'lu olduğundan imaj yalnızca ROS/pip çalışma-zamanı
+bağımlılıklarını taşır; kod değişince rebuild gerekmez.
 
 ### 3.3. Lane (Şerit) Model Dosyası
 

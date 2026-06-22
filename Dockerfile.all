@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-noetic-visualization-msgs \
     ros-noetic-cv-bridge \
     ros-noetic-pointcloud-to-laserscan \
+    ros-noetic-map-server \
     python3-tk \
     && rm -rf /var/lib/apt/lists/*
 
@@ -36,6 +37,7 @@ RUN pip3 install --no-cache-dir \
     "matplotlib>=3.4.0" \
     "pyyaml>=5.3" \
     "py_trees==2.2.3" \
+    "networkx>=2.5" \
     ultralytics
 
 WORKDIR /app

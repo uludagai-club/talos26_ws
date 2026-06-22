@@ -76,15 +76,14 @@ git clone git@github.com:uludagai-club/talos26_ws.git
 
 ### 4. Docker image (TEK image)
 
-**13 servisin 12'si** tek `talos-all:latest` image'ını kullanır ve ilk `./baslat.sh`
+**13 servisin hepsi** tek `talos-all:latest` image'ını kullanır ve ilk `./baslat.sh`
 çalıştığında `Dockerfile.all`'dan otomatik **build** edilir (repo kendi kendine yeter).
-**İstisna:** `talos-map-server` geçici olarak ayrı `talos-map-server:latest` prebuilt imajını
-kullanır (yeni graph gelince talos-all'a dönülecek); o imaj takımdan `.tar` ile edinilir
-(`docker load -i talos-map-server.tar`), yoksa `/map`+`/waypoint` yayınlanmaz.
+map-server da (eskiden Kerem'in ayrı prebuilt imajı) 2026-06-22'de talos-all'a taşındı —
+artık harici imaj/`.tar` gerekmez; `/map` + güncel `/waypoint` (644-node graf) talos-all'dan gelir.
 
-`talos-all:latest` (`Dockerfile.all`) — `konum`, `hedef-teslimi`,
+`talos-all:latest` (`Dockerfile.all`) — `konum`, `talos-map-server`, `hedef-teslimi`,
 `engel-node`, `traffic-node`, `lane-follower`, `yaya-gecidi-node`, `park-durak-node`,
-`karar-node`, `can-bridge`, `state-bridge`, `talos-controller`, `can-visualizer` — **12 servis**. Eski 6
+`karar-node`, `can-bridge`, `state-bridge`, `talos-controller`, `can-visualizer` — **13 servisin hepsi**. Eski 6
 prebuilt imajın (`konum`, `talos-map-server`, `hedef-yoneticisi`, `otonom-arac`,
 `karar-node`, `traffic_docker`) ve `talos-control:latest`'in yerini alır. Tüm Python kodu
 bind-mount edildiğinden imaj sadece ROS/pip çalışma-zamanı bağımlılıklarını taşır; kod
@@ -212,7 +211,7 @@ docker compose down && ./baslat.sh
 
 ## Bileşenler
 
-Servislerin 12'si tek `talos-all:latest` image'ını kullanır (ayrım `command` ile); `talos-map-server` geçici olarak ayrı prebuilt imaj kullanır.
+Tüm 13 servis tek `talos-all:latest` image'ını kullanır; ayrım `command` ile yapılır.
 
 | Servis | Açıklama |
 |--------|----------|

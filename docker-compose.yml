@@ -50,22 +50,28 @@ services:
     restart: "no"
 
   # =========================================================
-  # HARITA + WAYPOINT SERVISI
+  # HARITA + WAYPOINT SERVISI (tek imaj: talos-all)
   # =========================================================
-  # Eski hazir imaj: hem map_server (/map, my_map.yaml) hem waypoint_pub
-  # (/waypoint, gomulu final_graph.yaml — CUSTOM_EDGES ile uyumlu eski sema)
-  # calistirir. hedef_yoneticisi.py /map gelmeden cizim yapmaz; talos-all'a
-  # gecis map_server'i dusurdugu icin GUI bos kaliyordu. Yeni graph yapisi
-  # ekipten gelince tek-imaj (talos-all + ros-noetic-map-server) donusu yapilacak.
+  # Kerem'in eski prebuilt talos-map-server imajindan KURTULDUK (2026-06-22).
+  # Artik talos-all (+ ros-noetic-map-server) calistirir:
+  #   rosrun map_server map_server /app/my_map.yaml  -> /map (occupancy grid)
+  #   python3 waypoint_pub.py                          -> /waypoint (graf markerlari)
+  # Graf GUNCEL: maps/final_graph.yaml, hedef_yoneticisi.build_track_graph'tan uretildi
+  # (644 node; gen_track_graph.py ile yenilenir). Eski 60-node final_graph artik yok.
   talos-map-server:
-    image: talos-map-server:latest
+    image: talos-all:latest
     container_name: talos-map-server
     network_mode: host
     environment:
       - ROS_MASTER_URI=http://localhost:11311
       - RUN_ID=${RUN_ID:-dev}
     volumes:
+      - ./maps/my_map.yaml:/app/my_map.yaml:ro
+      - ./maps/my_map.pgm:/app/my_map.pgm:ro
+      - ./maps/final_graph.yaml:/app/final_graph.yaml:ro
       - ./maps/waypoint_pub.py:/app/waypoint_pub.py:ro
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && (rosrun map_server map_server /app/my_map.yaml &) && sleep 2 && python3 -u /app/waypoint_pub.py"
     logging: *log-defaults
     restart: "no"
 
