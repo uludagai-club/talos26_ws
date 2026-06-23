@@ -14,6 +14,13 @@ import numpy as np
 import heapq
 import networkx as nx
 
+# Kalıcı tanı logu (opsiyonel) — import edilemezse node yine çalışır.
+try:
+    from hedef_logger import HedefLogger
+except Exception as _e:  # noqa: BLE001
+    HedefLogger = None
+    sys.stderr.write(f"[hedef_yoneticisi] hedef_logger yok, loglama kapalı: {_e}\n")
+
 YESIL  = "\033[92m"
 KIRMIZI = "\033[91m"
 SARI   = "\033[93m"
@@ -810,6 +817,16 @@ class HedefYoneticisi:
         # FIX: varildi_callback & konum_callback çakışmasını önler
         self._wp_lock = threading.Lock()
 
+        # ── Tanı logu (kalıcı; docker kapanınca host'ta kalır) ───────
+        self.logger = None
+        if HedefLogger is not None:
+            try:
+                self.logger = HedefLogger()
+                # SIGTERM/shutdown'da tamponları flush et (son satırlar kaybolmasın)
+                rospy.on_shutdown(lambda: self.logger.close() if self.logger else None)
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[hedef_yoneticisi] logger başlatılamadı: {e}\n")
+
         # ── Planner ─────────────────────────────────────────────────
         self.planner = DLitePlanner()
         self._load_graph_from_import()
@@ -958,7 +975,7 @@ class HedefYoneticisi:
         if (not self.is_path_calculated
                 and self.planner.nodes
                 and self.geo_targets_world):
-            self.recalculate_path_from_robot()
+            self.recalculate_path_from_robot(reason="ilk_rota")
 
         if not self.is_path_calculated or not self.full_path_world:
             self.new_data_available = True
@@ -967,6 +984,7 @@ class HedefYoneticisi:
         now = time.time()
 
         # ── Otomatik WP geçişi (mesafe bazlı) ───────────────────────
+        wp_gecis_log = None   # lock içinde doldurulur, log lock DIŞINDA atılır
         with self._wp_lock:
             wp1_idx = min(self.current_wp_index + 1, len(self.full_path_world) - 1)
             wx_wp, wy_wp = self.full_path_world[wp1_idx]
@@ -978,6 +996,14 @@ class HedefYoneticisi:
                     self._son_varildi_zamani = now
                     rospy.loginfo(f"[OTO] WP {self.current_wp_index} geçildi "
                                   f"(d:{dist_to_wp:.1f}m)")
+                    wp_gecis_log = dict(wp_idx=self.current_wp_index,
+                                        n_path=len(self.full_path_world),
+                                        dist=round(dist_to_wp, 2),
+                                        task_idx=self.current_task_index)
+
+        # Disk I/O'yu _wp_lock dışında yap (lock contention'ı önler)
+        if wp_gecis_log is not None and self.logger is not None:
+            self.logger.log_event("wp_gecis", **wp_gecis_log)
 
         # ── Ana hedef (durak) kontrolü ───────────────────────────────
         if self.current_task_index < len(self.geo_targets_world):
@@ -997,7 +1023,11 @@ class HedefYoneticisi:
 
                 next_name = GOREV_GEOJSON['features'][self.current_task_index]['properties']['name']
                 print(f"{YESIL}>>> DURAK TAMAMLANDI! Yeni hedef: {next_name}{SIFIRLA}")
-                self.recalculate_path_from_robot()
+                if self.logger is not None:
+                    self.logger.log_event("gorev_tamam", task_idx=self.current_task_index,
+                                          next_name=next_name,
+                                          robot=[round(self.robot_x, 2), round(self.robot_y, 2)])
+                self.recalculate_path_from_robot(reason="durak_tamamlandi")
 
         # ── Sapma kontrolü ───────────────────────────────────────────
         # FIX: Tüm rota yerine sadece yakındaki WP'lere bak (CPU tasarrufu)
@@ -1012,8 +1042,37 @@ class HedefYoneticisi:
                     and now - self.son_hesaplama_zamani > 5.0):
                 print(f"{SARI}>>> [DİKKAT] Rotadan {min_dist:.1f}m uzak! "
                       f"Güncelleniyor...{SIFIRLA}")
+                if self.logger is not None:
+                    self.logger.log_event("sapma", min_dist=round(min_dist, 2),
+                                          esik=SAPMA_ESIK_METRE,
+                                          robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
+                                          yaw_deg=round(math.degrees(self.robot_yaw), 2)
+                                          if self.robot_yaw is not None else None,
+                                          wp_idx=self.current_wp_index,
+                                          task_idx=self.current_task_index)
                 self.son_hesaplama_zamani = now
-                self.recalculate_path_from_robot()
+                self.recalculate_path_from_robot(reason="sapma")
+
+        # ── Konum izi (kısılmış; pose.csv) ──────────────────────────
+        # pose_due(): throttle hint — mesafe hesapları sadece yazılacaksa
+        # yapılır (kısılan tick'lerde boşa hesap yok). d_wp/d_goal o anki
+        # current_wp_index/task ile tutarlı kalsın diye burada hesaplanır.
+        if self.logger is not None and self.logger.pose_due():
+            d_wp = d_goal = None
+            try:
+                nx_idx = min(self.current_wp_index + 1, len(self.full_path_world) - 1)
+                wxn, wyn = self.full_path_world[nx_idx]
+                d_wp = math.hypot(self.robot_x - wxn, self.robot_y - wyn)
+                if self.current_task_index < len(self.geo_targets_world):
+                    gxn, gyn = self.geo_targets_world[self.current_task_index]
+                    d_goal = math.hypot(self.robot_x - gxn, self.robot_y - gyn)
+            except Exception:  # noqa: BLE001
+                pass
+            self.logger.log_pose(
+                self.robot_x, self.robot_y, self.robot_yaw,
+                self.current_task_index, self.current_wp_index,
+                len(self.full_path_world), d_wp, d_goal,
+            )
 
         self.new_data_available = True
 
@@ -1042,7 +1101,7 @@ class HedefYoneticisi:
     # ==========================================
     #   ROTA HESAPLAMA
     # ==========================================
-    def recalculate_path_from_robot(self) -> None:
+    def recalculate_path_from_robot(self, reason: str = "?") -> None:
         if not self.geo_targets_world or not self.planner.nodes:
             rospy.logwarn("[recalculate] geo_targets veya planner.nodes boş!")
             return
@@ -1110,6 +1169,23 @@ class HedefYoneticisi:
                 self.planner.restore_edge_directed(start_node, n)
             for n in removed_back:
                 self.planner.restore_edge_directed(n, start_node)
+
+        # ── Tanı logu: rota uzaktan mı çiziliyor? ───────────────────
+        if self.logger is not None:
+            try:
+                task_name = (GOREV_GEOJSON['features'][self.current_task_index]
+                             ['properties']['name'])
+            except Exception:  # noqa: BLE001
+                task_name = None
+            # log buradan önce full_path_world hâlâ ESKİ rota → kıyas geçerli.
+            # path_changed=False → rota değişmedi (boşa recalc / oscillation işareti)
+            path_changed = (path != self.full_path_world) if path else None
+            self.logger.log_recalc(
+                reason=reason, rx=rx, ry=ry, yaw=self.robot_yaw,
+                front=(front_x, front_y), start_node=start_node,
+                goal_node=goal_node, task_idx=self.current_task_index,
+                task_name=task_name, path=path, path_changed=path_changed,
+            )
 
         if path:
             with self._wp_lock:

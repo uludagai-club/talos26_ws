@@ -69,11 +69,14 @@ cleanup() {
     fi
 
     # B2 fix: konteyner root olusturdugu dosyalari kullaniciya geri ver
-    if [ -d "$RUN_DIR" ] && command -v sudo >/dev/null; then
-        if [ "$(stat -c '%U' "$RUN_DIR" 2>/dev/null)" = "root" ]; then
-            sudo chown -R "$(id -u):$(id -g)" "$RUN_DIR" 2>/dev/null || true
+    # RUN_DIR + hedef-teslimi'nin tani loglari (hedef/logs) chown'lanir
+    for _logdir in "$RUN_DIR" "$SCRIPT_DIR/hedef/logs"; do
+        if [ -d "$_logdir" ] && command -v sudo >/dev/null; then
+            if [ "$(stat -c '%U' "$_logdir" 2>/dev/null)" = "root" ]; then
+                sudo chown -R "$(id -u):$(id -g)" "$_logdir" 2>/dev/null || true
+            fi
         fi
-    fi
+    done
 
     stty sane 2>/dev/null
     echo -e "${GREEN}[+] Tum konteynerler ve islemler durduruldu${NC}"

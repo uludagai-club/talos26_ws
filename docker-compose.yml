@@ -86,8 +86,12 @@ services:
       - ROS_MASTER_URI=http://localhost:11311
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
+      # Kalıcı tanı logu kökü (host'ta ./hedef/logs altına bind-mount edilir).
+      - TALOS_LOG_ROOT=/app/logs
     volumes:
       - ./hedef/hedef_yoneticisi.py:/app/hedef_yoneticisi.py:ro
+      - ./hedef/hedef_logger.py:/app/hedef_logger.py:ro
+      - ./hedef/logs:/app/logs
       - ./missions:/missions:ro
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
