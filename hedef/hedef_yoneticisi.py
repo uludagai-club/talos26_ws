@@ -59,7 +59,10 @@ SAPMA_TEMIZ_METRE  = SAPMA_ESIK_METRE - 1.5  # =3.0m. FAZ2 histerezis (Schmitt-t
                            # SAPMA_TEMIZ ALTINA inince sıfırlanır. Eşik etrafında salınan
                            # (flapping) araçta sayaç sıfırlanıp reroute'un hiç tetiklenmemesini önler.
 GOREV_YAKINLIK_M   = 2.0   # bu mesafede görevi tamamlandı sayar (5.0'dan düşürüldü)
-WP_GECIS_MESAFE_M  = 1.8   # bu mesafede WP geçildi sayılır (3.2'den düşürüldü)
+MATCH_PENCERE      = 6     # FAZ3 map-matching: current_wp_index'i ileri pencerede (bu kadar
+                           # WP) en yakın rota noktasına snap'le. Tek-tek +1 yerine; geri
+                           # zıplama yok (pencere ileri başlar). Snap koridoru SAPMA_ESIK (4.5m):
+                           # nokta o koridorun dışındaysa off-route'tur, snap yapılmaz.
 YON_FILTRE_ACIISI  = math.pi - 0.3   # geri yön filtresi açısı (162 derece)
 
 # Görselleştirme Arayüzü (GUI) Ayarı
@@ -999,23 +1002,38 @@ class HedefYoneticisi:
 
         now = time.time()
 
-        # ── Otomatik WP geçişi (mesafe bazlı) ───────────────────────
+        # ── Otomatik WP geçişi: hafif map-matching ──────────────────
+        # FAZ3: tek-tek +1 yerine, aracın rotadaki yerini İLERİ pencerede
+        # [idx, idx+MATCH_PENCERE) en yakın noktaya snap'le (geri zıplama yok,
+        # pencere ileri başlar). Sadece koridor içindeyse (best_d < SAPMA_ESIK)
+        # ilerlet; dışındaysa off-route → snap yapma, sapma/reroute mantığı halleder.
         wp_gecis_log = None   # lock içinde doldurulur, log lock DIŞINDA atılır
         with self._wp_lock:
-            wp1_idx = min(self.current_wp_index + 1, len(self.full_path_world) - 1)
-            wx_wp, wy_wp = self.full_path_world[wp1_idx]
-            dist_to_wp   = math.hypot(self.robot_x - wx_wp, self.robot_y - wy_wp)
+            n_path = len(self.full_path_world)
+            ust    = min(self.current_wp_index + MATCH_PENCERE, n_path)
+            best_i = self.current_wp_index
+            best_d = math.hypot(self.robot_x - self.full_path_world[best_i][0],
+                                self.robot_y - self.full_path_world[best_i][1])
+            for i in range(self.current_wp_index + 1, ust):
+                wx_wp, wy_wp = self.full_path_world[i]
+                d = math.hypot(self.robot_x - wx_wp, self.robot_y - wy_wp)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
 
-            if dist_to_wp < WP_GECIS_MESAFE_M and wp1_idx < len(self.full_path_world) - 1:
-                if now - self._son_varildi_zamani > 0.5:
-                    self.current_wp_index = wp1_idx
-                    self._son_varildi_zamani = now
-                    rospy.loginfo(f"[OTO] WP {self.current_wp_index} geçildi "
-                                  f"(d:{dist_to_wp:.1f}m)")
-                    wp_gecis_log = dict(wp_idx=self.current_wp_index,
-                                        n_path=len(self.full_path_world),
-                                        dist=round(dist_to_wp, 2),
-                                        task_idx=self.current_task_index)
+            if (best_i > self.current_wp_index
+                    and best_i <= n_path - 1
+                    and best_d < SAPMA_ESIK_METRE):
+                atlanan = best_i - self.current_wp_index
+                self.current_wp_index = best_i
+                self._son_varildi_zamani = now
+                rospy.loginfo(f"[OTO] WP {self.current_wp_index} "
+                              f"(map-match +{atlanan}, d:{best_d:.1f}m)")
+                wp_gecis_log = dict(wp_idx=self.current_wp_index,
+                                    n_path=n_path,
+                                    dist=round(best_d, 2),
+                                    atlanan=atlanan,
+                                    task_idx=self.current_task_index)
 
         # Disk I/O'yu _wp_lock dışında yap (lock contention'ı önler)
         if wp_gecis_log is not None and self.logger is not None:
