@@ -25,7 +25,11 @@ GOREV_GEOJSON = {
     {"type": "Feature", "properties": {"name": "durak_1", "description": "1. Durak (Eski Park Cebi - Sağ)"},
      "geometry": {"type": "Point", "coordinates": [37.0, -4.5]}},
     {"type": "Feature", "properties": {"name": "durak_2", "description": "2. Durak (Yeni Park Yolu - Sol)"},
-     "geometry": {"type": "Point", "coordinates": [7.35, -13.9]}}
+     "geometry": {"type": "Point", "coordinates": [7.35, -13.9]}},
+    {"type": "Feature", "properties": {"name": "durak_1_donus", "description": "Ara durak_1 (park dönüşü için tekrar)"},
+     "geometry": {"type": "Point", "coordinates": [37.0, -4.5]}},
+    {"type": "Feature", "properties": {"name": "park", "description": "Park (Spot lane, demo node 7)"},
+     "geometry": {"type": "Point", "coordinates": [-21.78, -13.92]}}
   ]
 }
 
@@ -34,6 +38,9 @@ SAPMA_ESIK_METRE   = 3.0   # bu kadar uzaklaşırsa rota yeniden hesaplanır
 GOREV_YAKINLIK_M   = 2.0   # bu mesafede görevi tamamlandı sayar (5.0'dan düşürüldü)
 WP_GECIS_MESAFE_M  = 1.8   # bu mesafede WP geçildi sayılır (3.2'den düşürüldü)
 YON_FILTRE_ACIISI  = math.pi - 0.3   # geri yön filtresi açısı (162 derece)
+ILERI_MESAFE_M     = 5.0   # start seçimi: aracın yaw yönünde bu kadar ileriye
+                           # sanal nokta atılır → start o noktaya en yakın düğüm
+                           # (Samed'in eski sürümündeki yaw forward-projection)
 
 # Görselleştirme Arayüzü (GUI) Ayarı
 ENABLE_GUI         = True  # Matplotlib penceresini açmak/kapatmak için (False = Headless/Penceresiz)
@@ -1051,48 +1058,20 @@ class HedefYoneticisi:
 
         rx, ry = self.robot_x, self.robot_y
 
-        # Son aktif şeridi belirle (şerit koruma / hysteresis için)
-        last_lane = None
-        if hasattr(self, 'pos_to_node') and self.full_path_world and self.current_wp_index < len(self.full_path_world):
-            last_p = self.full_path_world[self.current_wp_index]
-            last_node = self.pos_to_node.get(last_p)
-            if last_node:
-                last_lane = self.G.nodes[last_node].get('lane')
-
-        # Düğümleri mesafe ve şerit koruma cezasına göre puanla
-        def get_node_cost(n):
-            dist_sq = (n[0] - rx)**2 + (n[1] - ry)**2
-            if last_lane is not None:
-                n_node = self.pos_to_node.get(n)
-                if n_node:
-                    n_lane = self.G.nodes[n_node].get('lane')
-                    # Eğer düğüm son aktif şeritte değilse ceza ekle (16.0 = 4 metre sapma eşdeğeri)
-                    if n_lane != last_lane:
-                        return dist_sq + 16.0
-            return dist_sq
-
-        # Aracın arkasında kalan ve U dönüşü / geri gitme tetikleyebilecek düğümleri filtrele
-        candidates = []
+        # ── Yaw forward-projection start seçimi (Samed'in eski sürümünden) ──
+        # Aracın ÖNÜNDE (yaw yönünde) ILERI_MESAFE_M ileride sanal bir nokta
+        # hesapla, start düğümünü O noktaya en yakın düğüm yap. Böylece rota
+        # aracın BAKTIĞI yöne göre başlar (yaw'a göre döner) — salt mesafe değil.
         if self.robot_yaw is not None:
-            cos_yaw = math.cos(self.robot_yaw)
-            sin_yaw = math.sin(self.robot_yaw)
-            for n in self.planner.nodes:
-                dx = n[0] - rx
-                dy = n[1] - ry
-                # Araç yönü üzerindeki izdüşüm (en fazla 0.5 metre geriye kadar izin verilir)
-                if dx * cos_yaw + dy * sin_yaw >= -0.5:
-                    candidates.append(n)
-
-        if candidates:
-            start_node = min(
-                candidates,
-                key=get_node_cost
-            )
+            front_x = rx + ILERI_MESAFE_M * math.cos(self.robot_yaw)
+            front_y = ry + ILERI_MESAFE_M * math.sin(self.robot_yaw)
         else:
-            start_node = min(
-                self.planner.nodes,
-                key=get_node_cost
-            )
+            front_x, front_y = rx, ry
+
+        start_node = min(
+            self.planner.nodes,
+            key=lambda n: (n[0] - front_x) ** 2 + (n[1] - front_y) ** 2
+        )
 
         goal_node = self.geo_targets_world[self.current_task_index]
         rospy.loginfo(f"[recalculate] {start_node} → {goal_node}")
