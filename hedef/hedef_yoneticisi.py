@@ -46,22 +46,26 @@ ILERI_MESAFE_M     = 2.0   # start seçimi: aracın yaw yönünde bu kadar ileri
                            # (Samed'in eski sürümündeki yaw forward-projection).
                            # 5.0 → 2.0: 5m'lik ileri-projeksiyon hem yanlış paralel şeride
                            # snap'e hem de aşağıdaki sapma-eşiği şişmesine yol açıyordu.
-SAPMA_ESIK_METRE   = ILERI_MESAFE_M + 2.5   # =4.5m. start zaten ILERI kadar ileride seçildiğinden
-                           # eşik ILERI'nin ÜSTÜNDE olmalı; aksi halde duran/yavaş araç kendi taze
-                           # rotasından hep >eşik uzak sayılıp her 5sn'de bir sonsuz replan eder.
-                           # ILERI=2 ile eşik 4.5m: döngü kapanır ama gerçek sapmaya tepkisel kalır
-                           # (sabit 3.0 idi → ILERI'yi referans alıp otomatik takip etsin)
+SAPMA_ESIK_METRE   = 2.5   # FAZ5: sapma aracın BURUN noktasından (yaw yönünde ILERI_MESAFE_M
+                           # ileride) en yakın WP'ye ölçülür. Burun zaten rotada (start o noktaya
+                           # en yakın seçildiğinden) → on-route'ta mesafe ~0; bu yüzden eşik sıkı
+                           # (2.5m) olabilir ve döngü KENDİLİĞİNDEN kapanır (4.5m'lik artifact+
+                           # tolerans şişmesine gerek yok). Yön-bilinçli: araç rotaya dönükse
+                           # burun rotaya yakın kalır → hemen kopmaz.
 SAPMA_DEBOUNCE_SURE = 1.5  # FAZ2: sapma reroute tetiklemeden önce eşiği bu kadar saniye
                            # sürmeli. Anlık konum sıçraması/tek-kare gürültü reroute
                            # etmesin → kararlılık (literatürdeki minimum-dwell/debounce).
-SAPMA_TEMIZ_METRE  = SAPMA_ESIK_METRE - 1.5  # =3.0m. FAZ2 histerezis (Schmitt-trigger):
-                           # debounce sayacı SAPMA_ESIK üstünde kurulur ama yalnızca
-                           # SAPMA_TEMIZ ALTINA inince sıfırlanır. Eşik etrafında salınan
-                           # (flapping) araçta sayaç sıfırlanıp reroute'un hiç tetiklenmemesini önler.
+SAPMA_TEMIZ_METRE  = 1.5   # FAZ5 histerezis clear (band 1.5..2.5m). on-route burun-mesafesi
+                           # ~1m < 1.5 → sayaç sıfırlanır. Eşik etrafında salınan (flapping)
+                           # araçta sayacın sıfırlanıp reroute'un hiç tetiklenmemesini önler.
 GOREV_YAKINLIK_M   = 2.0   # bu mesafede görevi tamamlandı sayar (5.0'dan düşürüldü)
+MATCH_KORIDOR_M    = 4.5   # FAZ3 map-match snap koridoru — sapma eşiğinden AYRI (FAZ5'te ayrıldı).
+                           # Grafın en uzun kenarı 6.13m (park yolu) → kenar ortasında en yakın
+                           # düğüm 3.06m uzakta; koridor bundan büyük olmalı, yoksa o kenarların
+                           # ortasında map-match snap edemez. Sapma eşiği (2.5m) bunu karşılamaz.
 MATCH_PENCERE      = 6     # FAZ3 map-matching: current_wp_index'i ileri pencerede (bu kadar
                            # WP) en yakın rota noktasına snap'le. Tek-tek +1 yerine; geri
-                           # zıplama yok (pencere ileri başlar). Snap koridoru SAPMA_ESIK (4.5m):
+                           # zıplama yok (pencere ileri başlar). Snap koridoru MATCH_KORIDOR_M:
                            # nokta o koridorun dışındaysa off-route'tur, snap yapılmaz.
 YON_FILTRE_ACIISI  = math.pi - 0.3   # geri yön filtresi açısı (162 derece)
 
@@ -1016,7 +1020,7 @@ class HedefYoneticisi:
         # ── Otomatik WP geçişi: hafif map-matching ──────────────────
         # FAZ3: tek-tek +1 yerine, aracın rotadaki yerini İLERİ pencerede
         # [idx, idx+MATCH_PENCERE) en yakın noktaya snap'le (geri zıplama yok,
-        # pencere ileri başlar). Sadece koridor içindeyse (best_d < SAPMA_ESIK)
+        # pencere ileri başlar). Sadece koridor içindeyse (best_d < MATCH_KORIDOR_M)
         # ilerlet; dışındaysa off-route → snap yapma, sapma/reroute mantığı halleder.
         wp_gecis_log = None   # lock içinde doldurulur, log lock DIŞINDA atılır
         with self._wp_lock:
@@ -1034,7 +1038,7 @@ class HedefYoneticisi:
 
             if (best_i > self.current_wp_index
                     and best_i <= n_path - 1
-                    and best_d < SAPMA_ESIK_METRE):
+                    and best_d < MATCH_KORIDOR_M):
                 atlanan = best_i - self.current_wp_index
                 self.current_wp_index = best_i
                 self._son_varildi_zamani = now
@@ -1079,8 +1083,17 @@ class HedefYoneticisi:
         lookahead = self.full_path_world[self.current_wp_index:
                                          self.current_wp_index + 20]
         if lookahead:
+            # ── FAZ5: sapmayı aracın BURUN noktasından ölç ──────────────
+            # Burun = robot + ILERI_MESAFE_M * yaw yönü (start seçiminde kullanılan
+            # nokta). Böylece on-route'ta mesafe ~0 (döngü kendiliğinden kapanır) ve
+            # ölçüm yön-bilinçli: araç rotaya dönükse burun rotaya yakın → kopmaz.
+            if self.robot_yaw is not None:
+                burun_x = self.robot_x + ILERI_MESAFE_M * math.cos(self.robot_yaw)
+                burun_y = self.robot_y + ILERI_MESAFE_M * math.sin(self.robot_yaw)
+            else:
+                burun_x, burun_y = self.robot_x, self.robot_y
             min_dist = min(
-                math.hypot(self.robot_x - wx, self.robot_y - wy)
+                math.hypot(burun_x - wx, burun_y - wy)
                 for wx, wy in lookahead
             )
             # ── FAZ2: debounce + histerezis (Schmitt-trigger) ───────────
@@ -1099,11 +1112,12 @@ class HedefYoneticisi:
             if (sapma_sureli
                     and now - self.son_hesaplama_zamani > 5.0):
                 sapma_suresi = now - self._sapma_baslangic
-                print(f"{SARI}>>> [DİKKAT] Rotadan {min_dist:.1f}m uzak "
+                print(f"{SARI}>>> [DİKKAT] Burun rotadan {min_dist:.1f}m uzak "
                       f"({sapma_suresi:.1f}s süregeldi)! Güncelleniyor...{SIFIRLA}")
                 if self.logger is not None:
                     self.logger.log_event("sapma", min_dist=round(min_dist, 2),
                                           esik=SAPMA_ESIK_METRE,
+                                          burun=[round(burun_x, 2), round(burun_y, 2)],
                                           robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
                                           yaw_deg=round(math.degrees(self.robot_yaw), 2)
                                           if self.robot_yaw is not None else None,
