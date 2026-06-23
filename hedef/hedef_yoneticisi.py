@@ -40,49 +40,45 @@ GOREV_GEOJSON = {
   ]
 }
 
-# Sapma kontrolü için eşik değerleri
-ILERI_MESAFE_M     = 2.0   # start seçimi: aracın yaw yönünde bu kadar ileriye
-                           # sanal nokta atılır → start o noktaya en yakın düğüm
-                           # (Samed'in eski sürümündeki yaw forward-projection).
-                           # 5.0 → 2.0: 5m'lik ileri-projeksiyon hem yanlış paralel şeride
-                           # snap'e hem de aşağıdaki sapma-eşiği şişmesine yol açıyordu.
-SAPMA_ESIK_METRE   = 2.5   # FAZ5: sapma aracın BURUN noktasından (yaw yönünde ILERI_MESAFE_M
-                           # ileride) en yakın WP'ye ölçülür. Burun zaten rotada (start o noktaya
-                           # en yakın seçildiğinden) → on-route'ta mesafe ~0; bu yüzden eşik sıkı
-                           # (2.5m) olabilir ve döngü KENDİLİĞİNDEN kapanır (4.5m'lik artifact+
-                           # tolerans şişmesine gerek yok). Yön-bilinçli: araç rotaya dönükse
-                           # burun rotaya yakın kalır → hemen kopmaz.
-SAPMA_DEBOUNCE_SURE = 1.5  # FAZ2: sapma reroute tetiklemeden önce eşiği bu kadar saniye
-                           # sürmeli. Anlık konum sıçraması/tek-kare gürültü reroute
-                           # etmesin → kararlılık (literatürdeki minimum-dwell/debounce).
-SAPMA_TEMIZ_METRE  = 1.5   # FAZ5 histerezis clear (band 1.5..2.5m). on-route burun-mesafesi
-                           # ~1m < 1.5 → sayaç sıfırlanır. Eşik etrafında salınan (flapping)
-                           # araçta sayacın sıfırlanıp reroute'un hiç tetiklenmemesini önler.
-GOREV_YAKINLIK_M   = 2.0   # bu mesafede görevi tamamlandı sayar (5.0'dan düşürüldü)
-MATCH_KORIDOR_M    = 4.5   # FAZ3 map-match snap koridoru — sapma eşiğinden AYRI (FAZ5'te ayrıldı).
-                           # Grafın en uzun kenarı 6.13m (park yolu) → kenar ortasında en yakın
-                           # düğüm 3.06m uzakta; koridor bundan büyük olmalı, yoksa o kenarların
-                           # ortasında map-match snap edemez. Sapma eşiği (2.5m) bunu karşılamaz.
-MATCH_PENCERE      = 6     # FAZ3 map-matching: current_wp_index'i ileri pencerede (bu kadar
-                           # WP) en yakın rota noktasına snap'le. Tek-tek +1 yerine; geri
-                           # zıplama yok (pencere ileri başlar). Snap koridoru MATCH_KORIDOR_M:
-                           # nokta o koridorun dışındaysa off-route'tur, snap yapılmaz.
-YON_FILTRE_ACIISI  = math.pi - 0.3   # geri yön filtresi açısı (162 derece)
+# ════════════════════════════════════════════════════════════════════════
+#   AYARLANABİLİR PARAMETRELER  —  hepsi burada, kolay düzenleme için
+# ════════════════════════════════════════════════════════════════════════
 
-# Görselleştirme Arayüzü (GUI) Ayarı
-ENABLE_GUI         = True  # Matplotlib penceresini açmak/kapatmak için (False = Headless/Penceresiz)
+# ── GUI ──────────────────────────────────────────────────────────────────
+ENABLE_GUI          = True   # Matplotlib penceresi (False = headless/penceresiz)
 
-# Ağırlık ve Ceza Katsayıları (Yol ve Şerit Tercihleri)
-AGIRLIK_LANE_DUZ         = 1.0   # Düz şeritte normal sürüş çarpanı
-AGIRLIK_LANE_TERS_MULT   = 150.0 # Ters şeritte sürüş çarpanı (geriye doğru yol planlamasını önlemek için çok yüksek)
-AGIRLIK_LANE_TERS_P      = 0.0   # Ters şeritte sürüş sabit cezası (iptal)
+# ── Start seçimi & sapma / reroute (Faz 1-5) ─────────────────────────────
+ILERI_MESAFE_M      = 2.0    # start + sapma "burun" noktası: aracın yaw yönünde bu kadar ileri (m)
+SAPMA_ESIK_METRE    = 2.5    # burun en yakın WP'den bu kadar uzaksa → reroute (debounce sonrası) (m)
+SAPMA_TEMIZ_METRE   = 1.5    # histerezis: burun bu kadarın ALTINA inince sayaç sıfırlanır (band 1.5..2.5) (m)
+SAPMA_DEBOUNCE_SURE = 1.5    # sapma reroute için bu kadar saniye KESİNTİSİZ süregelmeli (s)
+GOREV_YAKINLIK_M    = 2.0    # bu mesafede durak/görev tamamlandı sayılır (m)
+YON_FILTRE_ACIISI   = math.pi - 0.3   # start'tan geri-yön kenar filtre açısı (~162°)
 
-AGIRLIK_SLALOM_MULT      = 6.0   # Şerit değiştirme (slalom) kat sayısı
-AGIRLIK_SLALOM_P         = 0.0   # Şerit değiştirme (slalom) sabit cezası (iptal)
+# ── Map-matching (Faz 3) ─────────────────────────────────────────────────
+MATCH_PENCERE       = 6      # current_wp_index ileri snap penceresi (kaç WP)
+MATCH_KORIDOR_M     = 4.5    # snap koridoru — graf max kenar 6.13m → yarı 3.06m'den BÜYÜK olmalı (m)
 
-AGIRLIK_CONN_DUZ         = 1.0   # Bağlantı yollarında normal geçiş çarpanı
-AGIRLIK_CONN_TERS_MULT   = 150.0 # Bağlantı yollarında ters yön çarpanı (geriye doğru yol planlamasını önlemek için çok yüksek)
-AGIRLIK_CONN_TERS_P      = 0.0   # Bağlantı yollarında ters yön sabit cezası (iptal)
+# ── CEZA PUANLARI (0-100)  —  rota / şerit tercihleri ────────────────────
+# Eşleme:  kenar_agirligi = mesafe * (1 + CEZA/100 * CEZA_ETKI)
+#   CEZA_ETKI=4 ile:  0p→1.0x · 8p→1.32x · 15p→1.6x · 25p→2.0x · 50p→3.0x · 90p→4.6x · 100p→5.0x
+#   (eski 6x slalom ≈ 125p idi — çok abartı; 0-100 aralığına çekildi)
+CEZA_ETKI             = 4.0  # global ölçek: ceza puanının çarpana etkisi
+
+# Aktif (D* grafında kullanılıyor):
+CEZA_DUZ_SERIT        = 0    # düz şeritte sürüş (1.0x) — referans, en tercih edilen
+CEZA_BAGLANTI         = 8    # bağlantı/dönüş yolu (1.32x) — düz şeridi hafif tercih et
+# Placeholder — DİNAMİK akış için, henüz hiçbir canlı kod yoluna BAĞLI DEĞİL
+# (karar↔hedef / control arayüzü gelince kullanılacak; şimdi değiştirmek bir şeyi etkilemez):
+CEZA_SERIT_DEGISTIRME = 15   # şerit değiştirme/sollama (1.6x) — karar-güdümlü
+CEZA_TERS_YON         = 90   # ters yön / geri sürüş (4.6x) — control
+
+
+def ceza_carpani(ceza_puani: float) -> float:
+    """0-100 ceza puanını D* kenar ağırlık çarpanına çevirir (1.0 + p/100 * CEZA_ETKI).
+    Puan 0-100'e clamp'lenir (dinamik akışta bozuk/aşırı çarpan oluşmasın)."""
+    p = max(0.0, min(100.0, ceza_puani))
+    return 1.0 + (p / 100.0) * CEZA_ETKI
 
 
 # ==========================================
@@ -628,6 +624,12 @@ def build_track_graph():
     for src, dst, app, ex in connections_to_build:
         add_curved_conn(src, dst, app, ex, conn_type='connection')
 
+    # NOT: slalom_connections_to_build (karşı şeride geçme) BİLİNÇLİ olarak
+    # D* grafına eklenmiyor. Şerit değiştirme/sollama DİNAMİK (karar-güdümlü):
+    # karar bir bağlantılı WP'ye geçmek isterse hedef ona karşı-şerit WP'sini
+    # iletir. Böylece D* her hesaplamada ters/karşı şeritleri taşımaz.
+    # (Karşı-şerit eşlemesi için slalom_connections_to_build / pairing kullanılır.)
+
     # A şeridi ile P1 ve P7 arasındaki bağlantıyı dinamik olarak ekliyoruz
     a_nodes = [n for n in G.nodes() if G.nodes[n].get('lane') == 'A']
     if 'P1' in G.nodes() and 'P7' in G.nodes():
@@ -928,31 +930,24 @@ class HedefYoneticisi:
             d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
             etype = edge_data.get('type', 'lane')
 
-            # Calculate forward weight
+            # İleri yön ağırlığı — ceza puanı (0-100) → çarpan
             if etype == 'lane':
-                w_forward = d * AGIRLIK_LANE_DUZ
+                w_forward = d * ceza_carpani(CEZA_DUZ_SERIT)
             elif etype == 'connection':
-                w_forward = d * AGIRLIK_CONN_DUZ
-            elif etype == 'slalom':
-                w_forward = d * AGIRLIK_SLALOM_MULT + AGIRLIK_SLALOM_P
+                w_forward = d * ceza_carpani(CEZA_BAGLANTI)
+            elif etype == 'slalom':   # şu an ÖLÜ dal: slalom kenarı grafa eklenmiyor
+                w_forward = d * ceza_carpani(CEZA_SERIT_DEGISTIRME)   # (dinamik akış gelince anlamlı)
             else:
                 w_forward = d
 
             # Add forward edge
             self.planner.add_edge(p1, p2, w_forward)
 
-            # Check if reverse edge exists in G. If not, do NOT add penalized reverse edge for overtaking
-            # (Orijinal tek yönlü DiGraph yapısını korumak ve ters yön planlamasını önlemek için devre dışı bırakıldı)
-            # if not G.has_edge(v, u):
-            #     if etype == 'lane':
-            #         w_reverse = d * AGIRLIK_LANE_TERS_MULT + AGIRLIK_LANE_TERS_P
-            #     elif etype == 'connection':
-            #         w_reverse = d * AGIRLIK_CONN_TERS_MULT + AGIRLIK_CONN_TERS_P
-            #     elif etype == 'slalom':
-            #         w_reverse = d * AGIRLIK_SLALOM_MULT + AGIRLIK_SLALOM_P
-            #     else:
-            #         w_reverse = d * 10.0
-            # 
+            # NOT: Ters/geri kenar D* grafına EKLENMİYOR (tek yönlü yapı korunur).
+            # Geri sürüş ve şerit değiştirme DİNAMİK: karar/control runtime'da
+            # karşı-şerit WP'sini ister; CEZA_TERS_YON / CEZA_SERIT_DEGISTIRME o
+            # akışta uygulanır. Eski "penalized reverse edge" yaklaşımı kaldırıldı
+            # (D* her hesaplamada ters şeritleri taşımasın diye — kullanıcı kararı).
             #     self.planner.add_edge(p2, p1, w_reverse)
 
         self._graph_loaded = True
