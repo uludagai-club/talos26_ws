@@ -41,13 +41,19 @@ GOREV_GEOJSON = {
 }
 
 # Sapma kontrolü için eşik değerleri
-SAPMA_ESIK_METRE   = 3.0   # bu kadar uzaklaşırsa rota yeniden hesaplanır
+ILERI_MESAFE_M     = 2.0   # start seçimi: aracın yaw yönünde bu kadar ileriye
+                           # sanal nokta atılır → start o noktaya en yakın düğüm
+                           # (Samed'in eski sürümündeki yaw forward-projection).
+                           # 5.0 → 2.0: 5m'lik ileri-projeksiyon hem yanlış paralel şeride
+                           # snap'e hem de aşağıdaki sapma-eşiği şişmesine yol açıyordu.
+SAPMA_ESIK_METRE   = ILERI_MESAFE_M + 2.5   # =4.5m. start zaten ILERI kadar ileride seçildiğinden
+                           # eşik ILERI'nin ÜSTÜNDE olmalı; aksi halde duran/yavaş araç kendi taze
+                           # rotasından hep >eşik uzak sayılıp her 5sn'de bir sonsuz replan eder.
+                           # ILERI=2 ile eşik 4.5m: döngü kapanır ama gerçek sapmaya tepkisel kalır
+                           # (sabit 3.0 idi → ILERI'yi referans alıp otomatik takip etsin)
 GOREV_YAKINLIK_M   = 2.0   # bu mesafede görevi tamamlandı sayar (5.0'dan düşürüldü)
 WP_GECIS_MESAFE_M  = 1.8   # bu mesafede WP geçildi sayılır (3.2'den düşürüldü)
 YON_FILTRE_ACIISI  = math.pi - 0.3   # geri yön filtresi açısı (162 derece)
-ILERI_MESAFE_M     = 5.0   # start seçimi: aracın yaw yönünde bu kadar ileriye
-                           # sanal nokta atılır → start o noktaya en yakın düğüm
-                           # (Samed'in eski sürümündeki yaw forward-projection)
 
 # Görselleştirme Arayüzü (GUI) Ayarı
 ENABLE_GUI         = True  # Matplotlib penceresini açmak/kapatmak için (False = Headless/Penceresiz)
@@ -1145,7 +1151,10 @@ class HedefYoneticisi:
                 neighbors = list(self.planner.adj_list.get(start_node, []))
                 candidates = []
                 for n in neighbors:
-                    dx, dy = n[0] - rx, n[1] - ry
+                    # FIX: yön filtresi komşunun start_node'a göre yönüne bakmalı
+                    # (robot konumuna göre değil); aksi halde start robottan uzakken
+                    # geri-yön kenarları yanlış değerlendirilir.
+                    dx, dy = n[0] - start_node[0], n[1] - start_node[1]
                     if dx == 0 and dy == 0:
                         continue
                     diff = (math.atan2(dy, dx) - self.robot_yaw + math.pi) \
