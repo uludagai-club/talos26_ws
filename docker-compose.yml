@@ -41,7 +41,7 @@ services:
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
     volumes:
-      - ./fixes/konum.py:/app/konum.py:ro
+      - ./konum/konum.py:/app/konum.py:ro
       - ./talos_common:/app/talos_common:ro
       - ./logs:/app/logs
     entrypoint: bash
@@ -50,22 +50,28 @@ services:
     restart: "no"
 
   # =========================================================
-  # HARITA + WAYPOINT SERVISI
+  # HARITA + WAYPOINT SERVISI (tek imaj: talos-all)
   # =========================================================
-  # Eski hazir imaj: hem map_server (/map, my_map.yaml) hem waypoint_pub
-  # (/waypoint, gomulu final_graph.yaml — CUSTOM_EDGES ile uyumlu eski sema)
-  # calistirir. hedef_yoneticisi.py /map gelmeden cizim yapmaz; talos-all'a
-  # gecis map_server'i dusurdugu icin GUI bos kaliyordu. Yeni graph yapisi
-  # ekipten gelince tek-imaj (talos-all + ros-noetic-map-server) donusu yapilacak.
+  # Kerem'in eski prebuilt talos-map-server imajindan KURTULDUK (2026-06-22).
+  # Artik talos-all (+ ros-noetic-map-server) calistirir:
+  #   rosrun map_server map_server /app/my_map.yaml  -> /map (occupancy grid)
+  #   python3 waypoint_pub.py                          -> /waypoint (graf markerlari)
+  # Graf GUNCEL: maps/final_graph.yaml, hedef_yoneticisi.build_track_graph'tan uretildi
+  # (644 node; gen_track_graph.py ile yenilenir). Eski 60-node final_graph artik yok.
   talos-map-server:
-    image: talos-map-server:latest
+    image: talos-all:latest
     container_name: talos-map-server
     network_mode: host
     environment:
       - ROS_MASTER_URI=http://localhost:11311
       - RUN_ID=${RUN_ID:-dev}
     volumes:
-      - ./fixes/waypoint_pub.py:/app/waypoint_pub.py:ro
+      - ./maps/my_map.yaml:/app/my_map.yaml:ro
+      - ./maps/my_map.pgm:/app/my_map.pgm:ro
+      - ./maps/final_graph.yaml:/app/final_graph.yaml:ro
+      - ./maps/waypoint_pub.py:/app/waypoint_pub.py:ro
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && (rosrun map_server map_server /app/my_map.yaml &) && sleep 2 && python3 -u /app/waypoint_pub.py"
     logging: *log-defaults
     restart: "no"
 
@@ -81,7 +87,7 @@ services:
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
     volumes:
-      - ./fixes/hedef_yoneticisi.py:/app/hedef_yoneticisi.py:ro
+      - ./hedef/hedef_yoneticisi.py:/app/hedef_yoneticisi.py:ro
       - ./missions:/missions:ro
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
@@ -103,8 +109,8 @@ services:
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
     volumes:
-      - ./fixes/engel_node_fixed.py:/app/engel_node_fixed.py:ro
-      - ./fixes/pointcloud_obstacle_publisher.py:/app/pointcloud_obstacle_publisher.py:ro
+      - ./lidar/engel_node_fixed.py:/app/engel_node_fixed.py:ro
+      - ./lidar/pointcloud_obstacle_publisher.py:/app/pointcloud_obstacle_publisher.py:ro
       - ./talos_common:/app/talos_common:ro
       - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
@@ -113,13 +119,22 @@ services:
     # export eder, sonra background job'lar fork edilir → tum subshell'ler ayni env'i
     # (Decision.msg dahil) miras alir.
     entrypoint: bash
+    # FIX(menzil): _min_height -1.2 → -0.7. Velodyne yerden ~1.0m; -1.2 zemin
+    # düzleminin ALTINDA olduğu için laserscan tüm zemin noktalarını yutuyordu →
+    # her yönde sabit ~3.3m "hayalet halka" (VLP en alt ışını zemini ~3.3m'de
+    # kesiyor). Halka 3m engel eşiğinin hemen üstünde durduğundan engel ancak
+    # <3m'ye girince ortaya çıkıyor, ~1m uyarı kalıyordu → geç tepki/çarpma.
+    # -0.7 (yerden ~0.3m üstü) zemini eler, cone'u gerçek menzilinde (10-20m)
+    # görünür kılar. Cone/duba >0.3m olduğu için korunur.
+    # NOT: Aşağıdaki '>-' katlanmış blok TEK satıra iner — içine '#' yorum KOYMA,
+    # sonraki her şeyi (rosrun dahil) yorum yapar ve node komutsuz kalır.
     command:
       - -c
       - >-
         set -e;
         source /opt/ros/noetic/setup.bash;
         export PYTHONPATH=/talos-devel/lib/python3/dist-packages:/app:$$PYTHONPATH;
-        (rosrun pointcloud_to_laserscan pointcloud_to_laserscan_node cloud_in:=/cart/center_laser/scan scan:=/converted_scan _min_height:=-1.2 _max_height:=1.0 _range_min:=0.45 _range_max:=100.0 &);
+        (rosrun pointcloud_to_laserscan pointcloud_to_laserscan_node cloud_in:=/cart/center_laser/scan scan:=/converted_scan _min_height:=-0.7 _max_height:=1.0 _range_min:=0.45 _range_max:=100.0 &);
         sleep 2;
         (stdbuf -oL python3 -u /app/engel_node_fixed.py &);
         stdbuf -oL python3 -u /app/pointcloud_obstacle_publisher.py
@@ -147,9 +162,9 @@ services:
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
     volumes:
-      - ./fixes/yolov8_ros_node_fixed.py:/app/yolov8_ros_node_fixed.py:ro
+      - ./algi/levha/yolov8_ros_node_fixed.py:/app/yolov8_ros_node_fixed.py:ro
       # Levha modeli: İndirilenler'deki yolov10n best.pt (26 sınıf) image içindeki modeli ezer
-      - ./levha_tespiti/yolov8_ros/scripts/best.pt:/root/catkin_ws/src/yolov8_ros/scripts/best.pt:ro
+      - ./algi/levha/yolov8_ros/scripts/best.pt:/root/catkin_ws/src/yolov8_ros/scripts/best.pt:ro
       # 'Levha Tespit' cv2 penceresi icin X11 (lane-follower ile ayni kalip)
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
@@ -165,11 +180,36 @@ services:
     restart: "no"
 
   # =========================================================
-  # GUVENLI ALAN TESPITI (GPU, prototip)
+  # PARK + DURAK ALANI TESPITI (HSV mavi-renk, GPU gerekmez)
+  # MODELLER 20.06.2026/PARK ALANI VE DURAK ALANI -> fixes/park_durak_node.py
+  # Cikti: /park_alani, /durak_alani (String) + /park_durak/image_annotated
   # =========================================================
-  safe-zone-detector:
+  park-durak-node:
     image: talos-all:latest
-    container_name: safe-zone-detector
+    container_name: park-durak-node
+    network_mode: host
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - DISPLAY=${DISPLAY}
+      - RUN_ID=${RUN_ID:-dev}
+    volumes:
+      - ./algi/park_durak/park_durak_node.py:/app/park_durak_node.py:ro
+      # 'Park/Durak Tespit' cv2 penceresi icin X11 (traffic-node ile ayni kalip)
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/park_durak_node.py"
+    logging: *log-defaults
+    restart: "no"
+
+  # =========================================================
+  # SERIT TAKIP / LANE FOLLOWER (YOLOv8, GPU)
+  # lane/scripts/lane_follow_node.py -> /line (direksiyon acisi) + /lane/* topic'leri
+  # control.py /line'i tuketir (LINE_TOPIC, 12 derece altinda gated duzeltme).
+  # Kamera: /cart/front_camera/image_raw/compressed
+  # =========================================================
+  lane-follower:
+    image: talos-all:latest
+    container_name: lane-follower
     network_mode: host
     environment:
       - ROS_MASTER_URI=http://localhost:11311
@@ -178,11 +218,46 @@ services:
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
     volumes:
-      - ./prototip-1/safe_zone_detector.py:/app/safe_zone_detector.py:ro
-      - ./prototip-1/best.pt:/app/models/best.pt:ro
+      # current_dir=/app -> model_candidates[1] = /app/models/best.pt eslesir
+      # fixes/ override: /lane/image_annotated publisher + DISPLAY guard eklenmis surum
+      - ./algi/serit/lane_follow_node_fixed.py:/app/lane_follow_node.py:ro
+      - ./algi/serit/models/best.pt:/app/models/best.pt:ro
+      # 'Lane Follow' cv2 penceresi icin X11 (traffic-node ile ayni kalip)
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
-    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/safe_zone_detector.py"
+    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/lane_follow_node.py"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    logging: *log-defaults
+    restart: "no"
+
+  # =========================================================
+  # YAYA GECIDI / CROSSWALK (YOLOv8 ADANMIS MODEL, GPU)
+  # MODELLER 20.06.2026/YAYA GEÇİDİ/best.pt ({0:crosswalk,1:object})
+  # -> /yaya_gecidi/image_annotated + /yaya_gecidi/model
+  # traffic-node'un bare /yaya_gecidi'sini (karar.py tuketir) EZMEZ.
+  # =========================================================
+  yaya-gecidi-node:
+    image: talos-all:latest
+    container_name: yaya-gecidi-node
+    network_mode: host
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - DISPLAY=${DISPLAY}
+      - RUN_ID=${RUN_ID:-dev}
+    volumes:
+      - ./algi/yaya_gecidi/yaya_gecidi_node.py:/app/yaya_gecidi_node.py:ro
+      - ./algi/yaya_gecidi/best.pt:/app/models/best.pt:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    entrypoint: bash
+    command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/yaya_gecidi_node.py"
     deploy:
       resources:
         reservations:
@@ -207,7 +282,12 @@ services:
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
     volumes:
-      - ./karar_bt:/app:ro
+      # NOT: /app salt-okunur. ./talos_common'ı /app/talos_common'a mount edebilmek
+      # için mountpoint'in ÖNCEDEN var olması şart (yoksa Docker ro fs'te mkdir
+      # yapamayıp "read-only file system" ile container'ı düşürür → karar-node hiç
+      # başlamaz, /karar yayınlanmazdı). Mountpoint karar_bt/talos_common/.gitkeep
+      # ile kalıcı sağlanıyor; ./talos_common bunun üzerine bindirilir.
+      - ./karar:/app:ro
       - ./talos_common:/app/talos_common:ro
       - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
@@ -232,8 +312,8 @@ services:
       - TALOS_LOG_ROOT=/app/logs
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
     volumes:
-      - ./hilmi-talos/can_to_talos_cart.py:/app/can_to_talos_cart.py:ro
-      - ./hilmi-talos/can_decoder.py:/app/can_decoder.py:ro
+      - ./control/can_to_talos_cart.py:/app/can_to_talos_cart.py:ro
+      - ./control/can_decoder.py:/app/can_decoder.py:ro
       - ./talos_common:/app/talos_common:ro
       - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
@@ -256,8 +336,8 @@ services:
       - TALOS_LOG_ROOT=/app/logs
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
     volumes:
-      - ./hilmi-talos/talos_state_to_can.py:/app/talos_state_to_can.py:ro
-      - ./hilmi-talos/can_decoder.py:/app/can_decoder.py:ro
+      - ./control/talos_state_to_can.py:/app/talos_state_to_can.py:ro
+      - ./control/can_decoder.py:/app/can_decoder.py:ro
       - ./talos_common:/app/talos_common:ro
       - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
@@ -282,8 +362,8 @@ services:
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
     volumes:
-      - ./hilmi-talos/control.py:/app/control.py:ro
-      - ./hilmi-talos/logs:/app/logs
+      - ./control/control.py:/app/control.py:ro
+      - ./control/logs:/app/logs
       - ./talos_common:/app/talos_common:ro
       - ./missions:/missions:ro   # FIX 2 — GOREV_NOKTALARI GeoJSON yükleme
     entrypoint: bash
@@ -305,8 +385,10 @@ services:
       - RUN_ID=${RUN_ID:-dev}
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages
     volumes:
-      - ./hilmi-talos/can_visualizer.py:/app/can_visualizer.py:ro
-      - ./hilmi-talos/can_decoder.py:/app/can_decoder.py:ro
+      - ./control/can_visualizer.py:/app/can_visualizer.py:ro
+      - ./control/can_decoder.py:/app/can_decoder.py:ro
+      - ./missions:/missions:ro
+      - ./maps:/maps:ro
       - ~/talos-sim/devel:/talos-devel:ro
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash

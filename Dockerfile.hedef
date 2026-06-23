@@ -1,6 +1,0 @@
-FROM hedef-yoneticisi:latest AS base
-
-# Guncel hedef_yoneticisi.py dosyasini kopyala
-COPY fixes/hedef_yoneticisi.py /app/hedef_yoneticisi.py
-
-CMD ["/bin/bash", "-c", "source /opt/ros/noetic/setup.bash && python3 hedef_yoneticisi.py"]

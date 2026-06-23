@@ -1,0 +1,93 @@
+# TALOS karar_bt parametreleri.
+# Eşikler ve zamanlamalar tek noktada tutulur — sahada hızlı tune için.
+
+tick_hz: 10.0
+
+# Sensor freshness — bu süreden uzun süre veri gelmemişse dal kapanır
+freshness:
+  yaya_max_age_s:   0.6
+  levha_max_age_s:  0.6
+  engel_max_age_s:  0.4
+  lane_max_age_s:   0.8
+  odom_max_age_s:   0.5
+  hedef_max_age_s:  2.0
+
+# Mesafe eşikleri (metre) — eski karar.py ile uyumlu başlangıç.
+# NOT: Yaya ve engel için ayrı acil eşik; eski karar.py yalnız yayaya bakıyordu.
+distances:
+  yaya_acil_durus_m: 2.0   # eski MESAFE_ACIL_DURUS
+  yaya_dur_m:        4.0
+  yaya_yavas_m:     12.0
+  engel_acil_m:      1.2   # bumper koruması — araç boyuna göre
+  engel_block_m:     2.0   # blokaj ama acil değil → kaçınma/dur dene
+  engel_yan_clear_m: 3.0   # yan sektörde bu kadar boşluk varsa lane change makul
+  levha_dur_m:       3.5
+  levha_oku_m:      10.0
+  yon_levha_max_m:   5.0
+
+# Hıza-duyarlı tepki mesafesi.
+# efektif_esik = taban_esik + gain_s * hiz_mps  (max_extra_m ile sınırlı)
+# gain_s ≈ "ileriye bakış / reaksiyon süresi" (saniye): bu kadar saniyelik
+# yolu eşiğe ekler. Odom bayatsa veya hız 0 ise eşik tabanda kalır (güvenli).
+speed_adaptive:
+  enabled: true
+  yaya_dur_gain_s:    0.5   # tam duruş eşiği büyümesi
+  yaya_yavas_gain_s:  0.8   # yavaşlama eşiği büyümesi
+  engel_block_gain_s: 0.4   # engel blokaj eşiği büyümesi
+  max_extra_m:        6.0   # hız katkısının üst sınırı
+
+# Trafik ışığı davranışı
+traffic_light:
+  # Sarı (YAVAS) ışıkta ne yapılsın: "slow" (yavaşla, varsayılan) | "dur" (tam dur).
+  # KTR §7.5.5 "kırmızı veya sarı → tam dur" istiyor; sahada flip için param.
+  yellow_action: slow
+
+# Zamanlayıcılar
+timers:
+  dur_levhasi_bekleme_s:    3.0
+  dur_levhasi_release_grace_s: 1.5  # bekleme bitti, levha hâlâ yakın → bu süre içinde release
+
+# Debounce — flicker önleme (tick cinsinden, 10Hz @ 0.1s/tick varsayar)
+debounce:
+  yaya_min_consecutive:     2
+  engel_min_consecutive:    2
+  levha_min_consecutive:    2
+
+# Emergency latch
+emergency:
+  release_clear_ticks: 8   # 8 tick (~0.8s) net olunca acil mühür çözülür
+
+# Engel kaynağı — iki arayüz desteklenir, otomatik failover ile:
+#   1) YENI: talos_obstacle_detector → /obstacles/poses (geometry_msgs/PoseArray)
+#            DBSCAN + PCA OBB engel konumları. Varsa BT bunu kullanır.
+#   2) ESKI: engel_node_fixed.py → /engel,/engel_distance,/engel_angle,
+#            /engel_sol_mesafe,/engel_sag_mesafe (skaler). Yeni kaynak yoksa bu.
+# source: "auto" (yeni varsa onu, yoksa eskiyi) | "legacy" | "poses"
+obstacle:
+  source: auto
+  new_source_max_age_s: 0.5     # /obstacles/poses bu süre içinde geldiyse "aktif" → skaler topic'ler yok sayılır
+  corridor_half_width_m: 1.0    # araç koridoru yarı genişliği (merkez sektör eşiği)
+  forward_min_m: 0.0            # bu değerden ileri engeller sayılır (önümüz)
+  forward_max_m: 30.0           # merkez/açı için ileri bakış sınırı (m)
+  side_forward_max_m: 8.0       # yan sektör (lane-change güvenliği) ileri sınırı (m)
+  # PoseArray eksen eşlemesi (sensör frame → araç gövdesi). Sim'de velodyne
+  # genelde REP-103: x ileri, y sol. Sensör farklıysa burada düzelt.
+  axis_forward: x               # x | y | z  → "ileri" hangi eksen
+  axis_left: y                  # x | y | z  → "sol" hangi eksen
+  invert_forward: false
+  invert_left: false
+
+# Lane change guard'ları (sadece BT içinde; control.py kendi guard'ını ayrı uygular)
+lane_change:
+  enabled: true
+  cooldown_s: 4.0           # ardışık lane change arası bekleme
+  # control.py şerit değişimini kenar-tetiklemeli başlatıp LANE_CHANGE_DURATION
+  # süresince kendi sürer. BT bu süre boyunca aynı yön komutunu tutar (yoksa
+  # "dur"/"normal" manevrayı keser). control.py LANE_CHANGE_DURATION ile eşit tut.
+  maneuver_hold_s: 2.0
+
+# Snapshot/debug
+debug:
+  publish_snapshot: true
+  snapshot_rate_hz: 2.0
+  ascii_tree_log_every_n_tick: 50  # 0 = kapalı
