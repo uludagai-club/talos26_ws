@@ -51,6 +51,13 @@ SAPMA_ESIK_METRE   = ILERI_MESAFE_M + 2.5   # =4.5m. start zaten ILERI kadar ile
                            # rotasından hep >eşik uzak sayılıp her 5sn'de bir sonsuz replan eder.
                            # ILERI=2 ile eşik 4.5m: döngü kapanır ama gerçek sapmaya tepkisel kalır
                            # (sabit 3.0 idi → ILERI'yi referans alıp otomatik takip etsin)
+SAPMA_DEBOUNCE_SURE = 1.5  # FAZ2: sapma reroute tetiklemeden önce eşiği bu kadar saniye
+                           # sürmeli. Anlık konum sıçraması/tek-kare gürültü reroute
+                           # etmesin → kararlılık (literatürdeki minimum-dwell/debounce).
+SAPMA_TEMIZ_METRE  = SAPMA_ESIK_METRE - 1.5  # =3.0m. FAZ2 histerezis (Schmitt-trigger):
+                           # debounce sayacı SAPMA_ESIK üstünde kurulur ama yalnızca
+                           # SAPMA_TEMIZ ALTINA inince sıfırlanır. Eşik etrafında salınan
+                           # (flapping) araçta sayaç sıfırlanıp reroute'un hiç tetiklenmemesini önler.
 GOREV_YAKINLIK_M   = 2.0   # bu mesafede görevi tamamlandı sayar (5.0'dan düşürüldü)
 WP_GECIS_MESAFE_M  = 1.8   # bu mesafede WP geçildi sayılır (3.2'den düşürüldü)
 YON_FILTRE_ACIISI  = math.pi - 0.3   # geri yön filtresi açısı (162 derece)
@@ -818,6 +825,9 @@ class HedefYoneticisi:
         self.son_hesaplama_zamani = time.time()
         self._son_varildi_zamani  = time.time()
         self._son_gorev_zamani    = time.time()
+        # FAZ2: sapmanın eşiği kesintisiz aştığı ilk an (debounce); eşik altına
+        # düşünce None'a sıfırlanır. reroute ancak bu süre >= SAPMA_DEBOUNCE_SURE olunca.
+        self._sapma_baslangic     = None
 
         # ── Thread güvenliği ─────────────────────────────────────────
         # FIX: varildi_callback & konum_callback çakışmasını önler
@@ -1044,10 +1054,24 @@ class HedefYoneticisi:
                 math.hypot(self.robot_x - wx, self.robot_y - wy)
                 for wx, wy in lookahead
             )
-            if (min_dist > SAPMA_ESIK_METRE
+            # ── FAZ2: debounce + histerezis (Schmitt-trigger) ───────────
+            # Sapma SAPMA_DEBOUNCE_SURE boyunca sürmeli. Eşik etrafında salınan
+            # (flapping) araçta sayaç sıfırlanmasın diye: sayaç SAPMA_ESIK üstünde
+            # KURULUR, ancak SAPMA_TEMIZ ALTINA inince SIFIRLANIR. Ara bantta
+            # (TEMIZ..ESIK) sayaca dokunulmaz → kenarda süren araç da tetikler.
+            if min_dist > SAPMA_ESIK_METRE:
+                if self._sapma_baslangic is None:
+                    self._sapma_baslangic = now
+            elif min_dist < SAPMA_TEMIZ_METRE:
+                self._sapma_baslangic = None
+            sapma_sureli = (self._sapma_baslangic is not None
+                            and (now - self._sapma_baslangic) >= SAPMA_DEBOUNCE_SURE)
+
+            if (sapma_sureli
                     and now - self.son_hesaplama_zamani > 5.0):
-                print(f"{SARI}>>> [DİKKAT] Rotadan {min_dist:.1f}m uzak! "
-                      f"Güncelleniyor...{SIFIRLA}")
+                sapma_suresi = now - self._sapma_baslangic
+                print(f"{SARI}>>> [DİKKAT] Rotadan {min_dist:.1f}m uzak "
+                      f"({sapma_suresi:.1f}s süregeldi)! Güncelleniyor...{SIFIRLA}")
                 if self.logger is not None:
                     self.logger.log_event("sapma", min_dist=round(min_dist, 2),
                                           esik=SAPMA_ESIK_METRE,
@@ -1057,6 +1081,7 @@ class HedefYoneticisi:
                                           wp_idx=self.current_wp_index,
                                           task_idx=self.current_task_index)
                 self.son_hesaplama_zamani = now
+                self._sapma_baslangic = None   # FAZ2: reroute sonrası debounce sıfırla
                 self.recalculate_path_from_robot(reason="sapma")
 
         # ── Konum izi (kısılmış; pose.csv) ──────────────────────────
