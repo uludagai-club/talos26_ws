@@ -94,7 +94,6 @@ class DLitePlanner:
         self.g:   dict[tuple, float] = {}
         self.rhs: dict[tuple, float] = {}
         self.U:   list = []
-        self.km:  float = 0.0
         self.s_start = None
         self.s_goal  = None
 
@@ -147,10 +146,14 @@ class DLitePlanner:
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
     def calculate_key(self, s: tuple) -> tuple:
+        # NOT: Klasik D* Lite'taki km (key modifier) burada YOK. km yalnızca start
+        # hareket ederken g/rhs'yi koruyup artımlı replan yapan sürümde gerekir.
+        # Bu planlayıcı her find_path'te sıfırdan arıyor (aşağıdaki açıklamaya bak),
+        # dolayısıyla km her zaman 0 olurdu → ölü terim, kaldırıldı (Faz4-lite).
         g_val  = self.g.get(s,   float('inf'))
         rhs_val = self.rhs.get(s, float('inf'))
         min_val = min(g_val, rhs_val)
-        return (min_val + self.dist(self.s_start, s) + self.km, min_val)
+        return (min_val + self.dist(self.s_start, s), min_val)
 
     # ── Çekirdek D* Lite ────────────────────────────────────────────
     def update_vertex(self, u: tuple) -> None:
@@ -209,9 +212,17 @@ class DLitePlanner:
                           f"start:{start} goal:{goal}")
             return None
 
+        # ── Soğuk (sıfırdan) arama — bilinçli tercih (Faz4-lite) ────────
+        # Klasik D* Lite g/rhs/U/km'yi replanlar arası korur ve km += h ile
+        # start'ı kaydırarak artımlı (ucuz) replan yapar. Burada her find_path
+        # sıfırdan arıyor. Gerekçe: (1) graf statik ve küçük (644 düğüm) — ölçüm:
+        # cold find_path medyan 0.88ms / p95 3.18ms (20Hz=50ms bütçe içinde önemsiz);
+        # (2) ileri-yön filtresi her replan'da start kenarlarını geçici silip geri
+        # ekliyor → artımlı durumu korumak her seferinde update_vertex yayılımı
+        # gerektirir, küçük kazancı yer ve risk getirir. Bu yüzden artımlı
+        # sürüme geçilmedi (Faz4 atlandı).
         self.s_start = start
         self.s_goal  = goal
-        self.km = 0.0
         self.U  = []
         self.g  = {}
         self.rhs = {}
