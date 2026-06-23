@@ -40,16 +40,23 @@ class KonumYoneticisi:
     def odom_callback(self, msg):
         self.current_x = msg.pose.pose.position.x
         self.current_y = msg.pose.pose.position.y
+        # FIX: /imu yönelim yayınlamadığı için yaw 0'da kalıyordu (/konum.theta=0).
+        # control.py gibi yaw'ı ground-truth Odometry orientation'ından türet.
+        q = msg.pose.pose.orientation
+        (_, _, self.current_yaw) = euler_from_quaternion([q.x, q.y, q.z, q.w])
         self.publish_pose()
         
         if self.is_mission_active:
             self.check_distance()
 
     def imu_callback(self, msg):
-        q = msg.orientation
-        orientation_list = [q.x, q.y, q.z, q.w]
-        (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
-        self.current_yaw = yaw
+        # NOT: yaw artık odom_callback'te ground-truth'tan alınıyor. /imu yönelim
+        # vermediği için buradan yaw yazmak (0/identity) gerçek yaw'ı ezerdi → devre dışı.
+        # q = msg.orientation
+        # orientation_list = [q.x, q.y, q.z, q.w]
+        # (roll, pitch, yaw) = euler_from_quaternion(orientation_list)
+        # self.current_yaw = yaw
+        pass
         
     def hedef_callback(self, msg):
         """ Hedef Yoneticisinden gelen WP1|WP2 verisi """
