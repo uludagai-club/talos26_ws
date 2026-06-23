@@ -159,7 +159,8 @@ class HedefLogger:
             sys.stderr.write(f"[hedef_logger] log_pose hata: {e}\n")
 
     def log_recalc(self, reason, rx, ry, yaw, front, start_node, goal_node,
-                   task_idx, task_name, path, path_changed=None):
+                   task_idx, task_name, path, path_changed=None,
+                   weighted_cost=None):
         """
         Rota yeniden hesaplama olayını kaydet — tanının kalbi.
         dist_robot_start: rotanın başladığı düğümün araca uzaklığı (büyükse
@@ -191,6 +192,10 @@ class HedefLogger:
                 path_changed=path_changed,
                 n_wp=n_wp,
                 path_len_m=self._r(path_len),
+                # Ceza-puan etkisi: cezalı maliyet ve ham uzunluğa oranı (>1 = ceza var)
+                weighted_cost=self._r(weighted_cost),
+                ceza_orani=(self._r(weighted_cost / path_len, 3)
+                            if (weighted_cost and path_len) else None),
             )
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[hedef_logger] log_recalc hata: {e}\n")

@@ -863,6 +863,27 @@ class HedefYoneticisi:
             except Exception as e:  # noqa: BLE001
                 sys.stderr.write(f"[hedef_yoneticisi] logger başlatılamadı: {e}\n")
 
+        # ── Config/ceza snapshot: bu run hangi parametre/ceza ile çalıştı ──
+        # (ceza-puan ilişkisini sonradan loglardan analiz edebilmek için)
+        if self.logger is not None:
+            self.logger.log_event(
+                "config",
+                ILERI_MESAFE_M=ILERI_MESAFE_M,
+                SAPMA_ESIK_METRE=SAPMA_ESIK_METRE,
+                SAPMA_TEMIZ_METRE=SAPMA_TEMIZ_METRE,
+                SAPMA_DEBOUNCE_SURE=SAPMA_DEBOUNCE_SURE,
+                GOREV_YAKINLIK_M=GOREV_YAKINLIK_M,
+                MATCH_PENCERE=MATCH_PENCERE,
+                MATCH_KORIDOR_M=MATCH_KORIDOR_M,
+                CEZA_ETKI=CEZA_ETKI,
+                ceza_duz_serit=CEZA_DUZ_SERIT,
+                ceza_baglanti=CEZA_BAGLANTI,
+                ceza_serit_degistirme=CEZA_SERIT_DEGISTIRME,
+                ceza_ters_yon=CEZA_TERS_YON,
+                carpan_baglanti=round(ceza_carpani(CEZA_BAGLANTI), 3),
+                carpan_serit_deg=round(ceza_carpani(CEZA_SERIT_DEGISTIRME), 3),
+            )
+
         # ── Planner ─────────────────────────────────────────────────
         self.planner = DLitePlanner()
         self._load_graph_from_import()
@@ -1060,6 +1081,14 @@ class HedefYoneticisi:
 
                 if self.current_task_index >= len(self.geo_targets_world):
                     print(f"{YESIL}>>> TÜM GÖREVLER TAMAMLANDI!{SIFIRLA}")
+                    # NOT: bu sadece LOG; dur/hold sinyali ayrı iş (control tarafı, bekleyen #1)
+                    if self.logger is not None:
+                        self.logger.log_event(
+                            "tum_gorev_tamam",
+                            son_durak=GOREV_GEOJSON['features'][-1]['properties']['name'],
+                            robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
+                            yaw_deg=(round(math.degrees(self.robot_yaw), 2)
+                                     if self.robot_yaw is not None else None))
                     self.is_path_calculated = False
                     self.full_path_world    = []
                     self.new_data_available = True
@@ -1252,11 +1281,21 @@ class HedefYoneticisi:
             # log buradan önce full_path_world hâlâ ESKİ rota → kıyas geçerli.
             # path_changed=False → rota değişmedi (boşa recalc / oscillation işareti)
             path_changed = (path != self.full_path_world) if path else None
+            # Rotanın CEZALI (ağırlıklı) toplam maliyeti — ceza-puan etkisini gösterir.
+            # log_recalc bunu ham path_len_m ile kıyaslayıp ceza_orani üretir (>1 = ceza uygulandı).
+            weighted = None
+            if path and len(path) > 1:
+                try:
+                    weighted = sum(self.planner.get_cost(path[i], path[i + 1])
+                                   for i in range(len(path) - 1))
+                except Exception:  # noqa: BLE001
+                    weighted = None
             self.logger.log_recalc(
                 reason=reason, rx=rx, ry=ry, yaw=self.robot_yaw,
                 front=(front_x, front_y), start_node=start_node,
                 goal_node=goal_node, task_idx=self.current_task_index,
                 task_name=task_name, path=path, path_changed=path_changed,
+                weighted_cost=weighted,
             )
 
         if path:
