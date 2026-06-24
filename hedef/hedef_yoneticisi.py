@@ -1367,18 +1367,16 @@ class HedefYoneticisi:
 
         now = time.time()
 
-        # ── Karar bloğu TTL düşüşü → tek-sefer reroute (fail-safe) ───
-        # kenar_serbest gelmeden blok TTL'i dolarsa, eski bloklu rotada kalmayalım:
-        # aktif blok sayısı düştüyse bir kez yeniden hesapla (cooldown'lı).
+        # ── Karar bloğu TTL düşüşü ───────────────────────────────────
+        # NOT: Eskiden blok TTL'i/aktif blok sayısı düşünce bir kez reroute
+        # ediliyordu (fail-safe). KALDIRILDI (canlı off-road bug,
+        # logs/20260624T193310Z): araç sol şeride GEÇERKEN blok düşünce recalc
+        # aracı B düğümüne snap'leyip (blok yok → enjeksiyon yok → B tek-yönlü)
+        # U-dönüşü/yukarı saçma rota çizip YOLDAN ÇIKARIYORDU. Blok kalkınca
+        # yeniden rota çizmiyoruz; araç committed overtake path'ini (B→A→hedef
+        # döner) sürer. (Sadece sayacı izlemeye devam — başka tüketici yok.)
         if HEDEF_KOMUT_AKTIF:
-            aktif_blok = len(self._aktif_bloklar())
-            if (aktif_blok < self._son_aktif_blok
-                    and self.is_path_calculated
-                    and now - self.son_hesaplama_zamani > 2.0):
-                self.son_hesaplama_zamani = now
-                rospy.loginfo("[hedef_komut] blok TTL düştü → reroute (fail-safe)")
-                self.recalculate_path_from_robot(reason="blok_ttl")
-            self._son_aktif_blok = aktif_blok
+            self._son_aktif_blok = len(self._aktif_bloklar())
 
         # ── Otomatik WP geçişi: hafif map-matching ──────────────────
         # FAZ3: tek-tek +1 yerine, aracın rotadaki yerini İLERİ pencerede
@@ -1564,6 +1562,14 @@ class HedefYoneticisi:
 
             now = time.time()
             kume_degisti = False
+            # reroute YALNIZ blok EKLENİNCE (yeni engel) veya replan'da yapılır.
+            # Blok KALDIRMA (kenar_serbest) reroute TETİKLEMEZ — KRİTİK (canlı bug,
+            # logs/20260624T193310Z): araç sol şeride GEÇERKEN karar kenar_serbest
+            # yollayınca recalc, aracı (blok artık yok → enjeksiyon yok) B düğümüne
+            # snap'liyordu; B tek-yönlü olduğundan planlayıcı U-dönüşü/yukarı saçma
+            # rota çizip aracı YOLDAN ÇIKARIYORDU. Çözüm: blok kalkınca yeniden rota
+            # çizme; araç zaten committed overtake path'ini (B→A→hedef döner) sürsün.
+            reroute_iste = False
 
             if komut in ('sollama', 'kenar_blok'):
                 ox, oy = _f(2), _f(3)
@@ -1580,6 +1586,7 @@ class HedefYoneticisi:
                         self._bloklu_engeller.append(
                             {'x': ox, 'y': oy, 'r': r, 'taraf': taraf, 't': now})
                         kume_degisti = True
+                        reroute_iste = True        # YENİ engel → karşı şeride sap
             elif komut == 'kenar_serbest':
                 ox, oy = _f(2), _f(3)
                 with self._komut_lock:
@@ -1591,8 +1598,10 @@ class HedefYoneticisi:
                     elif self._bloklu_engeller:        # eşleşme yoksa hepsini temizle (güvenli)
                         self._bloklu_engeller.clear()
                         kume_degisti = True
+                # NOT: reroute_iste = False kalır → committed path'i koru (off-road fix)
             elif komut == 'replan':
                 kume_degisti = True
+                reroute_iste = True
             else:
                 rospy.logwarn_throttle(5.0, f"[hedef_komut] bilinmeyen komut: {komut}")
                 return
@@ -1602,11 +1611,12 @@ class HedefYoneticisi:
                     n_blok = len(self._bloklu_engeller)
                 self.logger.log_event("hedef_komut", komut=komut, taraf=taraf,
                                       x=_f(2), y=_f(3), yaricap=_f(5),
-                                      n_blok=n_blok, kume_degisti=kume_degisti)
+                                      n_blok=n_blok, kume_degisti=kume_degisti,
+                                      reroute=reroute_iste)
 
-            # Rota yalnız blok kümesi değiştiyse yeniden çizilir (tazeleme spam'i değil)
-            if kume_degisti and self.is_path_calculated:
-                rospy.loginfo(f"[hedef_komut] {komut} → reroute (blok kümesi değişti)")
+            # Rota yalnız YENİ blok/replan'da çizilir (blok kaldırma reroute etmez)
+            if reroute_iste and self.is_path_calculated:
+                rospy.loginfo(f"[hedef_komut] {komut} → reroute (yeni blok/replan)")
                 self.recalculate_path_from_robot(reason=f"komut_{komut}")
         except Exception as e:  # noqa: BLE001 — callback node'u çökertmesin
             rospy.logwarn_throttle(5.0, f"[hedef_komut] işlenemedi: {e!r} (msg={msg.data!r})")
