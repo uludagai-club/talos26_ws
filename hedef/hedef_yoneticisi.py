@@ -140,6 +140,16 @@ CEZA_TERS_CIKIS         = 90    # ters şerite ÇIKMA (crossing) cezası (4.6x) 
 CEZA_TERS_KALMA         = 0     # ters şeritte KALMA (karşı-şerit ileri seyir) cezası (1.0x) — UCUZ: solda kal
 BLOK_EK_CEZA            = 50.0  # bloklu kenara TOPLAMSAL ceza (m) — detour'u baskın yap; sonlu (fail-safe)
 SLALOM_ENJEKSIYON_R     = 8.0   # crossing/segment endpoint'i engele bu kadar yakınsa enjekte (m)
+# Giriş crossing'i engeli SIYIRMASIN ("bir waypoint önce dön", kullanıcı 2026-06-24):
+# tek-dip girişi (A→B diyagonali) engele AT başlıyordu → engeli ~0.06m sıyırıp
+# (path engel DÜĞÜMÜnden geçince) karar `engel_blokaj` verip durduruyordu. Çözüm:
+# (a) cone'a r+KENAR_GUVENLI_M'den yakın geçen crossing'e toplamsal SIYIRMA cezası
+# (yakınlıkla orantılı), (b) o crossing'in BİR ÖNCEKİ düğümden (predecessor)
+# başlayan versiyonunu da enjekte et → planlayıcı engeli daha geniş geçen, bir
+# waypoint ÖNCE dönen girişi seçer (engel düğümünü atlar). Mid-cone'da giriş zaten
+# açık → ceza 0, değişmez. Köşe-cone (şeridin ilk düğümü) açıklık 0.06→1.0m.
+KENAR_GUVENLI_M         = 1.2   # crossing engele bundan + r kadar yaklaşırsa "sıyırıyor" sayılır (m)
+CEZA_SIYIRMA_M          = 80.0  # sıyıran crossing'e metre-başına toplamsal ceza (geniş geçeni tercih ettir)
 
 
 def ceza_carpani(ceza_puani: float) -> float:
@@ -1137,6 +1147,8 @@ class HedefYoneticisi:
                 ceza_ters_kalma=CEZA_TERS_KALMA,
                 blok_ek_ceza=BLOK_EK_CEZA,
                 slalom_enjeksiyon_r=SLALOM_ENJEKSIYON_R,
+                kenar_guvenli_m=KENAR_GUVENLI_M,
+                ceza_siyirma_m=CEZA_SIYIRMA_M,
             )
 
         # ── Planner ─────────────────────────────────────────────────
@@ -1662,15 +1674,52 @@ class HedefYoneticisi:
                     return True
             return False
 
-        # 1) Crossing'ler (ÇIKMA — pahalı)
+        # 1) Crossing'ler (ÇIKMA — pahalı) + SIYIRMA cezası + predecessor (bir
+        #    waypoint önce dön) enjeksiyonu. Cone'a yakın geçen giriş crossing'i
+        #    cezalanır; bir önceki düğümden başlayan (engeli daha geniş geçen)
+        #    versiyon da eklenir → planlayıcı erken-dönen, engel düğümünü atlayan
+        #    girişi seçer (path engel düğümünden geçmez → karar engel_blokaj vermez).
         carp_c = ceza_carpani(CEZA_TERS_CIKIS)
+
+        def _min_acik(a, b):
+            """crossing [a,b] segmentinin en yakın aktif bloğa (cone) açıklığı (m)."""
+            return min(_nokta_segment_mesafe(ox, oy, a[0], a[1], b[0], b[1])
+                       for (ox, oy, _r) in engeller)
+
+        def _siyirma_cezasi(a, b):
+            """Cone'a r+KENAR_GUVENLI_M'den yakın geçen crossing'e yakınlıkla
+            orantılı toplamsal ceza (geniş geçen tercih edilsin)."""
+            ek = 0.0
+            for (ox, oy, r) in engeller:
+                acik = _nokta_segment_mesafe(ox, oy, a[0], a[1], b[0], b[1])
+                ek = max(ek, CEZA_SIYIRMA_M * max(0.0, (r + KENAR_GUVENLI_M) - acik))
+            return ek
+
+        def _enjekte_crossing(a, b):
+            if (a, b) in self.planner.edge_weights:   # zaten varsa dokunma
+                return
+            d_ab = math.hypot(b[0] - a[0], b[1] - a[1])
+            self.planner.add_edge(a, b, d_ab * carp_c + _siyirma_cezasi(a, b))
+            eklenen.append((a, b))
+
+        # BASE predecessor snapshot (enjeksiyon pred_list'i kirletmeden ÖNCE) →
+        # "bir waypoint önce" için yalnız taban-graf (lane/connection) öncülleri.
+        pred_snap = {k: list(v) for k, v in self.planner.pred_list.items()}
+        esik_acik = min(r + KENAR_GUVENLI_M for (_x, _y, r) in engeller)
         for (p1, p2, d) in self._slalom_conns:
             if not _engele_yakin(p1, p2):
                 continue
-            if (p1, p2) in self.planner.edge_weights:   # zaten varsa (taban/durak) dokunma
-                continue
-            self.planner.add_edge(p1, p2, d * carp_c)
-            eklenen.append((p1, p2))
+            _enjekte_crossing(p1, p2)
+            # Sıyırıyorsa: bir önceki düğümden başlayan (daha geniş geçen) crossing'i
+            # de ekle → "bir waypoint önce dön". p1'in BASE öncüllerinden cone'u
+            # DAHA GENİŞ geçenleri enjekte et (planlayıcı en geniş geçeni seçer).
+            acik_p1p2 = _min_acik(p1, p2)
+            if acik_p1p2 < esik_acik:
+                for pu in pred_snap.get(p1, []):
+                    if pu == p2 or pu == p1:
+                        continue
+                    if _min_acik(pu, p2) > acik_p1p2:   # yalnız daha geniş geçeni
+                        _enjekte_crossing(pu, p2)
 
         # 2) Karşı-şerit boylamasına segmentler (KALMA — ucuz); EKSİK yönü ekle →
         #    şerit yerel olarak çift-yönlü olur, araç karşı şeritte ileri seyreder.
