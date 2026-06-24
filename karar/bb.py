@@ -89,6 +89,16 @@ class StatePersist:
     last_lane_change_s: float = 0.0
     lane_change_dir: str = ""          # "sol" | "sag" | "" — devam eden manevranın yönü
 
+    # Yol-bilinçli kaçış (KacisYonuSec yazar; KacisKarar + logger okur)
+    kacis_yon: str = ""               # "sol" | "sag" | "" — bu tick seçilen kaçış yönü
+    kacis_kaynak: str = ""            # "rota" (çapraz-çarpım) | "yan_sektor" (en açık) | ""
+    kacis_lateral_m: float = 0.0      # engelin rotaya işaretli yanal uzaklığı (sol+)
+    kacis_engel_dunya: tuple = (0.0, 0.0)  # son hesaplanan engel dünya konumu (debug)
+
+    # Sollama (OvertakeManager aynası — yalnız snapshot/log için)
+    overtake_active: bool = False
+    overtake_return_dist_m: float = 0.0
+
     # Debounce sayaçları (key -> ardışık true tick sayısı)
     debounce: dict = field(default_factory=dict)
 

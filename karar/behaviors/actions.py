@@ -217,6 +217,35 @@ class LaneChangeStamp(py_trees.behaviour.Behaviour):
         return Status.SUCCESS
 
 
+class KacisKarar(py_trees.behaviour.Behaviour):
+    """Yol-bilinçli kaçış kararı: bb.state.kacis_yon yönünde "sol"/"sag" üretir
+    ve cooldown/yön kilidini damgalar (LaneChangeStamp işini de yapar).
+
+    Statik [avoid_left, avoid_right] (sol-öncelikli) sırasının yerine geçer:
+    yön artık KacisYonuSec tarafından waypoint'lere göre seçilmiştir. Reason'a
+    seçim kaynağı (rota/yan_sektor) gömülür → karar logundan izlenebilir.
+    """
+
+    def __init__(self, bb: Blackboard):
+        super().__init__("KacisKarar")
+        self.bb = bb
+
+    def update(self):
+        d = self.bb.state.kacis_yon
+        if d not in ("sol", "sag"):
+            return Status.FAILURE
+        self.bb.state.last_lane_change_s = time.time()
+        self.bb.state.lane_change_dir = d
+        kaynak = self.bb.state.kacis_kaynak or "?"
+        self.bb.last_decision = {
+            "karar": d,
+            "reason": f"engel_kacis_{d}({kaynak})",
+            "phase": "driving",
+            "wait_remaining_s": 0.0,
+        }
+        return Status.SUCCESS
+
+
 class HoldLaneChange(py_trees.behaviour.Behaviour):
     """Devam eden şerit değişiminin yön komutunu yeniden yayınlar.
 

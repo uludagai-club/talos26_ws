@@ -82,6 +82,13 @@ class RosBridge:
         self._snapshot_period_s = 0.5
         self._snapshot_last = 0.0
 
+        # karar → hedef komut kanalı (gelistirme_plani §3.2). Olay-komutu olduğu
+        # için latch=False + queue_size=1: restart'ta eski "sollama" tekrar
+        # ateşlenmesin. String-prototip ("komut;taraf;x;y;etiket;yaricap"); sözleşme
+        # oturunca cart_sim/HedefKomut.msg'e terfi edilebilir.
+        self.pub_hedef_komut = rospy.Publisher("/hedef_komut", String, queue_size=1)
+        self._last_hedef_komut = ""
+
     # ============================================================
     # Subscriber callback'leri — yalnız blackboard'a yazar
     # ============================================================
@@ -270,6 +277,20 @@ class RosBridge:
             m.phase = phase
             m.wait_remaining_s = wait_remaining
             self.pub_decision.publish(m)
+
+    def publish_hedef_komut(self, cmd: str):
+        """OvertakeManager'ın ürettiği komutu /hedef_komut'a yayınla.
+
+        Boş/None komut yok sayılır. Aynı komut art arda gelirse de yayınlanır
+        (queue=1, latch=False → hedef tarafı son komutu görür; sollama tazeleme
+        kasıtlı tekrar). hedef abone tarafı Samed'in işi (bkz plan §3.2)."""
+        if not cmd:
+            return
+        try:
+            self.pub_hedef_komut.publish(cmd)
+            self._last_hedef_komut = cmd
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[karar_bt] /hedef_komut yayını başarısız: {e}")
 
     def publish_snapshot(self, tree_ascii: str = ""):
         if (time.time() - self._snapshot_last) < self._snapshot_period_s:

@@ -458,6 +458,123 @@ def run_scenarios():
     else:
         print(f"  ✓ S27: {got}  (reason: {bb2.last_decision.get('reason')})")
 
+    # -----------------------------------------------------------------
+    # S28: YOL-BİLİNÇLİ — engel rotanın SAĞINDA → SOLA kaç (rota kaynaklı)
+    #      Robot (0,0) yaw=0, rota +x (hedef 5,0 → next 10,0). Engel gövde
+    #      çerçevesinde sağda (açı +18.4°, ~3.16m) → dünya (3,-1) = rota sağı.
+    # -----------------------------------------------------------------
+    print("\nS28: Engel rotanın sağında → SOL (yol-bilinçli)")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.x = 0.0; bb.obs.y = 0.0; bb.obs.yaw = 0.0
+    bb.obs.hedef_x = 5.0; bb.obs.hedef_y = 0.0
+    bb.obs.next_hedef_x = 10.0; bb.obs.next_hedef_y = 0.0
+    bb.obs.hedef_last_seen = time.time()
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 3.16
+    bb.obs.engel_d_overall = 3.16
+    bb.obs.engel_angle_deg = 18.4         # sağ-pozitif → engel sağda
+    bb.obs.engel_d_left = float("inf")    # sol şerit boş
+    bb.obs.engel_d_right = float("inf")
+    for _ in range(n_engel):
+        fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
+    assert_karar("S28", "sol")
+    if "rota" not in bb.last_decision.get("reason", ""):
+        failures.append(f"[S28] kaynak 'rota' bekleniyordu: {bb.last_decision.get('reason')}")
+        print(f"  ✗ S28 kaynak: {bb.last_decision.get('reason')}")
+
+    # -----------------------------------------------------------------
+    # S29: YOL-BİLİNÇLİ — engel rotanın SOLUNDA → SAĞA kaç
+    # -----------------------------------------------------------------
+    print("\nS29: Engel rotanın solunda → SAG (yol-bilinçli)")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.x = 0.0; bb.obs.y = 0.0; bb.obs.yaw = 0.0
+    bb.obs.hedef_x = 5.0; bb.obs.hedef_y = 0.0
+    bb.obs.next_hedef_x = 10.0; bb.obs.next_hedef_y = 0.0
+    bb.obs.hedef_last_seen = time.time()
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 3.16
+    bb.obs.engel_d_overall = 3.16
+    bb.obs.engel_angle_deg = -18.4        # sol → engel solda
+    bb.obs.engel_d_left = float("inf")
+    bb.obs.engel_d_right = float("inf")
+    for _ in range(n_engel):
+        fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
+    assert_karar("S29", "sag")
+
+    # -----------------------------------------------------------------
+    # S30: Yol sol diyor ama SOL ŞERİT KAPALI → kaçış yok → dur (2.0m içinde)
+    # -----------------------------------------------------------------
+    print("\nS30: Yol-bilinçli sol ama sol kapalı → dur")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.x = 0.0; bb.obs.y = 0.0; bb.obs.yaw = 0.0
+    bb.obs.hedef_x = 5.0; bb.obs.hedef_y = 0.0
+    bb.obs.next_hedef_x = 10.0; bb.obs.next_hedef_y = 0.0
+    bb.obs.hedef_last_seen = time.time()
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 1.8            # dur bandında (< 2.0)
+    bb.obs.engel_d_overall = 1.8
+    bb.obs.engel_angle_deg = 18.4         # sağda → yol "sol" der
+    bb.obs.engel_d_left = 0.5             # ama sol kapalı
+    bb.obs.engel_d_right = 0.5
+    for _ in range(n_engel):
+        fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
+    assert_karar("S30", "dur")
+
+    # -----------------------------------------------------------------
+    # S31: KATMANLI — engel yavasla bandında (5m, block 3.5'in dışında) → yavasla
+    # -----------------------------------------------------------------
+    print("\nS31: Engel 5m (yavasla bandı, kaçışa daha var) → slow")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 5.0
+    bb.obs.engel_d_overall = 5.0
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S31", "slow")
+
+    # -----------------------------------------------------------------
+    # S32: Engel yavasla bandının DIŞINDA (7m > 6m) → normal (over-trigger yok)
+    # -----------------------------------------------------------------
+    print("\nS32: Engel 7m (banttan uzak) → normal")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 7.0
+    bb.obs.engel_d_overall = 7.0
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S32", "normal")
+
+    # -----------------------------------------------------------------
+    # S33: MERKEZİ koni (rota üzerinde, deadband içinde) + rota taze → geçiş
+    #      şeridine (varsayilan=sol). CANLI BUG regresyonu (2026-06-24): engel
+    #      lateral ~0.2m iken eski kod yan_sektor gürültüsünden "sag" seçip
+    #      aracı koniye sokuyordu. Artık varsayilan_kacis_yon=sol gelmeli.
+    # -----------------------------------------------------------------
+    print("\nS33: Merkezi koni + rota taze → SOL (varsayilan, yan_sektor değil)")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.x = 0.0; bb.obs.y = 0.0; bb.obs.yaw = 0.0
+    bb.obs.hedef_x = 5.0; bb.obs.hedef_y = 0.0
+    bb.obs.next_hedef_x = 10.0; bb.obs.next_hedef_y = 0.0
+    bb.obs.hedef_last_seen = time.time()
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 3.0
+    bb.obs.engel_d_overall = 3.0
+    bb.obs.engel_angle_deg = 4.0          # ~merkez (lateral ~0.2m, deadband içinde)
+    bb.obs.engel_d_left = 4.0             # iki yan da clear (>3m) → seçilen taraf commit eder
+    bb.obs.engel_d_right = 5.0            # TUZAK: sağ daha açık → eski yan_sektor kodu "sag" derdi
+    for _ in range(n_engel):
+        fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
+    assert_karar("S33", "sol")
+    if "rota_merkez" not in bb.last_decision.get("reason", ""):
+        failures.append(f"[S33] kaynak 'rota_merkez' bekleniyordu: {bb.last_decision.get('reason')}")
+        print(f"  ✗ S33 kaynak: {bb.last_decision.get('reason')}")
+
     print("\n" + "=" * 50)
     if failures:
         print(f"FAIL: {len(failures)} senaryo başarısız")

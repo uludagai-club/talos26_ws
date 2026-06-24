@@ -18,12 +18,53 @@ distances:
   yaya_acil_durus_m: 2.0   # eski MESAFE_ACIL_DURUS
   yaya_dur_m:        4.0
   yaya_yavas_m:     12.0
-  engel_acil_m:      1.2   # bumper koruması — araç boyuna göre
-  engel_block_m:     2.0   # blokaj ama acil değil → kaçınma/dur dene
+  engel_acil_m:      1.2   # (ARTIK wp_planlama'dan türetiliyor — geri uyum için duruyor)
+  engel_block_m:     2.0   # (ARTIK wp_planlama'dan türetiliyor — geri uyum için duruyor)
   engel_yan_clear_m: 3.0   # yan sektörde bu kadar boşluk varsa lane change makul
   levha_dur_m:       3.5
   levha_oku_m:      10.0
   yon_levha_max_m:   5.0
+
+# ---------------------------------------------------------------------------
+# WP-tabanlı planlama — control.py WP_NEAR_DISTANCE ± delta (kullanıcı isteği)
+# ---------------------------------------------------------------------------
+# control.py "varildi/okey" verip bir sonraki WP'ye geçtiği mesafe = WP_NEAR_DISTANCE.
+# Karar tüm engel tepki bantlarını bu TEK referansın üzerine ± delta ile türetir;
+# böylece karar ile control aynı "aktif waypoint" eşiğini paylaşır.
+#   acil    = wp_near + (-0.3) = 1.2 m   (acil durus)
+#   dur     = wp_near + ( 0.5) = 2.0 m   (kaçış yoksa tam dur)
+#   block   = wp_near + ( 2.0) = 3.5 m   (kaçışa commit menzili)
+#   yavasla = wp_near + ( 4.5) = 6.0 m   (en dış: tepki başlar → yavaşla)
+# DİKKAT: control_wp_near_m, control.py WP_NEAR_DISTANCE ile EŞİT TUTULMALI.
+wp_planlama:
+  control_wp_near_m:     1.5    # = control.py WP_NEAR_DISTANCE (senkron tut!)
+  engel_acil_delta_m:   -0.3
+  engel_dur_delta_m:     0.5
+  engel_block_delta_m:   2.0
+  engel_yavasla_delta_m: 4.5
+  aktif_wp_histerezis_m: 0.5    # robot wp1'e (wp_near + bu) kadar yaklaştıysa wp1→wp2 segmentine geç
+  kacis_deadband_m:      0.7    # engel rotaya bu kadar yakınsa "merkez" (blok eden koni) → geçiş şeridine (varsayilan_kacis_yon). Canlı koni ~0.23m ölçüldü, marj bırakıldı.
+  varsayilan_kacis_yon:  sol    # belirsizlikte tercih (ters/karşı şerit genelde sol)
+
+# ---------------------------------------------------------------------------
+# Sollama (ters şeride geç) + Ackermann güvenli geri-dönüş — /hedef_komut
+# ---------------------------------------------------------------------------
+# karar engel kaçışına çıkınca engel dünya konumunu sabitler, hedef'e "sollama"
+# komutu yollar, engeli Ackermann-güvenli mesafe kadar geçince "kenar_serbest"
+# (şeride dön) der. Bu blok overtake.py (OvertakeManager) tarafından okunur.
+overtake:
+  enabled:          true
+  lane_offset_m:    1.8    # karşı şeride yanal kayma (geri-dönüş yayı da bu kadar)
+  return_steer_deg: 20.0   # geri-dönüş yayının direksiyonu → Ackermann yarıçapı
+  clearance_m:      2.0    # araç ön çıkıntısı + engel yarıçapı + emniyet payı
+  block_radius_m:   1.0    # hedef'e bildirilen engel blok yarıçapı (m)
+  max_s:            15.0   # zaman aşımı → fallback geri-dönüş
+  refresh_s:        1.0    # aktif "sollama" komutunu bu periyotla tazele
+
+# Ackermann araç geometrisi (control.py ile EŞİT TUTULMALI)
+ackermann:
+  wheelbase_m:   1.78      # = control.py WHEELBASE
+  max_steer_deg: 30.0      # = control.py MAX_STEER_ANGLE
 
 # Hıza-duyarlı tepki mesafesi.
 # efektif_esik = taban_esik + gain_s * hiz_mps  (max_extra_m ile sınırlı)

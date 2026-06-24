@@ -24,12 +24,13 @@ from behaviors.conditions import (
     YayaFresh, LevhaFresh, EngelFresh,
     YayaVarMi, YayaCokYakin, YayaYakin, YayaOrtaMesafe,
     EngelCokYakin, EngelMerkezBlokaj, YanSektorBos,
+    KacisYonuSec, YanSektorBosSecilen,
     LevhaIs, LevhaIcindeMesafe,
     LaneChangeCooldownOk, LaneChangeInProgress,
 )
 from behaviors.actions import (
     SetKarar, LatchEmergency, ReleaseEmergencyIfClear,
-    DurLevhasiFSM, LaneChangeStamp, HoldLaneChange,
+    DurLevhasiFSM, LaneChangeStamp, KacisKarar, HoldLaneChange,
 )
 from behaviors.decorators import Debounce
 
@@ -51,6 +52,24 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     def _gain(key: str) -> float:
         return sa.get(key, 0.0) if sa_on else 0.0
 
+    # --- Engel tepki mesafeleri: control.py WP_NEAR_DISTANCE ± delta -------- #
+    # Kullanıcı isteği: "control'ün waypoint'e okey verdiği mesafeyi çekip onun
+    # üzerine +/- ile hesapla." Tüm engel bantları tek referanstan (wp_near)
+    # türetilir; böylece karar, control'ün WP geçiş eşiğiyle aynı dili konuşur.
+    #   acil   = wp_near - 0.3 = 1.2   (acil durus; emniyetli son çare)
+    #   dur    = wp_near + 0.5 = 2.0   (kaçış yoksa tam dur)
+    #   block  = wp_near + 2.0 = 3.5   (kaçışa commit menzili)
+    #   yavasla= wp_near + 4.5 = 6.0   (en dış: tepki başlar → yavaşla)
+    wp = p.get("wp_planlama", {}) or {}
+    wp_near = float(wp.get("control_wp_near_m", 1.5))
+    wp_hyst = float(wp.get("aktif_wp_histerezis_m", 0.5))
+    kacis_deadband = float(wp.get("kacis_deadband_m", 0.4))
+    varsayilan_yon = str(wp.get("varsayilan_kacis_yon", "sol"))
+    engel_acil_m = max(0.3, wp_near + float(wp.get("engel_acil_delta_m", -0.3)))
+    engel_dur_m = wp_near + float(wp.get("engel_dur_delta_m", 0.5))
+    engel_block_m = wp_near + float(wp.get("engel_block_delta_m", 2.0))
+    engel_yavasla_m = wp_near + float(wp.get("engel_yavasla_delta_m", 4.5))
+
     # ============================================================
     # 0. Safety: önce latch'i çözmeyi dene; çözüldüyse FAILURE
     #    döner ve aşağıdaki dallar konuşur. Hâlâ kapalıysa SUCCESS
@@ -60,7 +79,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         bb,
         release_clear_ticks=emer["release_clear_ticks"],
         yaya_esik=dist["yaya_acil_durus_m"] * 1.5,   # mührün çözülmesi için biraz daha geniş
-        engel_esik=dist["engel_acil_m"] * 1.5,
+        engel_esik=engel_acil_m * 1.5,
     )
 
     # ============================================================
@@ -73,7 +92,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
                 EngelFresh(bb, fresh["engel_max_age_s"]),
                 Debounce(
                     "EngelCokYakinDeb",
-                    EngelCokYakin(bb, dist["engel_acil_m"]),
+                    EngelCokYakin(bb, engel_acil_m),
                     bb, key="engel_emergency",
                     min_consecutive=deb["engel_min_consecutive"],
                 ),
@@ -154,32 +173,43 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     ])
 
     # ============================================================
-    # 5. Engelden kaçınma
+    # 5. Engelden kaçınma — KATMANLI MESAFE (kullanıcı isteği)
+    #    Dış kapı: engel yavasla bandında (en geniş) → en az "yavasla".
+    #    İçeride öncelik:
+    #      a) block menzilinde + yola göre seçilen taraf BOŞ → sol/sag (kaçış)
+    #      b) dur menzilinde + kaçış yok → dur (son çare)
+    #      c) aksi halde (orta menzil, henüz net taraf yok) → yavasla
+    #    "Ne dur ne sol/sag diyemiyorsan yavaşla" → dur artık yalnız yakın+çaresiz.
     # ============================================================
-    avoid_left = Sequence("AvoidLeft", memory=False, children=[
-        YanSektorBos(bb, "sol", dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
+    road_aware_avoid = Sequence("RoadAwareAvoid", memory=False, children=[
+        EngelMerkezBlokaj(bb, engel_block_m),                 # commit menzilinde mi?
+        KacisYonuSec(bb, deadband_m=kacis_deadband, wp_near_m=wp_near,
+                     wp_hyst_m=wp_hyst, hedef_max_age_s=fresh["hedef_max_age_s"],
+                     varsayilan_yon=varsayilan_yon),          # yönü yola göre seç (hep SUCCESS)
+        YanSektorBosSecilen(bb, dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
         LaneChangeCooldownOk(bb, lc["cooldown_s"]),
-        LaneChangeStamp(bb, "sol"),
-        SetKarar("Karar=SOL(engel)", bb, karar="sol", reason="engel_sol_kacis"),
+        KacisKarar(bb),                                       # sol/sag + cooldown/yön damgala
     ])
-    avoid_right = Sequence("AvoidRight", memory=False, children=[
-        YanSektorBos(bb, "sag", dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
-        LaneChangeCooldownOk(bb, lc["cooldown_s"]),
-        LaneChangeStamp(bb, "sag"),
-        SetKarar("Karar=SAG(engel)", bb, karar="sag", reason="engel_sag_kacis"),
+    engel_dur = Sequence("EngelDur", memory=False, children=[
+        EngelMerkezBlokaj(bb, engel_dur_m),                  # dur menzilinde + kaçış yok
+        SetKarar("Karar=DUR(engel)", bb, karar="dur", reason="engel_blokaj"),
     ])
+    engel_yavasla = SetKarar("Karar=SLOW(engel)", bb, karar="slow",
+                             reason="engel_yavasla", phase="approach")
+
     obstacle_avoidance = Sequence("ObstacleAvoidance", memory=False, children=[
         EngelFresh(bb, fresh["engel_max_age_s"]),
-        Debounce("EngelMerkezDeb",
-                 EngelMerkezBlokaj(bb, dist["engel_block_m"],
+        Debounce("EngelTepkiDeb",
+                 EngelMerkezBlokaj(bb, engel_yavasla_m,        # en dış: yavasla bandı
                                    gain_s=_gain("engel_block_gain_s"),
                                    max_extra_m=sa_max_extra, odom_max_age_s=odom_age),
                  bb, key="engel_blokaj",
                  min_consecutive=deb["engel_min_consecutive"]),
-        Selector("AvoidOrStop", memory=False, children=(
-            [avoid_left, avoid_right] if lc["enabled"] else []
+        Selector("EngelTepki", memory=False, children=(
+            [road_aware_avoid] if lc["enabled"] else []
         ) + [
-            SetKarar("Karar=DUR(engel)", bb, karar="dur", reason="engel_blokaj"),
+            engel_dur,
+            engel_yavasla,
         ]),
     ])
 
