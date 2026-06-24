@@ -184,8 +184,13 @@ class KararLogger:
         self.log_event("engel_kacis", taraf=taraf, kaynak=kaynak, **extra)
 
     def log_overtake(self, faz, **extra):
-        """Sollama yaşam döngüsü: faz='basla'|'donus'|'iptal'|'zaman_asimi'."""
+        """(DEPRECATED) Sollama yaşam döngüsü — eski overtake.py içindi."""
         self.log_event(f"sollama_{faz}", **extra)
+
+    def log_reroute(self, faz, **extra):
+        """Cone reroute yaşam döngüsü (§16): faz='blok'|'serbest'|'zaman_asimi'.
+        extra: cone_dunya, yaricap_m, neden, vb."""
+        self.log_event(f"reroute_{faz}", **extra)
 
     # ------------------------------------------------------------------ #
     @staticmethod

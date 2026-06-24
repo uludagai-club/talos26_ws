@@ -81,6 +81,20 @@ def run_scenarios():
         else:
             print(f"  ✓ {name}: {got}  (reason: {bb.last_decision.get('reason')})")
 
+    def assert_reroute(name, cone_expected=True):
+        """E-A: bloklu cone reroute_request + dünya konumu set edilmeli (kenar_blok hedefi)."""
+        if bb.state.reroute_request != cone_expected:
+            failures.append(f"[{name}] reroute_request={bb.state.reroute_request} (beklenen {cone_expected})")
+            print(f"  ✗ {name}: reroute_request={bb.state.reroute_request}")
+            return
+        if cone_expected:
+            cx, cy = bb.state.reroute_cone_world
+            if abs(cx) < 1e-6 and abs(cy) < 1e-6:
+                failures.append(f"[{name}] cone dünya konumu (0,0) — kenar_blok hedefi yok")
+                print(f"  ✗ {name}: cone konumu (0,0)")
+            else:
+                print(f"  ✓ {name}: reroute_request + cone dünya=({cx:.2f},{cy:.2f})")
+
     # -----------------------------------------------------------------
     # S1: Hiçbir şey yok → normal
     # -----------------------------------------------------------------
@@ -159,23 +173,26 @@ def run_scenarios():
     assert_karar("S7", "normal")
 
     # -----------------------------------------------------------------
-    # S8: Engel + sol boş → sol
+    # S8: Cone merkezde, dur bandında (1.5m < 2.0) → DUR + reroute
+    #     §16/E-B: "sol boş → sol" kaçışı KALDIRILDI. cone rotayla (hedef reroute)
+    #     geçilir; yan sektör boşluğu artık kararı etkilemez; ≤2m'de güvenlik-ağı dur.
     # -----------------------------------------------------------------
-    print("\nS8: Engel merkezde, sol boş → sol")
+    print("\nS8: Cone merkez 1.5m (dur bandı) → DUR + reroute")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.engel_present = True
     bb.obs.engel_d_center = 1.5
-    bb.obs.engel_d_left = 5.0     # sol boş
-    bb.obs.engel_d_right = 1.0    # sağ dolu
+    bb.obs.engel_d_left = 5.0     # (artık karar etkilemiyor)
+    bb.obs.engel_d_right = 1.0
     for _ in range(n_engel):
         fresh_now(bb); tree.tick()
-    assert_karar("S8", "sol")
+    assert_karar("S8", "dur")
+    assert_reroute("S8")
 
     # -----------------------------------------------------------------
-    # S9: Engel + iki taraf da dolu → dur
+    # S9: Cone merkez dur bandında (1.5m) → dur + reroute (yan sektör artık etkisiz)
     # -----------------------------------------------------------------
-    print("\nS9: Engel merkez, sol+sağ dolu → dur")
+    print("\nS9: Cone merkez 1.5m → dur + reroute")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.engel_present = True
@@ -185,6 +202,7 @@ def run_scenarios():
     for _ in range(n_engel):
         fresh_now(bb); tree.tick()
     assert_karar("S9", "dur")
+    assert_reroute("S9")
 
     # -----------------------------------------------------------------
     # S10: Hız sınırı 30 → slow
@@ -270,42 +288,48 @@ def run_scenarios():
     assert_karar("S16", "slow")
 
     # -----------------------------------------------------------------
-    # S17: Şerit değişimi manevra kilidi — başlatılan kaçış, manevra penceresi
-    #      (maneuver_hold_s) boyunca aynı yönde TUTULUR. control.py manevrayı
-    #      kenar-tetiklemeli başlatıp kendi sürdüğü için BT "dur"a düşmemeli;
-    #      yoksa fren manevrayı keser.
+    # S17: REROUTE PERSİSTENCE — cone commit bandında (3.5m) sürdükçe karar 'slow'
+    #      tutar ve reroute_request her tick yenilenir (kenar_blok refresh'i sürer).
+    #      §16/E-B: eski "manevra penceresinde sol tut" yerine; cone direksiyonla
+    #      değil rotayla geçildiğinden manevra-kilidi yok, blok talebi sürüyor.
     # -----------------------------------------------------------------
-    print("\nS17: Engel kaçışı başlayınca manevra penceresinde 'sol' tutulur")
+    print("\nS17: Cone commit bandında sürerken SLOW + reroute tutulur")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.engel_present = True
-    bb.obs.engel_d_center = 1.5
-    bb.obs.engel_d_left = 5.0   # sol boş
+    bb.obs.engel_d_center = 3.5   # commit bandı (>dur 2.0, <block 6.0)
+    bb.obs.engel_d_overall = 3.5
+    bb.obs.engel_d_left = 5.0
     bb.obs.engel_d_right = 1.0
     for _ in range(n_engel):
         fresh_now(bb); tree.tick()
-    assert_karar("S17a (ilk kaçış)", "sol")
-    # Manevra penceresi içinde: engel hâlâ merkezde olsa da aynı yön tutulur
+    assert_karar("S17a (ilk reroute)", "slow")
+    assert_reroute("S17a")
+    # Cone hâlâ commit bandında: karar slow tutar, blok talebi yenilenir
     for _ in range(n_engel):
         fresh_now(bb); tree.tick()
-    assert_karar("S17b (manevra kilidi)", "sol")
+    assert_karar("S17b (reroute sürüyor)", "slow")
+    assert_reroute("S17b")
 
     # -----------------------------------------------------------------
-    # S18: Yan sektör verisi bayat → kaçış yapma, dur
+    # S18: Cone dur bandında (1.5m) → dur + reroute. (Eskiden yan-sektör tazelik
+    #      kapısını test ederdi; §16/E-B ile yan sektör kararı etkilemiyor.)
     # -----------------------------------------------------------------
-    print("\nS18: Sol sektör bayat → kaçış yok → dur")
+    print("\nS18: Cone 1.5m → dur + reroute (yan-sektör tazeliği artık etkisiz)")
     bb.obs.__init__(); bb.state.__init__()
     t = time.time()
     bb.obs.engel_last_seen = t
     bb.obs.engel_present = True
     bb.obs.engel_d_center = 1.5
-    bb.obs.engel_d_left = 5.0   # değer boş gösteriyor AMA timestamp eski
+    bb.obs.engel_d_overall = 1.5
+    bb.obs.engel_d_left = 5.0
     bb.obs.engel_d_right = 5.0
-    bb.obs.engel_left_last_seen = t - 5.0   # bayat
-    bb.obs.engel_right_last_seen = t - 5.0  # bayat
+    bb.obs.engel_left_last_seen = t - 5.0   # bayat (artık önemsiz)
+    bb.obs.engel_right_last_seen = t - 5.0
     for _ in range(n_engel):
         bb.obs.engel_last_seen = time.time(); tree.tick()
     assert_karar("S18", "dur")
+    assert_reroute("S18")
 
     # -----------------------------------------------------------------
     # S19: Yüksek hızda yaya 5m → hız eşiği genişler → erken DUR
@@ -337,28 +361,30 @@ def run_scenarios():
     assert_karar("S20", "slow")
 
     # -----------------------------------------------------------------
-    # S21: YENI detektör (PoseArray) — tam önde engel, sol şerit boş → sol
+    # S21: YENI detektör (PoseArray) — cone commit bandında (3.5m) → SLOW + reroute
+    #      §16/E-B: yeni detektör de aynı reroute yoluna girer (yön seçimi yok).
     # -----------------------------------------------------------------
-    print("\nS21: Yeni detektör, merkez engel 1.5m, sağda engel → sol kaçış")
+    print("\nS21: Yeni detektör, merkez cone 3.5m → SLOW + reroute")
     bb.obs.__init__(); bb.state.__init__()
     bb.obs.odom_last_seen = time.time()
-    # merkez engel (1.5m önde) + sağ şeritte engel (sol boş kalsın)
     for _ in range(n_engel):
-        apply_fused(bb, [(1.5, 0.1), (4.0, -2.0)])
+        apply_fused(bb, [(3.5, 0.1), (5.0, -2.0)])
         tree.tick()
-    assert_karar("S21", "sol")
+    assert_karar("S21", "slow")
+    assert_reroute("S21")
 
     # -----------------------------------------------------------------
-    # S22: YENI detektör — merkez engel, her iki şerit de dolu → dur
+    # S22: YENI detektör — cone dur bandında (1.5m) → dur + reroute
+    #      (yan engeller artık kararı etkilemez; ≤2m güvenlik-ağı dur.)
     # -----------------------------------------------------------------
-    print("\nS22: Yeni detektör, merkez engel + iki şerit dolu → dur")
+    print("\nS22: Yeni detektör, merkez cone 1.5m → dur + reroute")
     bb.obs.__init__(); bb.state.__init__()
     bb.obs.odom_last_seen = time.time()
     for _ in range(n_engel):
-        # yan engeller yan_clear (3m) içinde → her iki şerit kapalı
         apply_fused(bb, [(1.5, 0.1), (1.8, 1.5), (1.8, -1.5)])
         tree.tick()
     assert_karar("S22", "dur")
+    assert_reroute("S22")
 
     # -----------------------------------------------------------------
     # S23: YENI detektör — merkez engel 0.8m (acil eşik altı) → acildurus
@@ -372,23 +398,25 @@ def run_scenarios():
     assert_karar("S23", "acildurus")
 
     # -----------------------------------------------------------------
-    # S24: Manevra penceresi DOLDUKTAN sonra engel hâlâ merkezde ve iki yan da
-    #      kapalı/cooldown → artık tutma yok → dur.
+    # S24: Levha şerit-değişimi penceresi DOLDUKTAN sonra (lane_change_hold artık
+    #      tutmaz) cone dur bandında → dur + reroute. lane_change_hold yalnız
+    #      LEVHA SAG/SOL içindir (S25); süresi geçince engel kararına düşülür.
     # -----------------------------------------------------------------
-    print("\nS24: Manevra penceresi bitince engel sürüyor + yan kapalı → dur")
+    print("\nS24: Levha manevra penceresi bitti + cone 1.5m → dur + reroute")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.engel_present = True
     bb.obs.engel_d_center = 1.5
-    bb.obs.engel_d_left = 1.0   # sol dolu
-    bb.obs.engel_d_right = 1.0  # sağ dolu
-    # Eski bir şerit değişimi başlatılmış gibi yap ama penceresi çoktan dolmuş
+    bb.obs.engel_d_left = 1.0
+    bb.obs.engel_d_right = 1.0
+    # Eski bir levha şerit değişimi başlatılmış gibi yap ama penceresi çoktan dolmuş
     hold_s = cfg["lane_change"].get("maneuver_hold_s", 2.0)
     bb.state.lane_change_dir = "sol"
     bb.state.last_lane_change_s = time.time() - (hold_s + 1.0)
     for _ in range(n_engel):
         fresh_now(bb); tree.tick()
     assert_karar("S24", "dur")
+    assert_reroute("S24")
 
     # -----------------------------------------------------------------
     # S25: Yön levhası SAG — ilk tick "sag", sonraki tick'te de "sag" tutulur
@@ -459,11 +487,11 @@ def run_scenarios():
         print(f"  ✓ S27: {got}  (reason: {bb2.last_decision.get('reason')})")
 
     # -----------------------------------------------------------------
-    # S28: YOL-BİLİNÇLİ — engel rotanın SAĞINDA → SOLA kaç (rota kaynaklı)
-    #      Robot (0,0) yaw=0, rota +x (hedef 5,0 → next 10,0). Engel gövde
-    #      çerçevesinde sağda (açı +18.4°, ~3.16m) → dünya (3,-1) = rota sağı.
+    # S28: CONE REROUTE — engel commit bandında (3.16m) → SLOW + kenar_blok
+    #      §16/E-B: sol/sag KALDIRILDI; cone artık rotayla (hedef reroute) geçilir,
+    #      karar yalnız 'slow' verir + cone'u DÜNYA frame'de kenar_blok ile bildirir.
     # -----------------------------------------------------------------
-    print("\nS28: Engel rotanın sağında → SOL (yol-bilinçli)")
+    print("\nS28: Engel commit bandında → SLOW + reroute (kenar_blok)")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.x = 0.0; bb.obs.y = 0.0; bb.obs.yaw = 0.0
@@ -473,40 +501,43 @@ def run_scenarios():
     bb.obs.engel_present = True
     bb.obs.engel_d_center = 3.16
     bb.obs.engel_d_overall = 3.16
-    bb.obs.engel_angle_deg = 18.4         # sağ-pozitif → engel sağda
-    bb.obs.engel_d_left = float("inf")    # sol şerit boş
-    bb.obs.engel_d_right = float("inf")
-    for _ in range(n_engel):
-        fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
-    assert_karar("S28", "sol")
-    if "rota" not in bb.last_decision.get("reason", ""):
-        failures.append(f"[S28] kaynak 'rota' bekleniyordu: {bb.last_decision.get('reason')}")
-        print(f"  ✗ S28 kaynak: {bb.last_decision.get('reason')}")
-
-    # -----------------------------------------------------------------
-    # S29: YOL-BİLİNÇLİ — engel rotanın SOLUNDA → SAĞA kaç
-    # -----------------------------------------------------------------
-    print("\nS29: Engel rotanın solunda → SAG (yol-bilinçli)")
-    bb.obs.__init__(); bb.state.__init__()
-    fresh_now(bb)
-    bb.obs.x = 0.0; bb.obs.y = 0.0; bb.obs.yaw = 0.0
-    bb.obs.hedef_x = 5.0; bb.obs.hedef_y = 0.0
-    bb.obs.next_hedef_x = 10.0; bb.obs.next_hedef_y = 0.0
-    bb.obs.hedef_last_seen = time.time()
-    bb.obs.engel_present = True
-    bb.obs.engel_d_center = 3.16
-    bb.obs.engel_d_overall = 3.16
-    bb.obs.engel_angle_deg = -18.4        # sol → engel solda
+    bb.obs.engel_angle_deg = 18.4         # konum hesabı için (yön seçimi YOK artık)
     bb.obs.engel_d_left = float("inf")
     bb.obs.engel_d_right = float("inf")
     for _ in range(n_engel):
         fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
-    assert_karar("S29", "sag")
+    assert_karar("S28", "slow")
+    assert_reroute("S28")
+    if "engel_reroute" not in bb.last_decision.get("reason", ""):
+        failures.append(f"[S28] reason engel_reroute bekleniyordu: {bb.last_decision.get('reason')}")
+        print(f"  ✗ S28 reason: {bb.last_decision.get('reason')}")
 
     # -----------------------------------------------------------------
-    # S30: Yol sol diyor ama SOL ŞERİT KAPALI → kaçış yok → dur (2.0m içinde)
+    # S29: CONE REROUTE — engel solda da olsa davranış AYNI (yön seçimi yok) → SLOW
     # -----------------------------------------------------------------
-    print("\nS30: Yol-bilinçli sol ama sol kapalı → dur")
+    print("\nS29: Engel solda → yine SLOW + reroute (yön seçimi yok)")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.x = 0.0; bb.obs.y = 0.0; bb.obs.yaw = 0.0
+    bb.obs.hedef_x = 5.0; bb.obs.hedef_y = 0.0
+    bb.obs.next_hedef_x = 10.0; bb.obs.next_hedef_y = 0.0
+    bb.obs.hedef_last_seen = time.time()
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 3.16
+    bb.obs.engel_d_overall = 3.16
+    bb.obs.engel_angle_deg = -18.4
+    bb.obs.engel_d_left = float("inf")
+    bb.obs.engel_d_right = float("inf")
+    for _ in range(n_engel):
+        fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
+    assert_karar("S29", "slow")
+    assert_reroute("S29")
+
+    # -----------------------------------------------------------------
+    # S30: GÜVENLİK AĞI — cone dur bandında (1.8m < 2.0) → reroute saptıramadı → DUR
+    #      (blok talebi KORUNUR: reroute_request hâlâ True, cone hâlâ orada).
+    # -----------------------------------------------------------------
+    print("\nS30: Cone dur bandında (1.8m) → DUR (reroute güvenlik ağı), blok korunur")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.x = 0.0; bb.obs.y = 0.0; bb.obs.yaw = 0.0
@@ -516,12 +547,16 @@ def run_scenarios():
     bb.obs.engel_present = True
     bb.obs.engel_d_center = 1.8            # dur bandında (< 2.0)
     bb.obs.engel_d_overall = 1.8
-    bb.obs.engel_angle_deg = 18.4         # sağda → yol "sol" der
-    bb.obs.engel_d_left = 0.5             # ama sol kapalı
+    bb.obs.engel_angle_deg = 18.4
+    bb.obs.engel_d_left = 0.5
     bb.obs.engel_d_right = 0.5
     for _ in range(n_engel):
         fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
     assert_karar("S30", "dur")
+    assert_reroute("S30")   # dur'da bile blok talebi sürmeli (cone hâlâ önde)
+    if "reroute" not in bb.last_decision.get("reason", ""):
+        failures.append(f"[S30] reason engel_blokaj_reroute bekleniyordu: {bb.last_decision.get('reason')}")
+        print(f"  ✗ S30 reason: {bb.last_decision.get('reason')}")
 
     # -----------------------------------------------------------------
     # S31: KATMANLI — engel yavasla bandında (7.5m, block 6.0'ın dışında) → yavasla
@@ -553,12 +588,11 @@ def run_scenarios():
     assert_karar("S32", "normal")
 
     # -----------------------------------------------------------------
-    # S33: MERKEZİ koni (rota üzerinde, deadband içinde) + rota taze → geçiş
-    #      şeridine (varsayilan=sol). CANLI BUG regresyonu (2026-06-24): engel
-    #      lateral ~0.2m iken eski kod yan_sektor gürültüsünden "sag" seçip
-    #      aracı koniye sokuyordu. Artık varsayilan_kacis_yon=sol gelmeli.
+    # S33: MERKEZİ koni (rota üzerinde, commit bandında) → SLOW + reroute.
+    #      §16/E-B: artık yön seçimi (sol/sag) YOK; merkezi koni de rotayla
+    #      (hedef reroute) geçilir. d_left/d_right artık karar etkilemiyor.
     # -----------------------------------------------------------------
-    print("\nS33: Merkezi koni + rota taze → SOL (varsayilan, yan_sektor değil)")
+    print("\nS33: Merkezi koni + rota taze → SLOW + reroute (yön seçimi yok)")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.x = 0.0; bb.obs.y = 0.0; bb.obs.yaw = 0.0
@@ -568,15 +602,16 @@ def run_scenarios():
     bb.obs.engel_present = True
     bb.obs.engel_d_center = 3.0
     bb.obs.engel_d_overall = 3.0
-    bb.obs.engel_angle_deg = 4.0          # ~merkez (lateral ~0.2m, deadband içinde)
-    bb.obs.engel_d_left = 4.0             # iki yan da clear (>3m) → seçilen taraf commit eder
-    bb.obs.engel_d_right = 5.0            # TUZAK: sağ daha açık → eski yan_sektor kodu "sag" derdi
+    bb.obs.engel_angle_deg = 4.0          # ~merkez (konum hesabı için)
+    bb.obs.engel_d_left = 4.0
+    bb.obs.engel_d_right = 5.0
     for _ in range(n_engel):
         fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
-    assert_karar("S33", "sol")
-    if "rota_merkez" not in bb.last_decision.get("reason", ""):
-        failures.append(f"[S33] kaynak 'rota_merkez' bekleniyordu: {bb.last_decision.get('reason')}")
-        print(f"  ✗ S33 kaynak: {bb.last_decision.get('reason')}")
+    assert_karar("S33", "slow")
+    assert_reroute("S33")
+    if "engel_reroute" not in bb.last_decision.get("reason", ""):
+        failures.append(f"[S33] reason engel_reroute bekleniyordu: {bb.last_decision.get('reason')}")
+        print(f"  ✗ S33 reason: {bb.last_decision.get('reason')}")
 
     print("\n" + "=" * 50)
     if failures:

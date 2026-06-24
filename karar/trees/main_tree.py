@@ -23,14 +23,13 @@ from bb import Blackboard
 from behaviors.conditions import (
     YayaFresh, LevhaFresh, EngelFresh,
     YayaVarMi, YayaCokYakin, YayaYakin, YayaOrtaMesafe,
-    EngelCokYakin, EngelMerkezBlokaj, YanSektorBos,
-    KacisYonuSec, YanSektorBosSecilen,
+    EngelCokYakin, EngelMerkezBlokaj,
     LevhaIs, LevhaIcindeMesafe,
     LaneChangeCooldownOk, LaneChangeInProgress,
 )
 from behaviors.actions import (
     SetKarar, LatchEmergency, ReleaseEmergencyIfClear,
-    DurLevhasiFSM, LaneChangeStamp, KacisKarar, HoldLaneChange,
+    DurLevhasiFSM, LaneChangeStamp, RerouteKarar, HoldLaneChange,
 )
 from behaviors.decorators import Debounce
 
@@ -43,32 +42,31 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     # Tüm engel tepki bantları control.py WP_NEAR_DISTANCE referansından
     # ± delta ile türetilir. Bir mesafeyi değiştirmek için: config/params.yaml
     # içindeki ilgili anahtarı düzenle (yoksa buradaki default geçerli).
-    # Bant sırası (yakın → uzak):  acil < dur < block(commit) < yavasla
-    #   acil    ≈ 1.2 m  → acil durus (emniyetli son çare)
-    #   dur     ≈ 2.0 m  → kaçış yoksa tam dur
-    #   block   ≈ 6.0 m  → SLALOM/kaçışa (sol/sag) COMMIT menzili (§12.12: 3.5→6.0)
-    #   yavasla ≈ 9.0 m  → en dış: tepki başlar, yavaşla (commit üstü ~3m slow-zone)
-    # NOT: lane-change'in FİİLEN tamamlanması için block menzili Ackermann
-    #      yayına yetmeli. Golf-cart (L=1.78m, R≈3.08m) 1.79m yanalı GÜVENLE
-    #      açmak ~5-6m gerektirir (doc §12.12, run 165604) → commit 6m'ye çekildi.
-    #      Araç hâlâ engele giriyorsa engel_block_delta_m'i daha da BÜYÜT.
+    # Bant sırası (yakın → uzak):  acil < dur < block(reroute) < yavasla
+    #   acil    ≈ 1.2 m  → acil durus (emniyetli son çare; e-stop control'de de var)
+    #   dur     ≈ 2.0 m  → reroute saptıramadı/cone çok yakın → tam dur (güvenlik ağı)
+    #   block   ≈ 6.0 m  → cone REROUTE tetiği: 'slow' + hedef'e kenar_blok (§16 E-A/E-B)
+    #   yavasla ≈ 9.0 m  → en dış: tepki başlar, yavaşla (reroute talebi yok, sadece yaklaş)
+    # MİMARİ (§16/§12.13): cone artık sol/sag direksiyon manevrasıyla DEĞİL,
+    #   planlayıcının (hedef) rotayı dubanın etrafından çizmesiyle geçilir. Karar
+    #   commit bandında 'slow' verir + cone'u kenar_blok ile hedef'e bildirir;
+    #   control offset YAPMAZ (H-A kaldırıldı), yalnız rerouted rotayı takip eder.
+    #   block menzili = hedef'in replan + control'ün tepki payı (6m kalibre, §12.12).
     # ===================================================================
     wp   = p.get("wp_planlama", {}) or {}
     lc   = p["lane_change"]
     dist = p["distances"]
 
     wp_near        = float(wp.get("control_wp_near_m",     1.5))   # = control.py WP_NEAR_DISTANCE (senkron tut!)
-    wp_hyst        = float(wp.get("aktif_wp_histerezis_m", 0.5))   # aktif WP segment geçiş histerezisi
-    kacis_deadband = float(wp.get("kacis_deadband_m",      0.7))   # rotaya bu kadar yakın engel = "merkez koni"
-    varsayilan_yon = str(  wp.get("varsayilan_kacis_yon", "sol"))  # merkez koni → bu yöne kaç (ters/karşı şerit)
 
     engel_acil_m      = max(0.3, wp_near + float(wp.get("engel_acil_delta_m",    -0.3)))  # acil durus
-    engel_dur_m       =          wp_near + float(wp.get("engel_dur_delta_m",      0.5))   # kaçış yoksa dur
-    engel_block_m     =          wp_near + float(wp.get("engel_block_delta_m",    4.5))   # sol/sag SLALOM commit (§12.12: →6.0m)
+    engel_dur_m       =          wp_near + float(wp.get("engel_dur_delta_m",      0.5))   # reroute saptıramazsa dur (güvenlik ağı)
+    engel_block_m     =          wp_near + float(wp.get("engel_block_delta_m",    4.5))   # cone REROUTE commit (§12.12: →6.0m)
     engel_yavasla_m   =          wp_near + float(wp.get("engel_yavasla_delta_m",  7.5))   # en dış: yavasla (→9.0m)
-    engel_yan_clear_m = float(dist.get("engel_yan_clear_m", 3.0))  # yan sektör bu kadar boşsa lane-change makul
+    # NOT: kacis_deadband/varsayilan_yon/wp_hyst/engel_yan_clear_m artık kullanılmıyor
+    #      (sol/sag yön seçimi §16/E-B ile kaldırıldı; cone reroute yön istemez).
 
-    lc_cooldown_s = float(lc.get("cooldown_s",      4.0))   # ardışık şerit değişimi arası bekleme
+    lc_cooldown_s = float(lc.get("cooldown_s",      4.0))   # ardışık şerit değişimi arası bekleme (levha SAG/SOL için)
     lc_hold_s     = float(lc.get("maneuver_hold_s", 2.0))   # = control.py LANE_CHANGE_DURATION (manevra tut süresi)
     # ===================================================================
 
@@ -188,26 +186,19 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     ])
 
     # ============================================================
-    # 5. Engelden kaçınma — KATMANLI MESAFE (kullanıcı isteği)
+    # 5. Engelden kaçınma — CONE REROUTE (§16/§12.13 yeni mimari)
     #    Dış kapı: engel yavasla bandında (en geniş) → en az "yavasla".
     #    İçeride öncelik:
-    #      a) block menzilinde + yola göre seçilen taraf BOŞ → sol/sag (kaçış)
-    #      b) dur menzilinde + kaçış yok → dur (son çare)
-    #      c) aksi halde (orta menzil, henüz net taraf yok) → yavasla
-    #    "Ne dur ne sol/sag diyemiyorsan yavaşla" → dur artık yalnız yakın+çaresiz.
+    #      a) commit (block) bandında → REROUTE: 'slow' + hedef'e kenar_blok
+    #         (cone çok yakınsa/dur bandında RerouteKarar 'dur' güvenlik-ağına düşer)
+    #      b) aksi halde (block↔yavasla arası) → yavasla (yaklaşıyor, henüz blok yok)
+    #    sol/sag KALDIRILDI (E-B): cone artık control offset'iyle değil planlayıcı
+    #    rerouteu ile geçiliyor → karar yalnız 'slow'/'dur'; control rerouted rotayı
+    #    düz takip eder (H-A). acildurus/dur safety-net üstte+RerouteKarar içinde.
     # ============================================================
-    road_aware_avoid = Sequence("RoadAwareAvoid", memory=False, children=[
-        EngelMerkezBlokaj(bb, engel_block_m),                 # commit menzilinde mi?
-        KacisYonuSec(bb, deadband_m=kacis_deadband, wp_near_m=wp_near,
-                     wp_hyst_m=wp_hyst, hedef_max_age_s=fresh["hedef_max_age_s"],
-                     varsayilan_yon=varsayilan_yon),          # yönü yola göre seç (hep SUCCESS)
-        YanSektorBosSecilen(bb, engel_yan_clear_m, fresh["engel_max_age_s"]),
-        LaneChangeCooldownOk(bb, lc_cooldown_s),
-        KacisKarar(bb),                                       # sol/sag + cooldown/yön damgala
-    ])
-    engel_dur = Sequence("EngelDur", memory=False, children=[
-        EngelMerkezBlokaj(bb, engel_dur_m),                  # dur menzilinde + kaçış yok
-        SetKarar("Karar=DUR(engel)", bb, karar="dur", reason="engel_blokaj"),
+    road_reroute = Sequence("RoadReroute", memory=False, children=[
+        EngelMerkezBlokaj(bb, engel_block_m),                 # commit (reroute) bandında mı?
+        RerouteKarar(bb, dur_esik_m=engel_dur_m),             # slow + kenar_blok talebi (≤dur → dur)
     ])
     engel_yavasla = SetKarar("Karar=SLOW(engel)", bb, karar="slow",
                              reason="engel_yavasla", phase="approach")
@@ -220,11 +211,9 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
                                    max_extra_m=sa_max_extra, odom_max_age_s=odom_age),
                  bb, key="engel_blokaj",
                  min_consecutive=deb["engel_min_consecutive"]),
-        Selector("EngelTepki", memory=False, children=(
-            [road_aware_avoid] if lc["enabled"] else []
-        ) + [
-            engel_dur,
-            engel_yavasla,
+        Selector("EngelTepki", memory=False, children=[
+            road_reroute,       # commit bandı → slow + kenar_blok reroute (≤dur → dur)
+            engel_yavasla,      # block↔yavasla arası → slow
         ]),
     ])
 

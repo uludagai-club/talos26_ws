@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""overtake.py — sollama (ters şeride geç) + güvenli geri-dönüş durum makinesi.
+"""overtake.py — (DEPRECATED, 2026-06-24) sollama + Ackermann geri-dönüş makinesi.
+
+    ⚠ ARTIK KULLANILMIYOR. Cone kaçınması §16/§12.13 mimarisiyle değişti: cone
+    artık karşı şeride DİREKSİYONLA (sollama + control offset) değil, planlayıcının
+    rotayı dubanın etrafından çizmesiyle (ROTAYLA) geçiliyor. Yerini `reroute.py`
+    (RerouteManager, /hedef_komut kenar_blok) aldı; karar_bt_node onu kullanır.
+    Bu dosya + test_overtake.py geri-uyum/referans için bırakıldı, bir sonraki
+    temizlikte silinebilir.
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+sollama (ters şeride geç) + güvenli geri-dönüş durum makinesi.
 
 NE YAPAR
     Behavior Tree engelden kaçış için "sol"/"sag" verdiğinde, bu yön anlık

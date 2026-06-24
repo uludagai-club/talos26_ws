@@ -15,6 +15,7 @@ import py_trees
 from py_trees.common import Status
 
 from bb import Blackboard
+from avoidance_geometry import obstacle_world_pos
 
 
 # ============================================================
@@ -243,6 +244,62 @@ class KacisKarar(py_trees.behaviour.Behaviour):
             "phase": "driving",
             "wait_remaining_s": 0.0,
         }
+        return Status.SUCCESS
+
+
+class RerouteKarar(py_trees.behaviour.Behaviour):
+    """Cone-case kararı: sol/sag YERİNE 'slow' + hedef'e kenar_blok reroute talebi.
+
+    Yeni mimari (gelistirme_plani §16, E-A/E-B): cone control'ün açık-döngü
+    offset'iyle (kaldırıldı, §12.13 H-A) DEĞİL, planlayıcının rotayı dubanın
+    etrafından çizmesiyle geçilir. Bu action:
+      - cone'un DÜNYA konumunu hesaplar (robot pozu + engel menzili/açısı; hedef
+        tazeliğine bağlı DEĞİL) ve bb.state'e yazar → node RerouteManager ile
+        /hedef_komut: kenar_blok yollar (E-A).
+      - /karar'a 'slow' basar (sol/sag YOK → control offset tetiklenmez, E-B).
+      - Cone dur eşiğinden yakınsa (reroute saptıramadı / çok yakın) güvenlik-ağı
+        'dur' (blok talebi KORUNUR — cone hâlâ orada). acildurus üst dalda zaten.
+    Her zaman SUCCESS (commit bandındaki cone'a bir tepki daima üretilir).
+    """
+
+    def __init__(self, bb: Blackboard, dur_esik_m: float):
+        super().__init__("RerouteKarar")
+        self.bb = bb
+        self.dur_esik_m = float(dur_esik_m)
+
+    def update(self):
+        o = self.bb.obs
+        s = self.bb.state
+        # Cone menzili: nearest overall, yoksa center
+        rng = o.engel_d_overall
+        if rng is None or not math.isfinite(rng):
+            rng = o.engel_d_center
+        if rng is None or not math.isfinite(rng):
+            # Konum yok → reroute talebi AÇMA (yanlış (0,0) blok riski); güvenli slow.
+            s.reroute_request = False
+            self.bb.last_decision = {
+                "karar": "slow", "reason": "engel_reroute_nopos",
+                "phase": "approach", "wait_remaining_s": 0.0,
+            }
+            return Status.SUCCESS
+
+        ox, oy = obstacle_world_pos(o.x, o.y, o.yaw, rng, o.engel_angle_deg or 0.0)
+        s.reroute_request = True
+        s.reroute_cone_world = (ox, oy)
+        s.kacis_engel_dunya = (ox, oy)   # trace log sürekliliği (eski alan)
+
+        d = o.engel_d_center
+        if d is not None and math.isfinite(d) and d < self.dur_esik_m:
+            # Güvenlik ağı: reroute saptıramadı veya cone çok yakın → tam dur (blok korunur)
+            self.bb.last_decision = {
+                "karar": "dur", "reason": "engel_blokaj_reroute",
+                "phase": "driving", "wait_remaining_s": 0.0,
+            }
+        else:
+            self.bb.last_decision = {
+                "karar": "slow", "reason": "engel_reroute",
+                "phase": "approach", "wait_remaining_s": 0.0,
+            }
         return Status.SUCCESS
 
 

@@ -95,7 +95,11 @@ class StatePersist:
     kacis_lateral_m: float = 0.0      # engelin rotaya işaretli yanal uzaklığı (sol+)
     kacis_engel_dunya: tuple = (0.0, 0.0)  # son hesaplanan engel dünya konumu (debug)
 
-    # Sollama (OvertakeManager aynası — yalnız snapshot/log için)
+    # Cone reroute (RerouteKarar yazar; node RerouteManager ile kenar_blok yönetir) — §16/E-A,E-B
+    reroute_request: bool = False           # bu tick bloklu cone var mı (reroute talebi); node tüketince sıfırlar
+    reroute_cone_world: tuple = (0.0, 0.0)  # bloklu cone'un dünya konumu (/hedef_komut kenar_blok için)
+
+    # Sollama/reroute aynası (yalnız snapshot/log için)
     overtake_active: bool = False
     overtake_return_dist_m: float = 0.0
 
