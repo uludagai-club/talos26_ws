@@ -113,20 +113,27 @@ HEDEF_KOMUT_AKTIF      = True
 BLOK_TTL_S             = 3.0    # sollama bloğu bu kadar sn tazelenmezse düşer (karar ~1s'de tazeler)
 BLOK_MARJIN_M          = 1.5    # blok yarıçapına eklenen pay (m): araç ön çıkıntısı + kenar uzunluğu
 
-# ── Karşı-şerit (slalom) crossing enjeksiyonu — plan §16 (S-A/S-B/S-C) ─────
+# ── Karşı-şerit (slalom) enjeksiyonu — plan §16 (S-A/S-B/S-C) ──────────────
 # Yalnız ağırlık şişirme rotayı SAPTIRMIYORDU (§10.3 bilinen kısıt): tek-yön
 # şeritte alternatif yoksa engel kenarı pahalanır ama planlayıcı yine düz geçer.
 # Çözüm (§16, hedef-yönlü karşı-şerit reroute): kenar_blok/sollama geldiğinde
-# engelin ÇEVRESİNE karşı-şerit geçiş (crossing) kenarları GEÇİCİ enjekte edilir
-# → planlayıcı engeli karşı şeritten GERÇEKTEN sollar, cone sonrası eski şeride
-# döner (S-C). Taban graf TEK-YÖNLÜ kalır: enjekte yalnız (a) blok aktifken,
-# (b) engel çevresinde (SLALOM_ENJEKSIYON_R), (c) recalc sonunda geri alınır
-# → "ters şeritten kolay yol" bug'ı (§0) geri gelmez. Sürülebilir zig-zag'ı
-# turn-aware cusp kapısı seçer; U-dönüşü üreten backward crossing'leri eler →
-# enjeksiyon YALNIZ TURN_AWARE_AKTIF iken yapılır (cusp güvenlik kapısı).
+# engelin ÇEVRESİNE iki tür kenar GEÇİCİ enjekte edilir:
+#   1) crossing (A↔B geçiş, "ters şerite ÇIKMA")  → CEZA_TERS_CIKIS (PAHALI)
+#   2) karşı-şerit boylamasına segment (B'de ileri seyir, "ters şeritte KALMA")
+#                                                  → CEZA_TERS_KALMA (UCUZ)
+# Ayrım (kullanıcı içgörüsü): çıkış riskli → az sayıda yap (tek giriş+çıkış,
+# zig-zag değil); bir kez çıktıysan engeli geçene kadar karşı şeritte KAL
+# (yanal açıklık). Bloklu kenara ayrıca TOPLAMSAL ceza (BLOK_EK_CEZA) eklenir →
+# cone "neredeyse geçilmez", herhangi bir sürülebilir detour tercih edilir
+# (ama sonlu → alternatif YOKSA yine geçer = fail-safe). Taban graf TEK-YÖNLÜ
+# kalır: enjekte yalnız (a) blok aktifken, (b) engel çevresinde (R), (c) recalc
+# sonunda geri alınır → "ters şeritten kolay yol" bug'ı (§0) dönmez. Sürülemez
+# U-dönüşlerini turn-aware cusp kapısı eler → enjeksiyon YALNIZ TURN_AWARE iken.
 SLALOM_ENJEKSIYON_AKTIF = True
-CEZA_SLALOM_ENJEKSIYON  = 15    # crossing kenar cezası (1.6x) — "cezalı" (§16.5); blok yoksa zaten enjekte edilmez
-SLALOM_ENJEKSIYON_R     = 8.0   # crossing endpoint'i engele bu kadar yakınsa enjekte edilir (m)
+CEZA_TERS_CIKIS         = 90    # ters şerite ÇIKMA (crossing) cezası (4.6x) — PAHALI: az geçiş
+CEZA_TERS_KALMA         = 0     # ters şeritte KALMA (karşı-şerit ileri seyir) cezası (1.0x) — UCUZ: solda kal
+BLOK_EK_CEZA            = 50.0  # bloklu kenara TOPLAMSAL ceza (m) — detour'u baskın yap; sonlu (fail-safe)
+SLALOM_ENJEKSIYON_R     = 8.0   # crossing/segment endpoint'i engele bu kadar yakınsa enjekte (m)
 
 
 def ceza_carpani(ceza_puani: float) -> float:
@@ -792,6 +799,12 @@ def build_track_graph():
                 G.nodes[v]['pos'] = (pos_v[0], y_avg)
 
     slalom_connections_to_build = []
+    # Karşı-şerit boylamasına (lane-parallel) segment kenarları: blok geldiğinde
+    # bunların ters yönü "ters şeritte KALMA" (ucuz) cezasıyla enjekte edilir →
+    # araç engeli geçene kadar karşı şeritte İLERİ seyredebilir (yalnız crossing
+    # zig-zag'ı değil). YALNIZ düz paralel kesim node'ları (köşe/connection YOK)
+    # → dikey şeride kaçma artefaktı oluşmaz.
+    slalom_lane_segments = []
     for lane1_nodes, lane2_nodes, orientation in slalom_segments:
         paired = []
         for u in lane1_nodes:
@@ -810,6 +823,9 @@ def build_track_graph():
         for i in range(len(unique_paired) - 1):
             u1, v1 = unique_paired[i]
             u2, v2 = unique_paired[i+1]
+            # İki şeridin boylamasına segmentleri (ardışık eşleşmiş node'lar arası)
+            slalom_lane_segments.append((u1, u2))
+            slalom_lane_segments.append((v1, v2))
             if orientation == "horizontal":
                 slalom_connections_to_build.append((u1, v2, "left", "right"))
                 slalom_connections_to_build.append((v2, u1, "right", "left"))
@@ -832,6 +848,7 @@ def build_track_graph():
     # blok kalkınca geri alınır). Bkz. plan §16 / _slalom_enjekte / _blok_uygula.
     # Crossing listesini G üzerinde sakla (runtime _load_graph_from_import okur).
     G.graph['slalom_connections'] = slalom_connections_to_build
+    G.graph['slalom_lane_segments'] = slalom_lane_segments
 
     # A şeridi ile P1 ve P7 arasındaki bağlantıyı dinamik olarak ekliyoruz
     a_nodes = [n for n in G.nodes() if G.nodes[n].get('lane') == 'A']
@@ -1066,6 +1083,7 @@ class HedefYoneticisi:
         # eşzamanlı recalc çağırırsa apply/restore çakışıp ağırlık sızdırmasın.
         self._graf_lock       = threading.Lock()
         self._slalom_conns    = []  # karşı-şerit crossing adayları (load'da doldurulur)
+        self._slalom_segs     = []  # karşı-şerit boylamasına segment adayları (KALMA)
 
         # ── Tanı logu (kalıcı; docker kapanınca host'ta kalır) ───────
         self.logger = None
@@ -1107,8 +1125,10 @@ class HedefYoneticisi:
                 blok_ttl_s=BLOK_TTL_S,
                 carpan_ters_yon=round(ceza_carpani(CEZA_TERS_YON), 3),
                 slalom_enjeksiyon=SLALOM_ENJEKSIYON_AKTIF,
-                ceza_slalom_enjeksiyon=CEZA_SLALOM_ENJEKSIYON,
-                carpan_slalom=round(ceza_carpani(CEZA_SLALOM_ENJEKSIYON), 3),
+                ceza_ters_cikis=CEZA_TERS_CIKIS,
+                carpan_ters_cikis=round(ceza_carpani(CEZA_TERS_CIKIS), 3),
+                ceza_ters_kalma=CEZA_TERS_KALMA,
+                blok_ek_ceza=BLOK_EK_CEZA,
                 slalom_enjeksiyon_r=SLALOM_ENJEKSIYON_R,
             )
 
@@ -1219,8 +1239,22 @@ class HedefYoneticisi:
             d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
             slalom_conns.append((p1, p2, d))
         self._slalom_conns = slalom_conns
-        rospy.loginfo(f"[graph] {len(slalom_conns)} karşı-şerit crossing adayı "
-                      f"saklandı (blok-tetikli enjeksiyon için).")
+
+        # ── Karşı-şerit boylamasına segment adayları (§16, "ters şeritte KALMA") ──
+        # Ardışık eşleşmiş şerit node'ları arası (yalnız düz paralel kesim).
+        # Blok geldiğinde EKSİK yönü ucuz (CEZA_TERS_KALMA) enjekte edilir →
+        # araç karşı şeritte İLERİ seyredip engeli geçene dek solda kalabilir.
+        slalom_segs = []
+        for (a, b) in G.graph.get('slalom_lane_segments', []):
+            p1 = node_to_pos.get(a)
+            p2 = node_to_pos.get(b)
+            if not p1 or not p2 or p1 == p2:
+                continue
+            d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            slalom_segs.append((p1, p2, d))
+        self._slalom_segs = slalom_segs
+        rospy.loginfo(f"[graph] {len(slalom_conns)} crossing + {len(slalom_segs)} "
+                      f"karşı-şerit segment adayı saklandı (blok-tetikli enjeksiyon).")
 
         self._graph_loaded = True
         rospy.loginfo(
@@ -1576,14 +1610,15 @@ class HedefYoneticisi:
             return [(b['x'], b['y'], b['r']) for b in taze]
 
     def _blok_uygula(self):
-        """Aktif blokların yarıçapındaki kenarların AĞIRLIĞINI şişirir (sert silmez —
-        Faz1-5 debounce çakışmasın) + engel çevresine karşı-şerit (slalom) crossing
-        kenarlarını GEÇİCİ enjekte eder (§16: rota gerçekten karşı şeritten sapsın).
-        Döndürür: (saved_w, eklenen) — recalc finally'sinde _blok_geri_al ile
-        geri yüklenir/kaldırılır → taban graf değişmeden kalır.
-        ÖNEMLİ sıra: önce mevcut kenarları şişir, SONRA slalom enjekte et —
-        enjekte edilen crossing'ler şişirme döngüsünün dışında kalır (kendi
-        cezalarıyla; çift ceza yok)."""
+        """Aktif blokların yarıçapındaki kenarların ağırlığını şişirir (çarpımsal)
+        + TOPLAMSAL ceza ekler (BLOK_EK_CEZA → cone'u baskın şekilde pahalı yapar
+        ki herhangi bir sürülebilir detour düz-geçişi yensin; sonlu → alternatif
+        yoksa yine geçer = fail-safe; SERT SİLME değil → Faz1-5 debounce çakışmaz)
+        + engel çevresine karşı-şerit crossing (ÇIKMA) ve boylamasına segment
+        (KALMA) kenarlarını GEÇİCİ enjekte eder (§16).
+        Döndürür: (saved_w, eklenen) — recalc finally'sinde geri yüklenir/kaldırılır.
+        ÖNEMLİ sıra: önce mevcut kenarları şişir, SONRA enjekte et — enjekte
+        edilenler şişirme döngüsünün dışında kalır (kendi cezalarıyla; çift ceza yok)."""
         saved = []
         eklenen = []
         engeller = self._aktif_bloklar()
@@ -1594,45 +1629,60 @@ class HedefYoneticisi:
             for (ox, oy, r) in engeller:
                 if _nokta_segment_mesafe(ox, oy, p1[0], p1[1], p2[0], p2[1]) <= r + BLOK_MARJIN_M:
                     saved.append(((p1, p2), w))
-                    self.planner.edge_weights[(p1, p2)] = w * carp
+                    self.planner.edge_weights[(p1, p2)] = w * carp + BLOK_EK_CEZA
                     break
-        # Karşı-şerit crossing enjeksiyonu (yalnız turn-aware açıkken → cusp kapısı
-        # sürülemez U-dönüşü crossing'lerini eler; klasik find_path'te bu güvenlik yok)
+        # Karşı-şerit enjeksiyonu (yalnız turn-aware açıkken → cusp kapısı sürülemez
+        # U-dönüşlerini eler; klasik find_path'te bu güvenlik yok)
         if SLALOM_ENJEKSIYON_AKTIF and TURN_AWARE_AKTIF:
             eklenen = self._slalom_enjekte(engeller)
         return saved, eklenen
 
     def _slalom_enjekte(self, engeller):
-        """Aktif blokların SLALOM_ENJEKSIYON_R yakınındaki karşı-şerit crossing
-        kenarlarını planlayıcıya GEÇİCİ ekler (cezalı). Döndürdüğü [(p1,p2),...]
-        listesi _blok_geri_al'da kaldırılır. Yalnız engel çevresinde + tek-yön
-        taban grafı bozmadan; cone öncesi giriş + sonrası çıkış crossing'leri
-        birlikte gelir → planlayıcı sollar, sonra eski şeride döner (S-C)."""
+        """Aktif blokların SLALOM_ENJEKSIYON_R yakınına GEÇİCİ karşı-şerit kenarı ekler:
+          • crossing (A↔B geçiş, "ÇIKMA")  → CEZA_TERS_CIKIS (PAHALI: az geçiş yap)
+          • boylamasına segment EKSİK yönü (karşı şeritte ileri seyir, "KALMA")
+                                           → CEZA_TERS_KALMA (UCUZ: bir kez çıkınca solda kal)
+        Bu ayrım (kullanıcı içgörüsü) → tek giriş+çıkış + engel boyunca karşı şeritte
+        kalma (yanal açıklık), zig-zag yerine. Döndürdüğü [(p1,p2),...] _blok_geri_al'da
+        kaldırılır. Yalnız engel çevresinde + tek-yön taban grafı bozmadan."""
         eklenen = []
-        conns = self._slalom_conns
-        if not conns:
-            return eklenen
-        carp = ceza_carpani(CEZA_SLALOM_ENJEKSIYON)
         R = SLALOM_ENJEKSIYON_R
-        for (p1, p2, d) in conns:
-            yakin = False
+
+        def _engele_yakin(p1, p2):
             for (ox, oy, _r) in engeller:
                 if (math.hypot(p1[0] - ox, p1[1] - oy) <= R or
                         math.hypot(p2[0] - ox, p2[1] - oy) <= R):
-                    yakin = True
-                    break
-            if not yakin:
+                    return True
+            return False
+
+        # 1) Crossing'ler (ÇIKMA — pahalı)
+        carp_c = ceza_carpani(CEZA_TERS_CIKIS)
+        for (p1, p2, d) in self._slalom_conns:
+            if not _engele_yakin(p1, p2):
                 continue
             if (p1, p2) in self.planner.edge_weights:   # zaten varsa (taban/durak) dokunma
                 continue
-            self.planner.add_edge(p1, p2, d * carp)
+            self.planner.add_edge(p1, p2, d * carp_c)
             eklenen.append((p1, p2))
+
+        # 2) Karşı-şerit boylamasına segmentler (KALMA — ucuz); EKSİK yönü ekle →
+        #    şerit yerel olarak çift-yönlü olur, araç karşı şeritte ileri seyreder.
+        #    (ters yön sürülemez bir U-dönüşü gerektirirse turn-aware cusp eler.)
+        carp_k = ceza_carpani(CEZA_TERS_KALMA)
+        for (p1, p2, d) in self._slalom_segs:
+            if not (_engele_yakin(p1, p2)):
+                continue
+            for (a, b) in ((p1, p2), (p2, p1)):
+                if (a, b) in self.planner.edge_weights:
+                    continue
+                self.planner.add_edge(a, b, d * carp_k)
+                eklenen.append((a, b))
         return eklenen
 
     def _blok_geri_al(self, saved, eklenen=None):
         for (e, w) in saved:
             self.planner.edge_weights[e] = w
-        # Enjekte edilen karşı-şerit crossing kenarlarını TAMAMEN kaldır
+        # Enjekte edilen karşı-şerit kenarlarını (crossing + segment) TAMAMEN kaldır
         # (adj_list + pred_list + edge_weights) → sızıntı yok. Düğümlere
         # dokunma (her iki uç da mevcut şerit düğümü).
         for (p1, p2) in (eklenen or []):
