@@ -113,6 +113,21 @@ HEDEF_KOMUT_AKTIF      = True
 BLOK_TTL_S             = 3.0    # sollama bloğu bu kadar sn tazelenmezse düşer (karar ~1s'de tazeler)
 BLOK_MARJIN_M          = 1.5    # blok yarıçapına eklenen pay (m): araç ön çıkıntısı + kenar uzunluğu
 
+# ── Karşı-şerit (slalom) crossing enjeksiyonu — plan §16 (S-A/S-B/S-C) ─────
+# Yalnız ağırlık şişirme rotayı SAPTIRMIYORDU (§10.3 bilinen kısıt): tek-yön
+# şeritte alternatif yoksa engel kenarı pahalanır ama planlayıcı yine düz geçer.
+# Çözüm (§16, hedef-yönlü karşı-şerit reroute): kenar_blok/sollama geldiğinde
+# engelin ÇEVRESİNE karşı-şerit geçiş (crossing) kenarları GEÇİCİ enjekte edilir
+# → planlayıcı engeli karşı şeritten GERÇEKTEN sollar, cone sonrası eski şeride
+# döner (S-C). Taban graf TEK-YÖNLÜ kalır: enjekte yalnız (a) blok aktifken,
+# (b) engel çevresinde (SLALOM_ENJEKSIYON_R), (c) recalc sonunda geri alınır
+# → "ters şeritten kolay yol" bug'ı (§0) geri gelmez. Sürülebilir zig-zag'ı
+# turn-aware cusp kapısı seçer; U-dönüşü üreten backward crossing'leri eler →
+# enjeksiyon YALNIZ TURN_AWARE_AKTIF iken yapılır (cusp güvenlik kapısı).
+SLALOM_ENJEKSIYON_AKTIF = True
+CEZA_SLALOM_ENJEKSIYON  = 15    # crossing kenar cezası (1.6x) — "cezalı" (§16.5); blok yoksa zaten enjekte edilmez
+SLALOM_ENJEKSIYON_R     = 8.0   # crossing endpoint'i engele bu kadar yakınsa enjekte edilir (m)
+
 
 def ceza_carpani(ceza_puani: float) -> float:
     """0-100 ceza puanını D* kenar ağırlık çarpanına çevirir (1.0 + p/100 * CEZA_ETKI).
@@ -809,11 +824,14 @@ def build_track_graph():
     for src, dst, app, ex in connections_to_build:
         add_curved_conn(src, dst, app, ex, conn_type='connection')
 
-    # NOT: slalom_connections_to_build (karşı şeride geçme) BİLİNÇLİ olarak
-    # D* grafına eklenmiyor. Şerit değiştirme/sollama DİNAMİK (karar-güdümlü):
-    # karar bir bağlantılı WP'ye geçmek isterse hedef ona karşı-şerit WP'sini
-    # iletir. Böylece D* her hesaplamada ters/karşı şeritleri taşımaz.
-    # (Karşı-şerit eşlemesi için slalom_connections_to_build / pairing kullanılır.)
+    # NOT: slalom_connections_to_build (karşı şeride geçme) TABAN grafa BİLİNÇLİ
+    # olarak eklenmiyor — tek-yönlü yapı korunur (yoksa "ters şeritten kolay yol"
+    # bug'ı geri gelir). Bunun yerine karşı-şerit crossing'leri RUNTIME'da, yalnız
+    # karar `kenar_blok`/`sollama` yolladığında ve YALNIZ engelin çevresinde geçici
+    # enjekte edilir (cezalı; turn-aware cusp kapısıyla sürülebilir zig-zag seçilir;
+    # blok kalkınca geri alınır). Bkz. plan §16 / _slalom_enjekte / _blok_uygula.
+    # Crossing listesini G üzerinde sakla (runtime _load_graph_from_import okur).
+    G.graph['slalom_connections'] = slalom_connections_to_build
 
     # A şeridi ile P1 ve P7 arasındaki bağlantıyı dinamik olarak ekliyoruz
     a_nodes = [n for n in G.nodes() if G.nodes[n].get('lane') == 'A']
@@ -1043,6 +1061,11 @@ class HedefYoneticisi:
         self._bloklu_engeller = []
         self._komut_lock      = threading.Lock()
         self._son_aktif_blok  = 0   # TTL düşüşünde tek-sefer reroute tetiği için
+        # recalc'taki graf mutasyonunu (blok ağırlık-şişirme + slalom enjeksiyon)
+        # serialize eder: konum_callback ile hedef_komut_callback ayrı thread'lerde
+        # eşzamanlı recalc çağırırsa apply/restore çakışıp ağırlık sızdırmasın.
+        self._graf_lock       = threading.Lock()
+        self._slalom_conns    = []  # karşı-şerit crossing adayları (load'da doldurulur)
 
         # ── Tanı logu (kalıcı; docker kapanınca host'ta kalır) ───────
         self.logger = None
@@ -1083,6 +1106,10 @@ class HedefYoneticisi:
                 hedef_komut=HEDEF_KOMUT_AKTIF,
                 blok_ttl_s=BLOK_TTL_S,
                 carpan_ters_yon=round(ceza_carpani(CEZA_TERS_YON), 3),
+                slalom_enjeksiyon=SLALOM_ENJEKSIYON_AKTIF,
+                ceza_slalom_enjeksiyon=CEZA_SLALOM_ENJEKSIYON,
+                carpan_slalom=round(ceza_carpani(CEZA_SLALOM_ENJEKSIYON), 3),
+                slalom_enjeksiyon_r=SLALOM_ENJEKSIYON_R,
             )
 
         # ── Planner ─────────────────────────────────────────────────
@@ -1175,6 +1202,25 @@ class HedefYoneticisi:
 
         # edge_info'yu sakla → iki-yönlü durak adımı (goal'lar kurulunca) kullanır
         self._edge_info = edge_info
+
+        # ── Karşı-şerit (slalom) crossing adayları (§16 S-A) ──────────────
+        # build_track_graph bunları TABAN grafa eklemez (tek-yön korunur); biz
+        # pozisyon-anahtarlı aday liste olarak saklarız. Blok geldiğinde engel
+        # çevresindekiler _slalom_enjekte() ile GEÇİCİ eklenir, recalc sonunda
+        # geri alınır. (p1, p2, d): yönlü crossing kenarı + ham uzunluk.
+        slalom_conns = []
+        for (u, v, _app, _ex) in G.graph.get('slalom_connections', []):
+            p1 = node_to_pos.get(u)
+            p2 = node_to_pos.get(v)
+            if not p1 or not p2 or p1 == p2:
+                continue
+            if (p1, p2) in self.planner.edge_weights:   # taban grafta zaten varsa atla
+                continue
+            d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            slalom_conns.append((p1, p2, d))
+        self._slalom_conns = slalom_conns
+        rospy.loginfo(f"[graph] {len(slalom_conns)} karşı-şerit crossing adayı "
+                      f"saklandı (blok-tetikli enjeksiyon için).")
 
         self._graph_loaded = True
         rospy.loginfo(
@@ -1531,12 +1577,18 @@ class HedefYoneticisi:
 
     def _blok_uygula(self):
         """Aktif blokların yarıçapındaki kenarların AĞIRLIĞINI şişirir (sert silmez —
-        Faz1-5 debounce çakışmasın). Döndürdüğü (kenar, eski_w) listesi recalc
-        finally'sinde geri yüklenir → taban graf değişmeden kalır."""
+        Faz1-5 debounce çakışmasın) + engel çevresine karşı-şerit (slalom) crossing
+        kenarlarını GEÇİCİ enjekte eder (§16: rota gerçekten karşı şeritten sapsın).
+        Döndürür: (saved_w, eklenen) — recalc finally'sinde _blok_geri_al ile
+        geri yüklenir/kaldırılır → taban graf değişmeden kalır.
+        ÖNEMLİ sıra: önce mevcut kenarları şişir, SONRA slalom enjekte et —
+        enjekte edilen crossing'ler şişirme döngüsünün dışında kalır (kendi
+        cezalarıyla; çift ceza yok)."""
         saved = []
+        eklenen = []
         engeller = self._aktif_bloklar()
         if not engeller:
-            return saved
+            return saved, eklenen
         carp = ceza_carpani(CEZA_TERS_YON)
         for (p1, p2), w in list(self.planner.edge_weights.items()):
             for (ox, oy, r) in engeller:
@@ -1544,11 +1596,48 @@ class HedefYoneticisi:
                     saved.append(((p1, p2), w))
                     self.planner.edge_weights[(p1, p2)] = w * carp
                     break
-        return saved
+        # Karşı-şerit crossing enjeksiyonu (yalnız turn-aware açıkken → cusp kapısı
+        # sürülemez U-dönüşü crossing'lerini eler; klasik find_path'te bu güvenlik yok)
+        if SLALOM_ENJEKSIYON_AKTIF and TURN_AWARE_AKTIF:
+            eklenen = self._slalom_enjekte(engeller)
+        return saved, eklenen
 
-    def _blok_geri_al(self, saved):
+    def _slalom_enjekte(self, engeller):
+        """Aktif blokların SLALOM_ENJEKSIYON_R yakınındaki karşı-şerit crossing
+        kenarlarını planlayıcıya GEÇİCİ ekler (cezalı). Döndürdüğü [(p1,p2),...]
+        listesi _blok_geri_al'da kaldırılır. Yalnız engel çevresinde + tek-yön
+        taban grafı bozmadan; cone öncesi giriş + sonrası çıkış crossing'leri
+        birlikte gelir → planlayıcı sollar, sonra eski şeride döner (S-C)."""
+        eklenen = []
+        conns = self._slalom_conns
+        if not conns:
+            return eklenen
+        carp = ceza_carpani(CEZA_SLALOM_ENJEKSIYON)
+        R = SLALOM_ENJEKSIYON_R
+        for (p1, p2, d) in conns:
+            yakin = False
+            for (ox, oy, _r) in engeller:
+                if (math.hypot(p1[0] - ox, p1[1] - oy) <= R or
+                        math.hypot(p2[0] - ox, p2[1] - oy) <= R):
+                    yakin = True
+                    break
+            if not yakin:
+                continue
+            if (p1, p2) in self.planner.edge_weights:   # zaten varsa (taban/durak) dokunma
+                continue
+            self.planner.add_edge(p1, p2, d * carp)
+            eklenen.append((p1, p2))
+        return eklenen
+
+    def _blok_geri_al(self, saved, eklenen=None):
         for (e, w) in saved:
             self.planner.edge_weights[e] = w
+        # Enjekte edilen karşı-şerit crossing kenarlarını TAMAMEN kaldır
+        # (adj_list + pred_list + edge_weights) → sızıntı yok. Düğümlere
+        # dokunma (her iki uç da mevcut şerit düğümü).
+        for (p1, p2) in (eklenen or []):
+            self.planner.remove_edge_directed(p1, p2)
+            self.planner.edge_weights.pop((p1, p2), None)
 
     # ==========================================
     #   ROTA HESAPLAMA
@@ -1625,13 +1714,21 @@ class HedefYoneticisi:
         goal_node = self.geo_targets_world[self.current_task_index]
         rospy.loginfo(f"[recalculate] {start_node} → {goal_node}")
 
-        # ── Rota arama (karar blokları ağırlık-şişirme ile; finally'de geri al) ──
+        # ── Rota arama (karar blokları: ağırlık-şişirme + karşı-şerit crossing
+        #    enjeksiyonu; finally'de geri al/kaldır). _graf_lock graf mutasyonunu
+        #    serialize eder (eşzamanlı recalc'lar ağırlık sızdırmasın). ──
         yaw0 = self.robot_yaw if self.robot_yaw is not None else 0.0
-        blok_saved = self._blok_uygula() if HEDEF_KOMUT_AKTIF else []
-        try:
-            path = self._rota_ara(start_node, goal_node, yaw0)
-        finally:
-            self._blok_geri_al(blok_saved)
+        with self._graf_lock:
+            blok_saved, blok_eklenen = (self._blok_uygula() if HEDEF_KOMUT_AKTIF
+                                        else ([], []))
+            if blok_eklenen:
+                rospy.loginfo_throttle(
+                    2.0, f"[slalom] {len(blok_eklenen)} karşı-şerit crossing "
+                         f"enjekte edildi (engel çevresi) → karşı şeritten reroute")
+            try:
+                path = self._rota_ara(start_node, goal_node, yaw0)
+            finally:
+                self._blok_geri_al(blok_saved, blok_eklenen)
 
         # ── Dönüş kalitesi (bisiklet modeli): en keskin dönüş + min dönüş yarıçapı ──
         max_donus_deg, min_yaricap = rota_donus_metrigi(path, yaw0)
