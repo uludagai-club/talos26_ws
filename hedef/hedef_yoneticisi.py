@@ -71,7 +71,47 @@ CEZA_BAGLANTI         = 8    # bağlantı/dönüş yolu (1.32x) — düz şeridi
 # Placeholder — DİNAMİK akış için, henüz hiçbir canlı kod yoluna BAĞLI DEĞİL
 # (karar↔hedef / control arayüzü gelince kullanılacak; şimdi değiştirmek bir şeyi etkilemez):
 CEZA_SERIT_DEGISTIRME = 15   # şerit değiştirme/sollama (1.6x) — karar-güdümlü
-CEZA_TERS_YON         = 90   # ters yön / geri sürüş (4.6x) — control
+CEZA_TERS_YON         = 90   # ters yön / geri sürüş (4.6x) — control (placeholder)
+
+# ── İki-yönlü durak erişimi ──────────────────────────────────────────────
+# Tek-yönlü graf, durağa kuş uçuşu yakınken aracı onca yolu dolaştırabiliyordu
+# (ör. (21,10)→durak_1: düz 19.8m ama tek-yön rota 61.5m loop; (33,-1)→durak_1
+# 86m). Çözüm: her durağın R_DURAK_M yarıçapındaki TÜM kenarlar (cep içi lane +
+# giriş/çıkış connection'ları) iki yönlü yapılır → durağa her iki uçtan girilebilir.
+# Ana tek-yön loop (A,B,C,...) bundan uzakta olduğu için DOKUNULMAZ; cep çıkmaz
+# yapı olduğundan iki yönlü olması ana trafiğe yeni geçiş rotası açmaz.
+# Ölçüm: (21,10) 61.5→31.3m, (33,-1) 86→6m. (Kullanıcı: "durağa illaki o
+# girişinden girmek gerekmez, iki yönlü de girilebilir".)
+IKI_YONLU_DURAK_AKTIF  = True
+R_DURAK_M              = 7.0    # durak goal'ünün bu yarıçapındaki kenarlar iki yönlü (m)
+
+# ── Bisiklet-modeli dönüş cezası (kolay-dönülebilir rota tercihi) ─────────
+# Keskin dönüşler açı + mesafe ile cezalanır (60°/3m ≫ 60°/10m). Yönlü-kenar
+# durumları üzerinde turn-aware arama (find_path_turn_aware): her köşede
+# Δθ (baş açısı değişimi) yerel mesafeye bölünür → eğrilik κ=Δθ/d → gereken
+# direksiyon δ=atan(L·κ). Yumuşak dönüş ucuz, keskin dönüş pahalı, U-dönüşü
+# (cusp) neredeyse yasak. Böylece iki-yönlü durakta DÖNÜLEBİLİR girişi seçer.
+TURN_AWARE_AKTIF       = True
+ARAC_DINGIL_M          = 1.86   # Bee1 dingil mesafesi (wheelbase, m)
+ARAC_MAX_DIREKSIYON    = math.radians(32.5)  # Bee1 maks teker açısı (iç, rad)
+DONUS_CEZA_AGIRLIK     = 1.5    # (δ/δ_max)² → dönüş cezası (m-eşdeğeri); yumuşak tercih
+DONUS_CEZA_MAX         = 4.0    # tek dönüş cezası üst sınırı (m) — büyük mesafe kazancını ezmesin
+DONUS_CUSP_ESIK        = math.radians(150)   # bu açının üstü U-dönüşü → ağır ceza (pratikte yasak)
+DONUS_CUSP_CEZA        = 1000.0 # cusp eşiği üstü dönüş için ek ceza (m)
+
+# ── Karar → hedef komutu (/hedef_komut) — sollama / kenar bloğu ───────────
+# karar (BT) sollamaya çıkınca engelin DÜNYA konumunu /hedef_komut ile yollar
+# (String: "komut;taraf;x;y;etiket;yaricap"). Komutlar: sollama / kenar_blok
+# (engeli blokla) · kenar_serbest (bloku kaldır) · replan (yalnız yeniden hesapla).
+# Hedef tarafı (plan §3.2): engeli SERT SİLMEZ — ağırlığını ŞİŞİRİR
+# (ceza_carpani(CEZA_TERS_YON), recalc'ta find_path öncesi uygula, finally'de
+# geri al) → alternatif varsa planlayıcı kenardan dolanır; yoksa düşük-bozulmayla
+# yine geçer (fail-safe). Sert silme Faz1-5 debounce'la çakışıp restore anında
+# aracı yanlış şeride sokabilirdi. Yanal manevranın kendisini control yapar;
+# hedef kapalı-döngüyü (engeli rota-körü tekrar üretmeme + dönüş zamanı) kapatır.
+HEDEF_KOMUT_AKTIF      = True
+BLOK_TTL_S             = 3.0    # sollama bloğu bu kadar sn tazelenmezse düşer (karar ~1s'de tazeler)
+BLOK_MARJIN_M          = 1.5    # blok yarıçapına eklenen pay (m): araç ön çıkıntısı + kenar uzunluğu
 
 
 def ceza_carpani(ceza_puani: float) -> float:
@@ -79,6 +119,75 @@ def ceza_carpani(ceza_puani: float) -> float:
     Puan 0-100'e clamp'lenir (dinamik akışta bozuk/aşırı çarpan oluşmasın)."""
     p = max(0.0, min(100.0, ceza_puani))
     return 1.0 + (p / 100.0) * CEZA_ETKI
+
+
+# ── Bisiklet-modeli dönüş cezası yardımcıları ────────────────────────────
+def _yon_farki(a: float, b: float) -> float:
+    """İki açının [-pi, pi] sarmalı MUTLAK farkı (rad)."""
+    return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
+
+
+def _nokta_segment_mesafe(px, py, ax, ay, bx, by) -> float:
+    """(px,py) noktasının [a,b] doğru parçasına en kısa mesafesi (m).
+    Engel bloğunun bir kenarı (a→b) kapsayıp kapsamadığını doğru ölçer
+    (orta-nokta yaklaşımı kısa kenarda engeli kaçırabilir)."""
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def bisiklet_donus_cezasi(dtheta: float, d_local: float) -> float:
+    """Bir köşedeki dönüşün bisiklet-modeli cezası (metre-eşdeğeri).
+    dtheta: baş açısı değişimi (rad, mutlak). d_local: dönüşün yayıldığı yerel
+    mesafe (m). Eğrilik κ=dtheta/d_local → gereken direksiyon δ=atan(L·κ).
+      • Yumuşak dönüş (δ küçük) → ucuz (oran²·ağırlık).
+      • Keskin dönüş (δ→δ_max) → pahalı ("kolay dönülebilir" rota tercih edilir).
+      • Aracın çevirebileceğinden keskin (δ>δ_max) → ağır ek ceza.
+      • Cusp (dtheta≥eşik, U-dönüşü) → DONUS_CUSP_CEZA (pratikte yasak).
+    Aynı açı kısa mesafede (60°/3m) uzun mesafeden (60°/10m) ÇOK daha pahalı."""
+    if dtheta < 1e-3:
+        return 0.0
+    if dtheta >= DONUS_CUSP_ESIK or d_local < 1e-3:
+        return DONUS_CUSP_CEZA
+    kappa = dtheta / d_local
+    delta = math.atan(ARAC_DINGIL_M * kappa)
+    oran = delta / ARAC_MAX_DIREKSIYON          # 0..~ (1 = maks direksiyon)
+    # Yumuşak, ÜST SINIRLI ceza: keskin dönüşü mesafeye göre cezalandırır ama
+    # tek bir dönüş büyük bir mesafe kazancını ezemez (DONUS_CEZA_MAX ile sınırlı).
+    # Gerçekten imkânsız U-dönüşleri yukarıdaki cusp bloğu yakalar.
+    return min(DONUS_CEZA_AGIRLIK * oran * oran, DONUS_CEZA_MAX)
+
+
+def rota_donus_metrigi(path, yaw0: float):
+    """Rota boyunca en keskin dönüş (derece) + min dönüş yarıçapı (m).
+    Köşe yerel mesafesi = komşu segmentlerin ortalaması (densify artefaktını
+    sönümler). yaw0: ilk segmente giriş dönüşü için aracın başlangıç yaw'ı."""
+    if not path or len(path) < 2:
+        return 0.0, float('inf')
+    max_deg = 0.0
+    min_r = float('inf')
+    prev_h = yaw0
+    prev_seg = None
+    for i in range(len(path) - 1):
+        dx, dy = path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]
+        seg = math.hypot(dx, dy)
+        if seg < 1e-9:
+            continue
+        h = math.atan2(dy, dx)
+        dtheta = _yon_farki(h, prev_h)
+        d_local = seg if prev_seg is None else 0.5 * (prev_seg + seg)
+        if math.degrees(dtheta) > max_deg:
+            max_deg = math.degrees(dtheta)
+        if dtheta > 1e-3:
+            r = d_local / dtheta
+            if r < min_r:
+                min_r = r
+        prev_h = h
+        prev_seg = seg
+    return max_deg, min_r
 
 
 # ==========================================
@@ -262,6 +371,82 @@ class DLitePlanner:
             curr = best_next
 
         return path if len(path) > 1 and curr == self.s_goal else None
+
+    # ── Turn-aware arama (bisiklet-modeli dönüş cezası) ─────────────
+    def find_path_turn_aware(self, start: tuple, goal: tuple,
+                             start_yaw: float = 0.0):
+        """Yönlü-kenar durumları üzerinde Dijkstra + bisiklet-modeli dönüş cezası.
+
+        Durum = (u, v): "v'ye u'dan gelindi" (u→v yönlü kenarı). Geçiş
+        (u,v)→(v,w) maliyeti = get_cost(v,w) + bisiklet_donus_cezasi(Δθ, d_yerel),
+        Δθ = giriş başı (u→v) ile çıkış başı (v→w) arasındaki açı. Başlangıç
+        durumları start'tan çıkan kenarlar (giriş dönüşü start_yaw'a göre).
+        Hedef: v == goal olan ilk (en ucuz) durum.
+
+        D* çekirdeği (find_path) DEĞİŞTİRİLMEZ — bu ayrı, temiz bir aramadır.
+        Pozitif maliyetli Dijkstra → optimal yol basittir (düğüm tekrarı yok).
+        Tüm kenar maliyetleri pozitif olduğundan ve graf küçük (≈700 kenar)
+        olduğundan ucuzdur."""
+        if start not in self.adj_list or goal not in self.adj_list:
+            rospy.logwarn(f"[turn-aware] start/goal graph'ta yok: {start} {goal}")
+            return None
+        if start == goal:
+            return [start]
+
+        def _dir(a, b):
+            return math.atan2(b[1] - a[1], b[0] - a[0])
+
+        pq = []                      # (g_cost, (u, v))
+        dist = {}                    # state → en iyi g_cost
+        came = {}                    # state → önceki state
+
+        # Başlangıç durumları: start'tan çıkan kenarlar (giriş dönüşü yaw'dan)
+        for w in self.adj_list.get(start, []):
+            d_out = self.dist(start, w)
+            dtheta = _yon_farki(_dir(start, w), start_yaw)
+            c = self.get_cost(start, w) + bisiklet_donus_cezasi(dtheta, d_out)
+            st = (start, w)
+            if c < dist.get(st, float('inf')):
+                dist[st] = c
+                came[st] = None
+                heapq.heappush(pq, (c, st))
+
+        goal_state = None
+        while pq:
+            g, (u, v) = heapq.heappop(pq)
+            if g > dist.get((u, v), float('inf')):
+                continue
+            if v == goal:
+                goal_state = (u, v)
+                break
+            d_in = self.dist(u, v)
+            h_in = _dir(u, v)
+            for w in self.adj_list.get(v, []):
+                if w == u:
+                    continue          # birebir geri dönüş (180° cusp) → atla
+                d_out = self.dist(v, w)
+                d_local = 0.5 * (d_in + d_out)
+                dtheta = _yon_farki(_dir(v, w), h_in)
+                nc = g + self.get_cost(v, w) + bisiklet_donus_cezasi(dtheta, d_local)
+                st = (v, w)
+                if nc < dist.get(st, float('inf')):
+                    dist[st] = nc
+                    came[st] = (u, v)
+                    heapq.heappush(pq, (nc, st))
+
+        if goal_state is None:
+            rospy.logwarn("[turn-aware] Yol bulunamadı.")
+            return None
+
+        # Geri iz sür: state zincirini düğüm dizisine çevir
+        states = []
+        st = goal_state
+        while st is not None:
+            states.append(st)
+            st = came.get(st)
+        states.reverse()
+        path = [states[0][0]] + [s[1] for s in states]
+        return path if len(path) > 1 and path[-1] == goal else None
 
 
 # ==========================================
@@ -853,6 +1038,12 @@ class HedefYoneticisi:
         # FIX: varildi_callback & konum_callback çakışmasını önler
         self._wp_lock = threading.Lock()
 
+        # ── Karar komutu (/hedef_komut) blok durumu ──────────────────
+        # Her blok: {x, y, r, taraf, t}. _komut_lock callback↔recalc çakışmasını önler.
+        self._bloklu_engeller = []
+        self._komut_lock      = threading.Lock()
+        self._son_aktif_blok  = 0   # TTL düşüşünde tek-sefer reroute tetiği için
+
         # ── Tanı logu (kalıcı; docker kapanınca host'ta kalır) ───────
         self.logger = None
         if HedefLogger is not None:
@@ -882,6 +1073,16 @@ class HedefYoneticisi:
                 ceza_ters_yon=CEZA_TERS_YON,
                 carpan_baglanti=round(ceza_carpani(CEZA_BAGLANTI), 3),
                 carpan_serit_deg=round(ceza_carpani(CEZA_SERIT_DEGISTIRME), 3),
+                iki_yonlu_durak=IKI_YONLU_DURAK_AKTIF,
+                r_durak_m=R_DURAK_M,
+                turn_aware=TURN_AWARE_AKTIF,
+                arac_dingil_m=ARAC_DINGIL_M,
+                arac_max_direksiyon_deg=round(math.degrees(ARAC_MAX_DIREKSIYON), 1),
+                donus_ceza_agirlik=DONUS_CEZA_AGIRLIK,
+                donus_cusp_esik_deg=round(math.degrees(DONUS_CUSP_ESIK), 1),
+                hedef_komut=HEDEF_KOMUT_AKTIF,
+                blok_ttl_s=BLOK_TTL_S,
+                carpan_ters_yon=round(ceza_carpani(CEZA_TERS_YON), 3),
             )
 
         # ── Planner ─────────────────────────────────────────────────
@@ -910,6 +1111,8 @@ class HedefYoneticisi:
 
         rospy.Subscriber('/konum',         Pose2D,        self.konum_callback)
         rospy.Subscriber('/gorev_durumu',  String,        self.varildi_callback)
+        if HEDEF_KOMUT_AKTIF:
+            rospy.Subscriber('/hedef_komut', String,       self.hedef_komut_callback)
 
         self.new_data_available = True
         print(f"{YESIL}>>> SİSTEM HAZIR. Bekleniyor: /konum{SIFIRLA}")
@@ -941,6 +1144,7 @@ class HedefYoneticisi:
                 self.planner.node_types[(pos[0], pos[1])] = data.get('type', 'intermediate')
                 self.pos_to_node[(pos[0], pos[1])] = node_name
 
+        edge_info: dict[tuple[tuple, tuple], tuple[str, float]] = {}
         for u, v, edge_data in G.edges(data=True):
             p1 = node_to_pos.get(u)
             p2 = node_to_pos.get(v)
@@ -963,13 +1167,14 @@ class HedefYoneticisi:
 
             # Add forward edge
             self.planner.add_edge(p1, p2, w_forward)
+            edge_info[(p1, p2)] = (etype, d)
 
-            # NOT: Ters/geri kenar D* grafına EKLENMİYOR (tek yönlü yapı korunur).
-            # Geri sürüş ve şerit değiştirme DİNAMİK: karar/control runtime'da
-            # karşı-şerit WP'sini ister; CEZA_TERS_YON / CEZA_SERIT_DEGISTIRME o
-            # akışta uygulanır. Eski "penalized reverse edge" yaklaşımı kaldırıldı
-            # (D* her hesaplamada ters şeritleri taşımasın diye — kullanıcı kararı).
-            #     self.planner.add_edge(p2, p1, w_reverse)
+            # NOT: Ana tek-yön loop (A,B,C,...) kenarlarının tersi grafa EKLENMEZ
+            # (tek yönlü yapı korunur). Durak çevresi iki yönlü yapımı
+            # _iki_yonlu_durak_ekle()'de (geo_targets kurulduktan SONRA) yapılır.
+
+        # edge_info'yu sakla → iki-yönlü durak adımı (goal'lar kurulunca) kullanır
+        self._edge_info = edge_info
 
         self._graph_loaded = True
         rospy.loginfo(
@@ -996,9 +1201,39 @@ class HedefYoneticisi:
 
         self.geo_targets_built = True
 
+        # ── İki-yönlü durak erişimi (goal'lar artık biliniyor) ──────────────
+        if IKI_YONLU_DURAK_AKTIF:
+            self._iki_yonlu_durak_ekle()
+
         # İlk konum zaten geldiyse hemen rota hesapla
         if self._ilk_konum_alindi and self.robot_x is not None:
             self.recalculate_path_from_robot()
+
+    def _iki_yonlu_durak_ekle(self) -> None:
+        """Her durak goal'ünün R_DURAK_M yarıçapındaki TÜM tek-yönlü kenarların
+        (cep içi lane + giriş/çıkış connection'ları) tersini ekler → durağa her
+        iki uçtan girilebilir. Ana tek-yön loop bu yarıçaptan uzakta olduğu için
+        dokunulmaz. Cep çıkmaz yapı → iki yönlü olması ana trafiğe yeni geçiş
+        rotası açmaz. Kalıcı (graf yüklemede bir kez); duraklar sabit."""
+        edge_info = getattr(self, "_edge_info", None)
+        if not edge_info or not self.geo_targets_world:
+            return
+        goals = list(self.geo_targets_world)
+        R = R_DURAK_M
+        n_eklendi = 0
+        for (p1, p2), (et, d) in list(edge_info.items()):
+            if (p2, p1) in edge_info:          # zaten çift yönlü → atla
+                continue
+            yakin = any(math.hypot(p1[0] - gx, p1[1] - gy) <= R and
+                        math.hypot(p2[0] - gx, p2[1] - gy) <= R
+                        for (gx, gy) in goals)
+            if yakin:
+                w = d * (ceza_carpani(CEZA_BAGLANTI) if et == 'connection'
+                         else ceza_carpani(CEZA_DUZ_SERIT))
+                self.planner.add_edge(p2, p1, w)
+                n_eklendi += 1
+        rospy.loginfo(f"[graph] İki-yönlü durak erişimi: {n_eklendi} ters kenar "
+                      f"eklendi (R={R}m, {len(goals)} durak).")
 
     # ==========================================
     #   CALLBACKLER
@@ -1032,6 +1267,19 @@ class HedefYoneticisi:
             return
 
         now = time.time()
+
+        # ── Karar bloğu TTL düşüşü → tek-sefer reroute (fail-safe) ───
+        # kenar_serbest gelmeden blok TTL'i dolarsa, eski bloklu rotada kalmayalım:
+        # aktif blok sayısı düştüyse bir kez yeniden hesapla (cooldown'lı).
+        if HEDEF_KOMUT_AKTIF:
+            aktif_blok = len(self._aktif_bloklar())
+            if (aktif_blok < self._son_aktif_blok
+                    and self.is_path_calculated
+                    and now - self.son_hesaplama_zamani > 2.0):
+                self.son_hesaplama_zamani = now
+                rospy.loginfo("[hedef_komut] blok TTL düştü → reroute (fail-safe)")
+                self.recalculate_path_from_robot(reason="blok_ttl")
+            self._son_aktif_blok = aktif_blok
 
         # ── Otomatik WP geçişi: hafif map-matching ──────────────────
         # FAZ3: tek-tek +1 yerine, aracın rotadaki yerini İLERİ pencerede
@@ -1196,9 +1444,153 @@ class HedefYoneticisi:
                 self._son_varildi_zamani = now
                 rospy.loginfo(f"[varildi] WP → {self.current_wp_index}")
 
+    def hedef_komut_callback(self, msg: String) -> None:
+        """karar → hedef komutu (/hedef_komut). String: "komut;taraf;x;y;etiket;yaricap".
+        sollama/kenar_blok → engeli blokla (ağırlık şişirme; recalc'ta uygulanır);
+        kenar_serbest → bloğu kaldır; replan → yalnız yeniden hesapla.
+        Aynı engelin sollama tazelemeleri (≈1s) sadece TTL'i günceller (reroute yok);
+        rota yalnız blok KÜMESİ değişince yeniden çizilir."""
+        try:
+            parcalar = msg.data.strip().split(';')
+            if not parcalar or not parcalar[0]:
+                return
+            komut = parcalar[0].strip().lower()
+            taraf = parcalar[1].strip().lower() if len(parcalar) > 1 else ""
+
+            def _f(i):
+                try:
+                    return float(parcalar[i])
+                except (IndexError, ValueError):
+                    return None
+
+            now = time.time()
+            kume_degisti = False
+
+            if komut in ('sollama', 'kenar_blok'):
+                ox, oy = _f(2), _f(3)
+                r = _f(5)
+                if ox is None or oy is None:
+                    return
+                if r is None or r <= 0.0:
+                    r = 1.0
+                with self._komut_lock:
+                    mevcut = self._yakin_blok_bul(ox, oy)
+                    if mevcut is not None:
+                        mevcut['t'] = now          # tazeleme → reroute yok
+                    else:
+                        self._bloklu_engeller.append(
+                            {'x': ox, 'y': oy, 'r': r, 'taraf': taraf, 't': now})
+                        kume_degisti = True
+            elif komut == 'kenar_serbest':
+                ox, oy = _f(2), _f(3)
+                with self._komut_lock:
+                    mevcut = (self._yakin_blok_bul(ox, oy)
+                              if ox is not None and oy is not None else None)
+                    if mevcut is not None:
+                        self._bloklu_engeller.remove(mevcut)
+                        kume_degisti = True
+                    elif self._bloklu_engeller:        # eşleşme yoksa hepsini temizle (güvenli)
+                        self._bloklu_engeller.clear()
+                        kume_degisti = True
+            elif komut == 'replan':
+                kume_degisti = True
+            else:
+                rospy.logwarn_throttle(5.0, f"[hedef_komut] bilinmeyen komut: {komut}")
+                return
+
+            if self.logger is not None:
+                with self._komut_lock:
+                    n_blok = len(self._bloklu_engeller)
+                self.logger.log_event("hedef_komut", komut=komut, taraf=taraf,
+                                      x=_f(2), y=_f(3), yaricap=_f(5),
+                                      n_blok=n_blok, kume_degisti=kume_degisti)
+
+            # Rota yalnız blok kümesi değiştiyse yeniden çizilir (tazeleme spam'i değil)
+            if kume_degisti and self.is_path_calculated:
+                rospy.loginfo(f"[hedef_komut] {komut} → reroute (blok kümesi değişti)")
+                self.recalculate_path_from_robot(reason=f"komut_{komut}")
+        except Exception as e:  # noqa: BLE001 — callback node'u çökertmesin
+            rospy.logwarn_throttle(5.0, f"[hedef_komut] işlenemedi: {e!r} (msg={msg.data!r})")
+
+    def _yakin_blok_bul(self, ox, oy, esik=2.0):
+        """(ox,oy)'ye `esik` m'den yakın mevcut bloğu döndürür (yoksa None).
+        ÇAĞIRAN _komut_lock'u tutmalı."""
+        for b in self._bloklu_engeller:
+            if math.hypot(b['x'] - ox, b['y'] - oy) <= esik:
+                return b
+        return None
+
+    def _aktif_bloklar(self):
+        """TTL içindeki blokları döndürür; süresi geçenleri listeden ayıklar."""
+        now = time.time()
+        with self._komut_lock:
+            taze = [b for b in self._bloklu_engeller if now - b['t'] <= BLOK_TTL_S]
+            if len(taze) != len(self._bloklu_engeller):
+                self._bloklu_engeller = taze
+            return [(b['x'], b['y'], b['r']) for b in taze]
+
+    def _blok_uygula(self):
+        """Aktif blokların yarıçapındaki kenarların AĞIRLIĞINI şişirir (sert silmez —
+        Faz1-5 debounce çakışmasın). Döndürdüğü (kenar, eski_w) listesi recalc
+        finally'sinde geri yüklenir → taban graf değişmeden kalır."""
+        saved = []
+        engeller = self._aktif_bloklar()
+        if not engeller:
+            return saved
+        carp = ceza_carpani(CEZA_TERS_YON)
+        for (p1, p2), w in list(self.planner.edge_weights.items()):
+            for (ox, oy, r) in engeller:
+                if _nokta_segment_mesafe(ox, oy, p1[0], p1[1], p2[0], p2[1]) <= r + BLOK_MARJIN_M:
+                    saved.append(((p1, p2), w))
+                    self.planner.edge_weights[(p1, p2)] = w * carp
+                    break
+        return saved
+
+    def _blok_geri_al(self, saved):
+        for (e, w) in saved:
+            self.planner.edge_weights[e] = w
+
     # ==========================================
     #   ROTA HESAPLAMA
     # ==========================================
+    def _rota_ara(self, start_node, goal_node, yaw0):
+        """Rota arama: turn-aware (bisiklet modeli) veya klasik forward-filtre.
+        Karar blokları (ağırlık şişirme) çağırandan ÖNCE uygulanıp sonra geri
+        alınır; bu fonksiyon güncel edge_weights üzerinden arar."""
+        if TURN_AWARE_AKTIF:
+            # Turn-aware arama: yönlü-kenar durumları üzerinde, her köşede
+            # δ=atan(L·Δθ/d) direksiyon cezasıyla. Başlangıç yaw'ından itibaren
+            # keskin dönüş/cusp pahalı → start'tan geri-yön çıkışı zaten cezalı;
+            # ayrı forward-filtre GEREKMEZ. İki-yönlü durakta yumuşak girişi seçer.
+            return self.planner.find_path_turn_aware(start_node, goal_node, yaw0)
+
+        # ── Klasik: ileri yönlü filtre + D* find_path (geçici kenar silme) ──
+        removed_fwd, removed_back = [], []
+        try:
+            if self.robot_yaw is not None:
+                neighbors = list(self.planner.adj_list.get(start_node, []))
+                candidates = []
+                for n in neighbors:
+                    dx, dy = n[0] - start_node[0], n[1] - start_node[1]
+                    if dx == 0 and dy == 0:
+                        continue
+                    diff = (math.atan2(dy, dx) - self.robot_yaw + math.pi) \
+                           % (2 * math.pi) - math.pi
+                    if abs(diff) > YON_FILTRE_ACIISI:
+                        candidates.append(n)
+                if len(candidates) < len(neighbors):
+                    for n in candidates:
+                        if self.planner.remove_edge_directed(start_node, n):
+                            removed_fwd.append(n)
+                        if self.planner.remove_edge_directed(n, start_node):
+                            removed_back.append(n)
+            return self.planner.find_path(start_node, goal_node)
+        finally:
+            for n in removed_fwd:
+                self.planner.restore_edge_directed(start_node, n)
+            for n in removed_back:
+                self.planner.restore_edge_directed(n, start_node)
+
     def recalculate_path_from_robot(self, reason: str = "?") -> None:
         if not self.geo_targets_world or not self.planner.nodes:
             rospy.logwarn("[recalculate] geo_targets veya planner.nodes boş!")
@@ -1233,43 +1625,19 @@ class HedefYoneticisi:
         goal_node = self.geo_targets_world[self.current_task_index]
         rospy.loginfo(f"[recalculate] {start_node} → {goal_node}")
 
-        # ── İleri yönlü filtre ──────────────────────────────────────
-        # FIX: her iki tarafı da güvenli sil + finally ile geri yükle
-        removed_fwd  = []   # start_node → n silinen kenarlar
-        removed_back = []   # n → start_node silinen kenarlar
-
+        # ── Rota arama (karar blokları ağırlık-şişirme ile; finally'de geri al) ──
+        yaw0 = self.robot_yaw if self.robot_yaw is not None else 0.0
+        blok_saved = self._blok_uygula() if HEDEF_KOMUT_AKTIF else []
         try:
-            if self.robot_yaw is not None:
-                neighbors = list(self.planner.adj_list.get(start_node, []))
-                candidates = []
-                for n in neighbors:
-                    # FIX: yön filtresi komşunun start_node'a göre yönüne bakmalı
-                    # (robot konumuna göre değil); aksi halde start robottan uzakken
-                    # geri-yön kenarları yanlış değerlendirilir.
-                    dx, dy = n[0] - start_node[0], n[1] - start_node[1]
-                    if dx == 0 and dy == 0:
-                        continue
-                    diff = (math.atan2(dy, dx) - self.robot_yaw + math.pi) \
-                           % (2 * math.pi) - math.pi
-                    if abs(diff) > YON_FILTRE_ACIISI:
-                        candidates.append(n)
-
-                # FIX: tüm komşular kaldırılacaksa filtreyi uygulama
-                if len(candidates) < len(neighbors):
-                    for n in candidates:
-                        if self.planner.remove_edge_directed(start_node, n):
-                            removed_fwd.append(n)
-                        if self.planner.remove_edge_directed(n, start_node):
-                            removed_back.append(n)
-
-            path = self.planner.find_path(start_node, goal_node)
-
+            path = self._rota_ara(start_node, goal_node, yaw0)
         finally:
-            # FIX: exception olsa bile kenarları geri yükle
-            for n in removed_fwd:
-                self.planner.restore_edge_directed(start_node, n)
-            for n in removed_back:
-                self.planner.restore_edge_directed(n, start_node)
+            self._blok_geri_al(blok_saved)
+
+        # ── Dönüş kalitesi (bisiklet modeli): en keskin dönüş + min dönüş yarıçapı ──
+        max_donus_deg, min_yaricap = rota_donus_metrigi(path, yaw0)
+        if path and max_donus_deg >= math.degrees(DONUS_CUSP_ESIK):
+            print(f"{SARI}>>> [DÖNÜŞ] rota maks dönüş {max_donus_deg:.0f}° "
+                  f"(min yarıçap {min_yaricap:.1f}m) — sıkışık!{SIFIRLA}")
 
         # ── Tanı logu: rota uzaktan mı çiziliyor? ───────────────────
         if self.logger is not None:
@@ -1297,6 +1665,19 @@ class HedefYoneticisi:
                 task_name=task_name, path=path, path_changed=path_changed,
                 weighted_cost=weighted,
             )
+            # Dönüş kalitesi izi (bisiklet modeli): rotanın en keskin dönüşü +
+            # min dönüş yarıçapı — turn-aware aramanın etkisi loglardan görülür.
+            if path:
+                self.logger.log_event(
+                    "donus_metrik", reason=reason,
+                    turn_aware=TURN_AWARE_AKTIF,
+                    iki_yonlu_durak=IKI_YONLU_DURAK_AKTIF,
+                    max_donus_deg=round(max_donus_deg, 1),
+                    min_yaricap_m=round(min_yaricap, 2),
+                    arac_min_yaricap_m=round(ARAC_DINGIL_M / math.tan(ARAC_MAX_DIREKSIYON), 2),
+                    bloklu_kenar=len(blok_saved),
+                    task_idx=self.current_task_index,
+                )
 
         if path:
             with self._wp_lock:
