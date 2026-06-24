@@ -37,12 +37,45 @@ from behaviors.decorators import Debounce
 
 def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     """Ağacı kur. `p` config/params.yaml içeriğidir."""
-    fresh = p["freshness"]
+    # ===================================================================
+    # AYAR BLOĞU — ENGEL / ŞERİT MESAFELERİ  (sahada hızlı tune için TEK YER)
+    # -------------------------------------------------------------------
+    # Tüm engel tepki bantları control.py WP_NEAR_DISTANCE referansından
+    # ± delta ile türetilir. Bir mesafeyi değiştirmek için: config/params.yaml
+    # içindeki ilgili anahtarı düzenle (yoksa buradaki default geçerli).
+    # Bant sırası (yakın → uzak):  acil < dur < block(commit) < yavasla
+    #   acil    ≈ 1.2 m  → acil durus (emniyetli son çare)
+    #   dur     ≈ 2.0 m  → kaçış yoksa tam dur
+    #   block   ≈ 6.0 m  → SLALOM/kaçışa (sol/sag) COMMIT menzili (§12.12: 3.5→6.0)
+    #   yavasla ≈ 9.0 m  → en dış: tepki başlar, yavaşla (commit üstü ~3m slow-zone)
+    # NOT: lane-change'in FİİLEN tamamlanması için block menzili Ackermann
+    #      yayına yetmeli. Golf-cart (L=1.78m, R≈3.08m) 1.79m yanalı GÜVENLE
+    #      açmak ~5-6m gerektirir (doc §12.12, run 165604) → commit 6m'ye çekildi.
+    #      Araç hâlâ engele giriyorsa engel_block_delta_m'i daha da BÜYÜT.
+    # ===================================================================
+    wp   = p.get("wp_planlama", {}) or {}
+    lc   = p["lane_change"]
     dist = p["distances"]
+
+    wp_near        = float(wp.get("control_wp_near_m",     1.5))   # = control.py WP_NEAR_DISTANCE (senkron tut!)
+    wp_hyst        = float(wp.get("aktif_wp_histerezis_m", 0.5))   # aktif WP segment geçiş histerezisi
+    kacis_deadband = float(wp.get("kacis_deadband_m",      0.7))   # rotaya bu kadar yakın engel = "merkez koni"
+    varsayilan_yon = str(  wp.get("varsayilan_kacis_yon", "sol"))  # merkez koni → bu yöne kaç (ters/karşı şerit)
+
+    engel_acil_m      = max(0.3, wp_near + float(wp.get("engel_acil_delta_m",    -0.3)))  # acil durus
+    engel_dur_m       =          wp_near + float(wp.get("engel_dur_delta_m",      0.5))   # kaçış yoksa dur
+    engel_block_m     =          wp_near + float(wp.get("engel_block_delta_m",    4.5))   # sol/sag SLALOM commit (§12.12: →6.0m)
+    engel_yavasla_m   =          wp_near + float(wp.get("engel_yavasla_delta_m",  7.5))   # en dış: yavasla (→9.0m)
+    engel_yan_clear_m = float(dist.get("engel_yan_clear_m", 3.0))  # yan sektör bu kadar boşsa lane-change makul
+
+    lc_cooldown_s = float(lc.get("cooldown_s",      4.0))   # ardışık şerit değişimi arası bekleme
+    lc_hold_s     = float(lc.get("maneuver_hold_s", 2.0))   # = control.py LANE_CHANGE_DURATION (manevra tut süresi)
+    # ===================================================================
+
+    fresh = p["freshness"]
     timer = p["timers"]
     deb = p["debounce"]
     emer = p["emergency"]
-    lc = p["lane_change"]
     sa = p.get("speed_adaptive", {})
     # Hız-uyumu kapalıysa gain'leri 0'la → eşikler tabanda kalır
     sa_on = bool(sa.get("enabled", False))
@@ -51,24 +84,6 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
 
     def _gain(key: str) -> float:
         return sa.get(key, 0.0) if sa_on else 0.0
-
-    # --- Engel tepki mesafeleri: control.py WP_NEAR_DISTANCE ± delta -------- #
-    # Kullanıcı isteği: "control'ün waypoint'e okey verdiği mesafeyi çekip onun
-    # üzerine +/- ile hesapla." Tüm engel bantları tek referanstan (wp_near)
-    # türetilir; böylece karar, control'ün WP geçiş eşiğiyle aynı dili konuşur.
-    #   acil   = wp_near - 0.3 = 1.2   (acil durus; emniyetli son çare)
-    #   dur    = wp_near + 0.5 = 2.0   (kaçış yoksa tam dur)
-    #   block  = wp_near + 2.0 = 3.5   (kaçışa commit menzili)
-    #   yavasla= wp_near + 4.5 = 6.0   (en dış: tepki başlar → yavaşla)
-    wp = p.get("wp_planlama", {}) or {}
-    wp_near = float(wp.get("control_wp_near_m", 1.5))
-    wp_hyst = float(wp.get("aktif_wp_histerezis_m", 0.5))
-    kacis_deadband = float(wp.get("kacis_deadband_m", 0.4))
-    varsayilan_yon = str(wp.get("varsayilan_kacis_yon", "sol"))
-    engel_acil_m = max(0.3, wp_near + float(wp.get("engel_acil_delta_m", -0.3)))
-    engel_dur_m = wp_near + float(wp.get("engel_dur_delta_m", 0.5))
-    engel_block_m = wp_near + float(wp.get("engel_block_delta_m", 2.0))
-    engel_yavasla_m = wp_near + float(wp.get("engel_yavasla_delta_m", 4.5))
 
     # ============================================================
     # 0. Safety: önce latch'i çözmeyi dene; çözüldüyse FAILURE
@@ -186,8 +201,8 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         KacisYonuSec(bb, deadband_m=kacis_deadband, wp_near_m=wp_near,
                      wp_hyst_m=wp_hyst, hedef_max_age_s=fresh["hedef_max_age_s"],
                      varsayilan_yon=varsayilan_yon),          # yönü yola göre seç (hep SUCCESS)
-        YanSektorBosSecilen(bb, dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
-        LaneChangeCooldownOk(bb, lc["cooldown_s"]),
+        YanSektorBosSecilen(bb, engel_yan_clear_m, fresh["engel_max_age_s"]),
+        LaneChangeCooldownOk(bb, lc_cooldown_s),
         KacisKarar(bb),                                       # sol/sag + cooldown/yön damgala
     ])
     engel_dur = Sequence("EngelDur", memory=False, children=[
@@ -221,7 +236,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     #     Emergency/yaya/dur-levhası/kırmızı bu dalın ÜZERİNDE → her zaman önceliklidir.
     # ============================================================
     lane_change_hold = Sequence("LaneChangeHold", memory=False, children=[
-        LaneChangeInProgress(bb, lc.get("maneuver_hold_s", 2.0)),
+        LaneChangeInProgress(bb, lc_hold_s),
         HoldLaneChange(bb),
     ])
 
@@ -231,14 +246,14 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     direction_right = Sequence("DirectionRight", memory=False, children=[
         LevhaFresh(bb, fresh["levha_max_age_s"]),
         LevhaIcindeMesafe(bb, "SAG", dist["yon_levha_max_m"]),
-        LaneChangeCooldownOk(bb, lc["cooldown_s"]),
+        LaneChangeCooldownOk(bb, lc_cooldown_s),
         LaneChangeStamp(bb, "sag"),
         SetKarar("Karar=SAG(levha)", bb, karar="sag", reason="yon_levhasi_sag"),
     ])
     direction_left = Sequence("DirectionLeft", memory=False, children=[
         LevhaFresh(bb, fresh["levha_max_age_s"]),
         LevhaIcindeMesafe(bb, "SOL", dist["yon_levha_max_m"]),
-        LaneChangeCooldownOk(bb, lc["cooldown_s"]),
+        LaneChangeCooldownOk(bb, lc_cooldown_s),
         LaneChangeStamp(bb, "sol"),
         SetKarar("Karar=SOL(levha)", bb, karar="sol", reason="yon_levhasi_sol"),
     ])

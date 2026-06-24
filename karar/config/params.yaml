@@ -1,5 +1,36 @@
 # TALOS karar_bt parametreleri.
 # Eşikler ve zamanlamalar tek noktada tutulur — sahada hızlı tune için.
+#
+# ===========================================================================
+#  KARAR PARAMETRE ÖZETİ — TÜM KARAR EŞİKLERİ TEK BAKIŞTA
+#  (efektif değerler; gerçek anahtarlar aşağıdaki bölümlerde — burası ÖZET)
+# ===========================================================================
+#  Karar çıktıları: normal | slow | sol | sag | dur | acildurus  → /karar
+#
+#  ENGEL / SLALOM bantları (engel rotada, ileri mesafe; yakın→uzak):
+#    acildurus .... 1.2 m   tam fren, son çare        [wp_near-0.3]
+#    dur .......... 2.0 m   kaçış YOKSA tam dur        [wp_near+0.5]
+#    sol/sag ...... 6.0 m   SLALOM/kaçışa COMMIT       [wp_near+4.5]  ← §12.12: 3.5→6.0
+#    yavasla ...... 9.0 m   en dış: tepki başlar       [wp_near+7.5]  ← §12.12: 6.0→9.0
+#    (wp_near = 1.5 m = control.py WP_NEAR_DISTANCE — senkron tut)
+#    (hıza-duyarlı: yavasla bandı hız×0.4 sn, +6 m'ye kadar büyür)
+#
+#  SLALOM commit neden 6 m? Golf-cart L=1.78 m, R≈3.08 m → 1.79 m yanal
+#    açmak GÜVENLE ~5-6 m gerektirir (run 165604 kanıtı, doc §12.12).
+#    Mesafe = en sağlam pay; control yanal-offset tuning'i ancak bunu
+#    marjinal-feasible yapıyordu. 3.5 m'de araç engele tıkanıp acil-dur'a düşüyordu.
+#
+#  YAYA bantları:        acil 2.0 m · dur 4.0 m · yavas 12.0 m
+#  LEVHA:                dur-levhası 3.5 m · okuma 10.0 m · yön-levha 5.0 m
+#  SOLLAMA (/hedef_komut): yanal 1.8 m · geri-dönüş açısı 20° · clearance 2.0 m
+#                          zaman aşımı 15 s · tazeleme 1.0 s
+#  ŞERİT DEĞİŞİMİ:       cooldown 4.0 s · manevra-tut 2.0 s (=control LANE_CHANGE_DURATION)
+#  ARAÇ GEOMETRİSİ:      wheelbase 1.78 m · max direksiyon 30°  (control.py ile eşit)
+#  DÖNGÜ:                10 Hz · DUR levhası bekleme 3.0 s · acil mühür çözme 8 tick
+#
+#  Sahiplik: karar/ = Enes (bu dosya). control_wp_near_m / wheelbase / max_steer
+#  control.py ile ELLE aynalı (programatik bağ yok → biri değişirse diğerini güncelle).
+# ===========================================================================
 
 tick_hz: 10.0
 
@@ -33,15 +64,15 @@ distances:
 # böylece karar ile control aynı "aktif waypoint" eşiğini paylaşır.
 #   acil    = wp_near + (-0.3) = 1.2 m   (acil durus)
 #   dur     = wp_near + ( 0.5) = 2.0 m   (kaçış yoksa tam dur)
-#   block   = wp_near + ( 2.0) = 3.5 m   (kaçışa commit menzili)
-#   yavasla = wp_near + ( 4.5) = 6.0 m   (en dış: tepki başlar → yavaşla)
+#   block   = wp_near + ( 4.5) = 6.0 m   (SLALOM/kaçışa commit — §12.12: 3.5→6.0)
+#   yavasla = wp_near + ( 7.5) = 9.0 m   (en dış: tepki başlar → yavaşla; commit'in üstünde ~3m slow-zone)
 # DİKKAT: control_wp_near_m, control.py WP_NEAR_DISTANCE ile EŞİT TUTULMALI.
 wp_planlama:
   control_wp_near_m:     1.5    # = control.py WP_NEAR_DISTANCE (senkron tut!)
   engel_acil_delta_m:   -0.3
   engel_dur_delta_m:     0.5
-  engel_block_delta_m:   2.0
-  engel_yavasla_delta_m: 4.5
+  engel_block_delta_m:   4.5    # SLALOM/kaçış commit = wp_near+4.5 = 6.0 m (§12.12: golf-cart geometrisi 1.79m yanal için ~6m gerek)
+  engel_yavasla_delta_m: 7.5    # en dış tepki = wp_near+7.5 = 9.0 m (commit'in 3m üstünde slow-zone)
   aktif_wp_histerezis_m: 0.5    # robot wp1'e (wp_near + bu) kadar yaklaştıysa wp1→wp2 segmentine geç
   kacis_deadband_m:      0.7    # engel rotaya bu kadar yakınsa "merkez" (blok eden koni) → geçiş şeridine (varsayilan_kacis_yon). Canlı koni ~0.23m ölçüldü, marj bırakıldı.
   varsayilan_kacis_yon:  sol    # belirsizlikte tercih (ters/karşı şerit genelde sol)

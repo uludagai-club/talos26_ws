@@ -524,27 +524,30 @@ def run_scenarios():
     assert_karar("S30", "dur")
 
     # -----------------------------------------------------------------
-    # S31: KATMANLI — engel yavasla bandında (5m, block 3.5'in dışında) → yavasla
+    # S31: KATMANLI — engel yavasla bandında (7.5m, block 6.0'ın dışında) → yavasla
+    #      §12.12: block(commit) 3.5→6.0, yavasla 6.0→9.0. 7.5m commit'in dışı,
+    #      yavasla'nın içi → slow (kaçışa commit etmeden yaklaş).
     # -----------------------------------------------------------------
-    print("\nS31: Engel 5m (yavasla bandı, kaçışa daha var) → slow")
+    print("\nS31: Engel 7.5m (yavasla bandı, kaçışa daha var) → slow")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.engel_present = True
-    bb.obs.engel_d_center = 5.0
-    bb.obs.engel_d_overall = 5.0
+    bb.obs.engel_d_center = 7.5
+    bb.obs.engel_d_overall = 7.5
     for _ in range(n_engel):
         fresh_now(bb); tree.tick()
     assert_karar("S31", "slow")
 
     # -----------------------------------------------------------------
-    # S32: Engel yavasla bandının DIŞINDA (7m > 6m) → normal (over-trigger yok)
+    # S32: Engel yavasla bandının DIŞINDA (11m > 9m) → normal (over-trigger yok)
+    #      §12.12: yavasla 6.0→9.0; 11m hâlâ bandın dışında olmalı.
     # -----------------------------------------------------------------
-    print("\nS32: Engel 7m (banttan uzak) → normal")
+    print("\nS32: Engel 11m (banttan uzak) → normal")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.engel_present = True
-    bb.obs.engel_d_center = 7.0
-    bb.obs.engel_d_overall = 7.0
+    bb.obs.engel_d_center = 11.0
+    bb.obs.engel_d_overall = 11.0
     for _ in range(n_engel):
         fresh_now(bb); tree.tick()
     assert_karar("S32", "normal")
