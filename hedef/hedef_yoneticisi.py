@@ -49,6 +49,12 @@ ENABLE_GUI          = True   # Matplotlib penceresi (False = headless/penceresiz
 
 # ── Start seçimi & sapma / reroute (Faz 1-5) ─────────────────────────────
 ILERI_MESAFE_M      = 2.0    # start + sapma "burun" noktası: aracın yaw yönünde bu kadar ileri (m)
+# BLOK (sollama/kenar_blok) aktifken start ileri-projeksiyonu: 0 → path aracın
+# GERÇEK konumundan başlar. Aksi halde 2m ileri-projeksiyon, aracın o anki
+# konumundaki karşı-şerit GİRİŞ crossing'ini atlayıp girişi engele ~2m yaklaştırır
+# → yanal manevra cone'da tamamlanmaz, açıklık engelin İLERİSİNDE oluşur
+# (engel geç algılanırsa açıklık ~0 → çarpma). Blokta lead-in kritik → 0.
+ILERI_MESAFE_BLOK_M = 0.0    # blok aktifken start ileri-projeksiyonu (m); lead-in için 0
 SAPMA_ESIK_METRE    = 2.5    # burun en yakın WP'den bu kadar uzaksa → reroute (debounce sonrası) (m)
 SAPMA_TEMIZ_METRE   = 1.5    # histerezis: burun bu kadarın ALTINA inince sayaç sıfırlanır (band 1.5..2.5) (m)
 SAPMA_DEBOUNCE_SURE = 1.5    # sapma reroute için bu kadar saniye KESİNTİSİZ süregelmeli (s)
@@ -1101,6 +1107,7 @@ class HedefYoneticisi:
             self.logger.log_event(
                 "config",
                 ILERI_MESAFE_M=ILERI_MESAFE_M,
+                ILERI_MESAFE_BLOK_M=ILERI_MESAFE_BLOK_M,
                 SAPMA_ESIK_METRE=SAPMA_ESIK_METRE,
                 SAPMA_TEMIZ_METRE=SAPMA_TEMIZ_METRE,
                 SAPMA_DEBOUNCE_SURE=SAPMA_DEBOUNCE_SURE,
@@ -1747,12 +1754,18 @@ class HedefYoneticisi:
         rx, ry = self.robot_x, self.robot_y
 
         # ── Yaw forward-projection start seçimi (Samed'in eski sürümünden) ──
-        # Aracın ÖNÜNDE (yaw yönünde) ILERI_MESAFE_M ileride sanal bir nokta
-        # hesapla, start düğümünü O noktaya en yakın düğüm yap. Böylece rota
-        # aracın BAKTIĞI yöne göre başlar (yaw'a göre döner) — salt mesafe değil.
+        # Aracın ÖNÜNDE (yaw yönünde) ileride sanal bir nokta hesapla, start
+        # düğümünü O noktaya en yakın düğüm yap. Böylece rota aracın BAKTIĞI yöne
+        # göre başlar (yaw'a göre döner) — salt mesafe değil.
+        # BLOK aktifken ileri-projeksiyon 0'a iner: 2m ileri-okuma, aracın o anki
+        # konumundaki karşı-şerit GİRİŞ crossing'ini atlayıp girişi engele
+        # yaklaştırıyordu (yanal açıklık engelin ilerisinde oluşuyordu, engel geç
+        # algılanırsa çarpma). Blokta lead-in kritik → path gerçek konumdan başlasın.
+        _bloklu = bool(HEDEF_KOMUT_AKTIF and self._aktif_bloklar())
+        _ileri = ILERI_MESAFE_BLOK_M if _bloklu else ILERI_MESAFE_M
         if self.robot_yaw is not None:
-            front_x = rx + ILERI_MESAFE_M * math.cos(self.robot_yaw)
-            front_y = ry + ILERI_MESAFE_M * math.sin(self.robot_yaw)
+            front_x = rx + _ileri * math.cos(self.robot_yaw)
+            front_y = ry + _ileri * math.sin(self.robot_yaw)
         else:
             front_x, front_y = rx, ry
 
