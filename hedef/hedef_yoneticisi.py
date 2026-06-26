@@ -1831,55 +1831,18 @@ class HedefYoneticisi:
 
     def _sapma_reroute_bastir(self):
         """Sapma (deviation) reroute'u bastırılmalı mı? Sebebi (str) döndürür, yoksa None.
-          (A) "sollama_aktif": aktif duba bloğu var (sollama ortası, araç bilerek şerit
-              dışında — sol şeritte). Reroute karşı-şerit start'ından sürülemez (~0.8m
-              yarıçap) rota üretir; committed overtake path (A→B→A) korunmalı. Latch'li
-              blok viraja gelince düşünce sapma normale döner (canlı 185629Z @18:57:00).
-          (B) "ters_yon_start": blok yok ama start çıkışı U-dönüşü (karşı şeritte takılı).
-        (A) yaw geometriden bağımsız → dönüş ortasını (yaw~49°) da yakalar; (B) salt
-        geometrik olduğu için kaçırıyordu (REVİZYON 5'in genişletilmiş hâli)."""
+        TEK sebep — "sollama_aktif": aktif duba bloğu var (sollama ortası, araç bilerek
+        şerit dışında — sol şeritte). Bu konumdan reroute, karşı-şerit start'ından dar/
+        sürülemez (~0.8m yarıçap, canlı 185629Z @18:57:00) rota üretir; committed overtake
+        path (A→B→A) korunmalı. Latch'li blok viraja gelince düşünce sapma normale döner.
+        NOT: Eski "ters_yon_start" (başlangıç-düğümü U-dönüşü tahmini) KALDIRILDI →
+        çıktı cusp kapısı (recalc'ta, gerçek rotada cusp varsa COMMIT ETME) onu tetikleyiciden
+        BAĞIMSIZ ve daha sağlam kapsıyor (dokümante 141631Z vakası max-dönüş 167°=cusp idi).
+        sollama_aktif ise gerek var: o rota cusp değil ama dar (61°/0.8m) olabiliyor →
+        çıktı kapısı kesmez, bu girdi guard'ı keser."""
         if HEDEF_KOMUT_AKTIF and self._son_aktif_blok > 0:
             return "sollama_aktif"
-        if self._ters_yon_start_riski():
-            return "ters_yon_start"
         return None
-
-    def _ters_yon_start_riski(self) -> bool:
-        """SAPMA reroute'unu tetiklemeden ÖNCE kontrol: aracın o anki konumunda
-        seçilecek start düğümünden ileri çıkış ancak U-DÖNÜŞÜYLE mümkün mü (ters-yön)?
-        Slalom sırasında araç karşı şeride (tek-yön TERS lane) geçince start o şeridin
-        düğümüne snap olur; oranın forward kenarları aracın yaw'ına ~180° ters → recalc
-        sürülemez saçma rota üretir (canlı: min_yaricap 0.6m, max-dönüş 167°, araç yoldan
-        çıktı). True → SAPMA reroute YAPMA, committed slalom path'i koru (A→B→A zaten
-        döner). Araç ileri şeride dönünce guard kalkar → sapma normal çalışır.
-        Bu, kenar_serbest off-road fix'inin (REVİZYON 4) SAPMA yoluna genişletilmiş hâli;
-        YALNIZ sapma için — blok (kenar_blok) reroute'u etkilenmez.
-        NOT: `_aktif_bloklar()` çağrısı yan etkili — TTL'i geçmiş blokları ayıklar.
-        Guard base adj_list'i (SERT blokla geçici silinen kenarları DEĞİL) okur;
-        amacı 'blok var mı' değil 'çıkış U-dönüşü mü' olduğundan bu doğru."""
-        if self.robot_yaw is None:
-            return False
-        rx, ry = self.robot_x, self.robot_y
-        # _aktif_bloklar _komut_lock alır → _graf_lock'tan ÖNCE çağır (nesting yok).
-        _ileri = (ILERI_MESAFE_BLOK_M if (HEDEF_KOMUT_AKTIF and self._aktif_bloklar())
-                  else ILERI_MESAFE_M)
-        fx = rx + _ileri * math.cos(self.robot_yaw)
-        fy = ry + _ileri * math.sin(self.robot_yaw)
-        # Graf okuması _graf_lock altında: hedef_komut_callback thread'i recalc'ta
-        # blok mutasyonu (kenar sil/enjekte) yaparken nodes/adj_list yarışmasın.
-        with self._graf_lock:
-            if not self.planner.nodes:
-                return False
-            start = min(self.planner.nodes,
-                        key=lambda n: (n[0] - fx) ** 2 + (n[1] - fy) ** 2)
-            nbrs = [n for n in self.planner.adj_list.get(start, []) if n != start]
-        if not nbrs:
-            return True   # çıkışsız düğüm → reroute saçma/yarım rota olur
-        # start'tan çıkan forward kenarların aracın yaw'ına göre EN KÜÇÜK başlangıç
-        # dönüşü cusp eşiğini aşıyorsa → tüm çıkışlar U-dönüşü gerektiriyor = ters-yön.
-        min_turn = min(_yon_farki(math.atan2(n[1] - start[1], n[0] - start[0]),
-                                  self.robot_yaw) for n in nbrs)
-        return min_turn >= DONUS_CUSP_ESIK
 
     def _engel_rotada(self, path, engeller):
         """Aktif engellerden HERHANGİ biri verilen (bloksuz baseline) rotanın
@@ -2325,6 +2288,24 @@ class HedefYoneticisi:
             print(f"{SARI}>>> [DÖNÜŞ] rota maks dönüş {max_donus_deg:.0f}° "
                   f"(min yarıçap {min_yaricap:.1f}m) — sıkışık!{SIFIRLA}")
 
+        # ── ÇIKTI KAPISI: sürülemez (cusp/U-dönüşü) rotayı COMMIT ETME ──
+        # Kullanıcı (2026-06-26): "araç buna uymasa da yine de hatalı rota çizmemeli."
+        # Tetikleyiciyi tahmin etmek (girdi-tarafı guard'lar) yerine ÇIKTIYI denetle:
+        # rota bir cusp (≥DONUS_CUSP_ESIK ~150° tek dönüş = U-dönüşü) içeriyorsa ve elde
+        # KORUNACAK committed path varsa → çizme, eskisini koru. Cusp net sinyaldir:
+        # meşru rotalar (düz takip, geçerli sollama) <150°; cusp yalnız araç kötü konumda
+        # (karşı şeritte) reroute zorlandığında çıkar (canlı 141631Z max-dönüş 167°,
+        # off-road). Tetikleyiciden BAĞIMSIZ → eski _ters_yon_start_riski (başlangıç-düğümü
+        # tahmini) yerine GERÇEK rotayı keser. İlk rota (committed yok) daima kabul edilir
+        # (yoksa araç hiç başlamaz; engele yaklaşırsa control e-stop güvenlik ağı).
+        rota_reddedildi = False
+        if path and self.full_path_world and max_donus_deg >= math.degrees(DONUS_CUSP_ESIK):
+            rota_reddedildi = True
+            rospy.logwarn_throttle(
+                2.0, f"[rota] SÜRÜLEMEZ rota reddedildi (maks dönüş {max_donus_deg:.0f}° "
+                     f"≥ cusp; min yarıçap {min_yaricap:.2f}m) → committed path korunuyor "
+                     f"({reason})")
+
         # ── Tanı logu: rota uzaktan mı çiziliyor? ───────────────────
         if self.logger is not None:
             try:
@@ -2364,15 +2345,19 @@ class HedefYoneticisi:
                     bloklu_kenar=len(blok_saved),
                     blok_sert=BLOK_SERT_AKTIF,
                     fallback_bloksuz=fallback_bloksuz,
+                    rota_reddedildi=rota_reddedildi,
                     task_idx=self.current_task_index,
                 )
 
-        if path:
+        if path and not rota_reddedildi:
             with self._wp_lock:
                 self.full_path_world   = path
                 self.current_wp_index = 0
                 self.is_path_calculated = True
             print(f"{YESIL}>>> [ROTA] {len(path)} WP oluşturuldu.{SIFIRLA}")
+        elif rota_reddedildi:
+            # committed path KORUNUR (overwrite yok) → araç eski sürülebilir rotayı sürer.
+            print(f"{SARI}>>> [ROTA] sürülemez rota reddedildi, committed path korundu.{SIFIRLA}")
         else:
             print(f"{KIRMIZI}!!! [HATA] Rota bulunamadı! "
                   f"{start_node} → {goal_node}{SIFIRLA}")
