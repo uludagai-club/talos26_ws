@@ -18,6 +18,7 @@ from tf.transformations import euler_from_quaternion
 
 from bb import Blackboard
 from obstacle_fusion import ObstacleFusionParams, fuse_obstacles
+from obstacle_memory import ObstacleMemory, MemParams
 
 try:
     from cart_sim.msg import Decision as DecisionMsg
@@ -48,13 +49,26 @@ class RosBridge:
         self._inv_left = -1.0 if bool(oc.get("invert_left", False)) else 1.0
         self._new_obs_last = 0.0   # /obstacles/poses son geliş zamanı (failover için)
 
+        # --- Duba DÜNYA-konum hafızası (dropout köprüsü) ---
+        # Detektör kareyi düşürünce konfirme dubayı gövde-frame'e geri-projekte edip
+        # füzyon girdisine enjekte eder → "lidar veri vermese bile duba orada".
+        # Pose (x,y,yaw) bu tazelikten eski ise hafıza atlanır (lokalizasyon yoksa
+        # sahte konum üretme). bkz obstacle_memory.py (canlı teşhis 2026-06-26).
+        mc = oc.get("memory", {}) or {}
+        self._obs_mem = (ObstacleMemory(MemParams.from_cfg(mc))
+                         if bool(mc.get("enabled", True)) else None)
+        self._odom_max_age_s = float(
+            (params.get("freshness", {}) or {}).get("odom_max_age_s", 0.5))
+
         # --- Subscribers (yalnız okuma) ---
         rospy.Subscriber("/trafik_levha", String, self._on_levha, queue_size=10)
         rospy.Subscriber("/yaya_gecidi",   String, self._on_yaya,   queue_size=10)
 
         # YENI engel arayüzü: talos_obstacle_detector → /obstacles/poses (PoseArray)
         if self._obs_source in ("auto", "poses"):
-            rospy.Subscriber("/obstacles/poses", PoseArray, self._on_obstacles_poses, queue_size=5)
+            # queue_size=1: hafıza köprüsü dünya konumunu GÜNCEL pozla hesaplıyor →
+            # birikmiş bayat PoseArray güncel pozla işlenirse iz kayar (/incele performans).
+            rospy.Subscriber("/obstacles/poses", PoseArray, self._on_obstacles_poses, queue_size=1)
 
         # ESKI skaler engel arayüzü (auto: yeni kaynak yoksa devreye girer)
         if self._obs_source in ("auto", "legacy"):
@@ -154,6 +168,20 @@ class RosBridge:
                 continue
             points.append((fwd, lat, 0.0))  # PoseArray boyut taşımaz → half_width=0
 
+        # Hafıza köprüsü: pose taze ise konfirme dubaları dropout'ta yeniden enjekte et.
+        # Pose lock altında tutarlı okunur; update() try/except'le sarılı → odom NaN/
+        # math hatası callback'i çökertip engel körlüğü yapmasın (/incele güvenlik Yüksek).
+        n_mem = 0
+        if self._obs_mem is not None:
+            rx, ry, ryaw, odom_ts = self.bb.read_pose()
+            pose_fresh = (odom_ts > 0.0 and (now - odom_ts) <= self._odom_max_age_s)
+            if pose_fresh:
+                try:
+                    points, stats = self._obs_mem.update(points, rx, ry, ryaw, now)
+                    n_mem = stats["injected"]
+                except Exception as e:
+                    rospy.logwarn_throttle(2.0, f"[karar_bt] obstacle_memory hata: {e}")
+
         fused = fuse_obstacles(points, self._fusion_p)
         self._new_obs_last = now
         self.bb.write(
@@ -164,7 +192,8 @@ class RosBridge:
             engel_d_right=fused.d_right,
             engel_angle_deg=fused.angle_deg,
             engel_count=fused.count,
-            engel_source="poses",
+            engel_mem_count=n_mem,
+            engel_source="poses+mem" if n_mem > 0 else "poses",
             engel_last_seen=now,
             engel_left_last_seen=now,
             engel_right_last_seen=now,

@@ -41,8 +41,9 @@ class Observations:
     engel_last_seen: float = 0.0
     engel_left_last_seen:  float = 0.0   # yan sektör ayrı tazelik (lane-change güvenliği)
     engel_right_last_seen: float = 0.0
-    engel_source: str = "none"           # "poses" (yeni detektör) | "legacy" | "none" — debug
+    engel_source: str = "none"           # "poses" (yeni detektör) | "poses+mem" | "legacy" | "none" — debug
     engel_count: int = 0                 # ileri bakış içindeki engel sayısı — debug
+    engel_mem_count: int = 0             # bu tick hafızadan enjekte edilen duba sayısı (dropout köprüsü) — debug
 
     # --- Şerit ---
     lane_offset_px: float = 0.0
@@ -130,6 +131,17 @@ class Blackboard:
             for k, v in kw.items():
                 setattr(self.obs, k, v)
 
+    def read_pose(self) -> tuple:
+        """(x, y, yaw, odom_last_seen) — lock altında TUTARLI okuma.
+
+        _on_odom (arka iplik) bu dört alanı birlikte write() ile yazar; başka bir
+        callback (ör. ros_bridge memory köprüsü) lock'suz üç ayrı okursa yarı-yazılmış
+        poz (x_eski, yaw_yeni) yakalayabilir → yanlış dünya konumu (/incele ROS+güvenlik).
+        """
+        with self._lock:
+            o = self.obs
+            return (o.x, o.y, o.yaw, o.odom_last_seen)
+
     def snapshot(self) -> dict:
         """Debug/logging için anlık özet (JSON'a çevrilebilir)."""
         o = self.obs
@@ -146,6 +158,7 @@ class Blackboard:
                 "age_s": _age(o.engel_last_seen),
                 "source": o.engel_source,
                 "count": o.engel_count,
+                "mem": o.engel_mem_count,
             },
             "speed_kmh": o.speed_kmh,
             "state": {

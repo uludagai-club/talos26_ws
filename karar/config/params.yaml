@@ -27,6 +27,9 @@
 #  LEVHA:                dur-levhası 3.5 m · okuma 10.0 m · yön-levha 5.0 m
 #  CONE REROUTE (/hedef_komut kenar_blok): blok yarıçapı 1.0 m · zaman aşımı 15 s
 #                          · tazeleme 1.0 s · serbest-bırakma 5 tick (~0.5 s)
+#  DUBA HAFIZASI (dropout köprüsü): konfirme 3 hit + ≤7 m yaklaşma · tut 3 s ·
+#                          mutlak tavan 12 s · geçince düş (gövde ileri < -1.5 m)
+#                          → detektör kareyi düşürse de duba "orada" sayılır (anti flip-flop)
 #  ŞERİT DEĞİŞİMİ (levha):cooldown 4.0 s · manevra-tut 2.0 s (=control LANE_CHANGE_DURATION)
 #  ARAÇ GEOMETRİSİ:      wheelbase 1.78 m · max direksiyon 30°  (control.py ile eşit)
 #  DÖNGÜ:                10 Hz · DUR levhası bekleme 3.0 s · acil mühür çözme 8 tick
@@ -155,6 +158,28 @@ obstacle:
   axis_left: y                  # x | y | z  → "sol" hangi eksen
   invert_forward: false
   invert_left: false
+
+  # Duba DÜNYA-konum hafızası (dropout köprüsü) — obstacle_memory.py
+  # Detektör duba ~3m önümüzdeyken bile kareyi düşürünce engel_d_center boşalıyor
+  # → reroute flip-flop ("cone_temiz" her ~1s, karar bir kez cruise'a düştü; canlı
+  # teşhis manuel_103648Z, 2026-06-26). Hafıza: konfirme dubayı (yeterli hit +
+  # yaklaşıldı) gövde-frame'e geri-projekte edip füzyona enjekte eder → "lidar veri
+  # vermese bile o duba orada". Geçilince/timeout'ta düşer (doğal serbest bırakma).
+  memory:
+    enabled: true
+    assoc_radius_m:        1.5   # canlı nokta bu kadar yakınsa aynı duba (iz)
+    confirm_hits:          3     # bu kadar tick eşleşince (+yaklaşma) konfirme (~0.3s @10Hz)
+    confirm_approach_m:    9.0   # iz en az bir kez bu menzile girmiş olmalı ("yaklaştı"); =yavasla
+                                 #   bandı → reroute(6m)'den ÖNCE konfirme (ani-beliren dubada marj)
+    memory_ttl_s:          3.0   # konfirme iz canlı algı olmadan bu kadar tutulur
+    unconfirmed_ttl_s:     0.8   # konfirme olmamış iz bu süre algılanmazsa düşer (FP temizliği)
+    max_memory_s:         12.0   # mutlak tavan — YALNIZ hafızayla tutulan ize (canlı izi düşürmez)
+    inject_forward_min_m:  0.3   # yalnız bu kadar ÖNDE iz enjekte edilir
+    hold_forward_max_m:   14.0   # bu menzilden uzak iz enjekte edilmez
+    pass_behind_m:         1.5   # gövde ileri < -bu → araç geçti → iz düşer (Bee1 ~2.5m boy)
+    pos_alpha:             0.4   # dünya konumu EMA katsayısı (yeni gözleme doğru)
+    max_tracks:           12     # iz sayısı tavanı (önce konfirme-olmayanı at)
+    max_pose_jump_m:       2.0   # araç pozu bir tick'te bundan fazla atlarsa (odom reset) → hafıza sıfırla
 
 # Lane change guard'ları (sadece BT içinde; control.py kendi guard'ını ayrı uygular)
 lane_change:

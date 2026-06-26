@@ -103,7 +103,7 @@ class KararLogger:
                 "karar", "reason", "phase",
                 "engel_present", "d_center", "d_left", "d_right", "angle_deg",
                 "kacis_yon", "overtake_active",
-                "hedef_x", "hedef_y",
+                "hedef_x", "hedef_y", "engel_mem",
             ])
 
     # ------------------------------------------------------------------ #
@@ -146,7 +146,7 @@ class KararLogger:
     def log_trace(self, *, x, y, yaw, speed_kmh, karar, reason, phase,
                   engel_present, d_center, d_left, d_right, angle_deg,
                   kacis_yon=None, overtake_active=False,
-                  hedef_x=None, hedef_y=None):
+                  hedef_x=None, hedef_y=None, engel_mem=0):
         """Karar izini trace.csv'ye yaz — trace_hz'e göre kısılır."""
         if not self.ok or self._trace_writer is None:
             return
@@ -167,7 +167,7 @@ class KararLogger:
                     self._r(self._fin(d_center)), self._r(self._fin(d_left)),
                     self._r(self._fin(d_right)), self._r(angle_deg, 2),
                     kacis_yon or "", 1 if overtake_active else 0,
-                    self._r(hedef_x), self._r(hedef_y),
+                    self._r(hedef_x), self._r(hedef_y), int(engel_mem or 0),
                 ])
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"[karar_logger] log_trace hata: {e}\n")

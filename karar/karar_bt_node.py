@@ -185,6 +185,7 @@ def main():
                 angle_deg=o.engel_angle_deg,
                 kacis_yon=bb.state.kacis_yon, overtake_active=bb.state.overtake_active,
                 hedef_x=o.hedef_x, hedef_y=o.hedef_y,
+                engel_mem=o.engel_mem_count,
             )
 
         # 5) Karar değişiminde event logu
