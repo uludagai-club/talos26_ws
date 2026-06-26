@@ -1251,7 +1251,7 @@ class HedefYoneticisi:
         # ── Görselleştirme ───────────────────────────────────────────
         if ENABLE_GUI:
             plt.ion()
-            self.fig, self.ax = plt.subplots(figsize=(10, 10))
+            self.fig, self.ax = plt.subplots(figsize=(4, 4))   
             self.ax.set_aspect('equal')
             plt.show(block=False)
         self._static_drawn = False
@@ -2495,6 +2495,25 @@ class HedefYoneticisi:
                 spine.set_edgecolor('#3d3c38')
                 spine.set_linewidth(0.6)
 
+            # ── HESAPLAMA KİLİDİ göstergesi: çizili asma kilit + metin (sol-üst) ──
+            # Emoji DejaVu'da tofu → kilidi patch ile çiziyoruz (gövde + halka). Renk
+            # durumu verir: KIRMIZI=kilitli, YEŞİL=açık. figure-fraction (kare figür → bozulmaz).
+            from matplotlib.patches import FancyBboxPatch, Arc
+            lx, ly, bw, bh = 0.05, 0.80, 0.055, 0.05   # başlığın altı, sol-üst
+            self.lock_body = FancyBboxPatch(
+                (lx, ly), bw, bh, transform=self.fig.transFigure,
+                boxstyle='round,pad=0.004,rounding_size=0.012',
+                facecolor='#ff4d5e', edgecolor='none', zorder=30, clip_on=False)
+            self.fig.add_artist(self.lock_body)
+            self.lock_shackle = Arc(
+                (lx + bw / 2, ly + bh), bw * 0.62, bh * 0.95, angle=0, theta1=0, theta2=180,
+                transform=self.fig.transFigure, lw=2.2, edgecolor='#ff4d5e', zorder=29, clip_on=False)
+            self.fig.add_artist(self.lock_shackle)
+            self.lock_text = self.fig.text(
+                lx + bw + 0.02, ly + bh / 2, '', transform=self.fig.transFigure,
+                fontsize=9, fontfamily='monospace', fontweight='bold',
+                va='center', ha='left', color='#ff4d5e', zorder=30)
+
             self._static_drawn = True
 
         # ── Rota ────────────────────────────────────────────────────
@@ -2573,6 +2592,15 @@ class HedefYoneticisi:
             bbox=dict(boxstyle='round,pad=0.4', facecolor='#1e1d1b',
                       edgecolor='#3d3c38', alpha=0.6)
         )
+
+        # ── HESAPLAMA KİLİDİ göstergesi (çizili kilit + metin) ───────
+        if getattr(self, 'lock_body', None) is not None:
+            kilitli = bool(HESAP_KILIDI_AKTIF and self._hesap_kilitli)
+            col = '#ff4d5e' if kilitli else '#39ff14'   # kırmızı=kilitli, yeşil=açık
+            self.lock_body.set_facecolor(col)
+            self.lock_shackle.set_edgecolor(col)
+            self.lock_text.set_color(col)
+            self.lock_text.set_text('KİLİTLİ' if kilitli else 'AÇIK')
 
         self.fig.canvas.draw_idle()
 
