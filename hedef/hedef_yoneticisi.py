@@ -1160,7 +1160,7 @@ class HedefYoneticisi:
         # BLOK_LATCH_MAX_S düşürür. _komut_lock callback↔recalc çakışmasını önler.
         self._bloklu_engeller = []
         self._komut_lock      = threading.Lock()
-        self._son_aktif_blok  = 0   # TTL düşüşünde tek-sefer reroute tetiği için
+        self._son_aktif_blok  = 0   # aktif blok sayısı (konum_callback'te her tick güncel); sapma off-road guard sinyali (_sapma_reroute_bastir)
         self._viraj_poz_cache = None  # 'viraj' tipi düğüm pozisyonları (latch serbest kontrolü); load'da/lazy doldurulur
         # recalc'taki graf mutasyonunu (blok ağırlık-şişirme + slalom enjeksiyon)
         # serialize eder: konum_callback ile hedef_komut_callback ayrı thread'lerde
@@ -1572,22 +1572,31 @@ class HedefYoneticisi:
 
             if (sapma_sureli
                     and now - self.son_hesaplama_zamani > 5.0):
-                # ── Off-road guard (REVİZYON 5): slalom sırasında araç karşı şeride
-                # (tek-yön TERS lane) geçince sapma tetikleniyor; ama oradaki start
-                # düğümünden ileri çıkış ancak U-dönüşüyle → recalc sürülemez saçma
-                # rota üretip aracı yoldan çıkarıyordu (canlı manuel_20260626T141631Z:
-                # 4× ardışık sapma, start ters-yön B, min_yaricap 0.6m, max-dönüş 167°).
-                # Start ters-yön ise reroute YAPMA, committed slalom path'i koru.
-                if self._ters_yon_start_riski():
+                # ── Off-road guard — sollama ortasında reroute YAPMA ──
+                # İki bastırma sebebi:
+                # (A) start ters-yön (REVİZYON 5): araç karşı şeride (tek-yön TERS lane)
+                #     geçince start çıkışı ancak U-dönüşüyle → recalc sürülemez rota
+                #     üretip aracı yoldan çıkarıyordu (manuel_20260626T141631Z).
+                # (B) AKTİF DUBA BLOĞU (kullanıcı 2026-06-26, canlı 185629Z @18:57:00):
+                #     araç sol şeride çıkmışken (sollama ortası) "sapma" BEKLENEN — araç
+                #     bilerek şerit dışında. Reroute, karşı-şerit start'ından min_yaricap
+                #     ~0.8m SÜRÜLEMEZ rota üretiyordu. (A) salt geometrik (U-dönüşü) olduğu
+                #     için dönüş ortasını (yaw~49°) kaçırdı; (B) blok-tabanlı olduğundan
+                #     yaw'dan bağımsız tüm sollama penceresini yakalar. Latch'li blok
+                #     viraja gelince düşünce (sweep) sapma normale döner → committed
+                #     overtake path (A→B→A) korunur.
+                bastir_neden = self._sapma_reroute_bastir()
+                if bastir_neden:
                     rospy.logwarn_throttle(
-                        2.0, "[sapma] start ters-yön/karşı şerit → reroute U-dönüşü "
-                             "riski; committed path korunuyor (off-road guard)")
+                        2.0, f"[sapma] {bastir_neden} → reroute bastırıldı; committed path "
+                             f"korunuyor (off-road guard)")
                     if self.logger is not None:
                         self.logger.log_event(
-                            "sapma_bastirildi", neden="ters_yon_start",
+                            "sapma_bastirildi", neden=bastir_neden,
                             min_dist=round(min_dist, 2),
                             robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
-                            yaw_deg=round(math.degrees(self.robot_yaw), 2),
+                            yaw_deg=round(math.degrees(self.robot_yaw), 2)
+                            if self.robot_yaw is not None else None,
                             wp_idx=self.current_wp_index)
                     # Debounce'u SIFIRLA → bu hem structured log'u hem guard hesabını
                     # kısar (her tick değil; sapma ESIK üstünde SAPMA_DEBOUNCE_SURE
@@ -1802,9 +1811,12 @@ class HedefYoneticisi:
             kalan = []
             for b in self._bloklu_engeller:
                 if b.get('latch'):
-                    # duba GERİDE mi (yaw yönünde geçildi)? yaw yoksa serbest bırakma.
+                    # duba GERİDE mi (yaw yönünde ARKA KENARI geçildi, dot < -r)? Merkez
+                    # (dot<0) yerine -r eşiği: dönüş ortasında (duba henüz tam geçilmemiş)
+                    # latch erken düşmesin → sollama penceresi boyunca aktif kalır (sapma
+                    # off-road guard'ının sinyali). yaw yoksa serbest bırakma.
                     cone_geride = (fwd is not None
-                                   and (b['x'] - rx) * fwd[0] + (b['y'] - ry) * fwd[1] < 0.0)
+                                   and (b['x'] - rx) * fwd[0] + (b['y'] - ry) * fwd[1] < -b['r'])
                     if viraj_yakin and cone_geride:
                         continue   # yol viraja girdi + duba geçildi → serbest
                     if now - b.get('t_create', b['t']) > BLOK_LATCH_MAX_S:
@@ -1816,6 +1828,21 @@ class HedefYoneticisi:
         if n_serbest:   # log _komut_lock DIŞINDA (kritik bölgeyi log I/O kadar uzatma)
             rospy.loginfo_throttle(
                 2.0, f"[latch] {n_serbest} duba bloğu serbest (viraja girildi / fail-safe)")
+
+    def _sapma_reroute_bastir(self):
+        """Sapma (deviation) reroute'u bastırılmalı mı? Sebebi (str) döndürür, yoksa None.
+          (A) "sollama_aktif": aktif duba bloğu var (sollama ortası, araç bilerek şerit
+              dışında — sol şeritte). Reroute karşı-şerit start'ından sürülemez (~0.8m
+              yarıçap) rota üretir; committed overtake path (A→B→A) korunmalı. Latch'li
+              blok viraja gelince düşünce sapma normale döner (canlı 185629Z @18:57:00).
+          (B) "ters_yon_start": blok yok ama start çıkışı U-dönüşü (karşı şeritte takılı).
+        (A) yaw geometriden bağımsız → dönüş ortasını (yaw~49°) da yakalar; (B) salt
+        geometrik olduğu için kaçırıyordu (REVİZYON 5'in genişletilmiş hâli)."""
+        if HEDEF_KOMUT_AKTIF and self._son_aktif_blok > 0:
+            return "sollama_aktif"
+        if self._ters_yon_start_riski():
+            return "ters_yon_start"
+        return None
 
     def _ters_yon_start_riski(self) -> bool:
         """SAPMA reroute'unu tetiklemeden ÖNCE kontrol: aracın o anki konumunda
