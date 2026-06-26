@@ -138,22 +138,19 @@ BLOK_MARJIN_M          = 1.5    # blok yarıçapına eklenen pay (m): araç ön 
 BLOK_SERT_AKTIF        = True   # True → engel çemberini SERT sil (varsayılan); False → eski ağırlık-şişirme
 BLOK_YARICAP_M         = 1.0    # engel çemberi yarıçapı (m); etkin = max(engel_r, bu). Kullanıcı: 1m.
 
-# ── HESAPLAMA KİLİDİ — yol ayrımı + durma-bekleme (kullanıcı kararı 2026-06-26) ──
-# Kullanıcı: "aracın 2m önünde koyduğumuz nokta YOL AYRIMINI geçtiği anda blokaj
-# yapalım; araç durup 15 sn beklemediği sürece hesaplamasın."
-# Mekanizma: aracın BURUN_MESAFE_M önündeki "burun" noktası bir YOL AYRIMI (grafta
-# yolun DALLANDIĞI düğüm — out-degree ≥ 2; kullanıcı seçimi) geçtiği an rota HESABI
-# KİLİTLENİR (_hesap_kilitli=True). Kilitliyken planlayıcı YENİDEN HESAPLAMAZ
-# (ne duba reroute'u ne sapma) → araç sol şeride çıkmışken (mid-manevra) cusp/
-# U-dönüşü re-plan'ı tamamen biter. Kilit YALNIZ araç durup DURMA_BEKLEME_SN saniye
-# bekleyince açılır → o STABİL konumdan tek bir temiz recalc yapılır. Duba kilitliyken
-# gelirse control e-stop ile durdurur → araç DURMA_BEKLEME_SN bekler → yeniden planlar
-# (engeli sollar). Bu, "viraja kadar latch"in yerini alır (viraj değil yol ayrımı).
+# ── HESAPLAMA KİLİDİ — sollama-kararı + sağ-şerit (kullanıcı kararı 2026-06-26/27) ──
+# Kullanıcı: "sollama yapmaya KARAR verdiği AN kilitlesin; SAĞ şeride döndüğü AN
+# kilitlemesi bitsin." (Eski "yol ayrımı geçince kilitle" ÇOK GEÇ tetikliyordu —
+# A-şeridi ilk ayrımı x=10, dubalardan sonra.)
+# Mekanizma: recalc bir SOLLAMA rotası commit ettiğinde (rota KARŞI/sol şeride
+# giriyorsa → sollama kararı verildi) rota HESABI KİLİTLENİR (_hesap_kilitli=True).
+# Kilitliyken planlayıcı YENİDEN HESAPLAMAZ → araç sol şeride çıkmışken (mid-manevra)
+# cusp/U-dönüşü re-plan'ı biter. Kilit, araç SOL şeride girip SAĞ (forward) şeride
+# DÖNÜNCE açılır + o stabil konumdan tek temiz recalc (sonraki dubayı sağ şeritten
+# planlar). Fail-safe: sol şeritte takılırsa DURMA_BEKLEME_SN durunca açılır.
 HESAP_KILIDI_AKTIF   = True   # False → kilit yok (her tetikte recalc — eski davranış)
-BURUN_MESAFE_M       = 2.0    # aracın önündeki burun noktası mesafesi (m); yol ayrımını bununla geçer
-DURMA_BEKLEME_SN     = 15.0   # kilidi açmak için aracın durup bekleyeceği süre (s)
+DURMA_BEKLEME_SN     = 15.0   # fail-safe: sol şeritte takılırsa durup bu kadar bekleyince aç (s)
 DURMA_HIZ_ESIK_MS    = 0.15   # ardışık poz'dan tahmini hız bunun altıysa "durdu" sayılır (m/s)
-YOL_AYRIMI_YAKIN_M   = 1.5    # burun bir yol-ayrımı düğümüne bu kadar yaklaşınca "geçti" → kilit (m)
 # Kilit açma (sağ-şerit/15s) recalc COOLDOWN'u: araç şeritler arasında yanal salınınca
 # _sag_seritte titreyip kilit aç-kapa yapıp her açılışta recalc tetikliyordu (canlı
 # 203548Z: 426 recalc / 1s churn). Açma recalc'ı bu süreden sık tetiklenmez.
@@ -1176,11 +1173,11 @@ class HedefYoneticisi:
         self._komut_lock      = threading.Lock()
 
         # ── HESAPLAMA KİLİDİ (yol ayrımı + 15s durma + sağ-şerit açma) durumu ──
-        self._ayrim_poz_cache = None    # yol-ayrımı (out-degree≥2) düğüm pozisyonları; load'da doldurulur
         self._forward_poz     = None    # forward(sağ) şerit düğüm pozisyonları; load'da
-        self._karsi_poz       = None    # karşı(sol/overtake) şerit düğüm pozisyonları; load'da
+        self._karsi_poz       = None    # karşı(sol/overtake) şerit düğüm pozisyon KÜMESİ; load'da
         self._karsi_seritler  = set()   # sollama/overtake lane kümesi (B/D/F/...); load'da doldurulur
-        self._hesap_kilitli   = False   # True → recalc bastırılır (burun bir yol ayrımı geçti, sağ şerit/15s açar)
+        self._hesap_kilitli   = False   # True → recalc bastırılır (sollama kararı verildi; sağ şerit/15s açar)
+        self._kilit_sol_serite_girdi = False  # kilitliyken araç sol şeride girdi mi (sağ'a dönüş = açma şartı)
         self._son_sag_serit   = True    # _sag_seritte histerezis durumu (başlangıç: sağ şerit)
         self._son_kilit_recalc = 0.0    # son kilit-açma recalc zamanı (cooldown / churn engeli)
         self._durma_baslangic = None    # araç "durdu" sayıldığı an (15s sayacı); hareket edince None
@@ -1244,10 +1241,10 @@ class HedefYoneticisi:
                 blok_sert_aktif=BLOK_SERT_AKTIF,
                 blok_yaricap_m=BLOK_YARICAP_M,
                 hesap_kilidi_aktif=HESAP_KILIDI_AKTIF,
-                burun_mesafe_m=BURUN_MESAFE_M,
                 durma_bekleme_sn=DURMA_BEKLEME_SN,
                 durma_hiz_esik_ms=DURMA_HIZ_ESIK_MS,
-                yol_ayrimi_yakin_m=YOL_AYRIMI_YAKIN_M,
+                kilit_cooldown_sn=KILIT_COOLDOWN_SN,
+                serit_marjin_m=SERIT_MARJIN_M,
                 b_plan_yaw_rota=B_PLAN_YAW_ROTA_AKTIF,
                 b_plan_offset_m=B_PLAN_OFFSET_M,
                 b_plan_offset_marjin_m=B_PLAN_OFFSET_MARJIN_M,
@@ -1304,7 +1301,7 @@ class HedefYoneticisi:
         self.planner.adj_list.clear()
         self.planner.pred_list.clear()
         self.planner.edge_weights.clear()
-        self._ayrim_poz_cache = None   # ÖNCE invalidate (aşağıdaki node_types.clear ile yarış penceresini kapat)
+        self._forward_poz = None   # ÖNCE invalidate (aşağıdaki node_types.clear ile yarış penceresini kapat)
         self.planner.node_types.clear()
         self.planner.nodes.clear()
         self.pos_to_node = {}
@@ -1383,22 +1380,19 @@ class HedefYoneticisi:
                       f"karşı-şerit segment adayı saklandı (blok-tetikli enjeksiyon).")
 
         # YOL AYRIMI (out-degree ≥ 2 = yolun dallandığı düğüm) pozisyonlarını YÜKLEME
-        # sırasında (subscriber'lar register olmadan, tek-thread) doldur → runtime'da
-        # _ayrim_pozlari kilitsiz/güvenli okur. G (networkx) out-degree'yi verir.
-        self._ayrim_poz_cache = [node_to_pos[n] for n in G.nodes()
-                                 if n in node_to_pos and G.out_degree(n) >= 2]
-        # Forward(sağ) + karşı(sol/overtake) şerit düğüm pozisyonları → "araç sağ şeride
-        # döndü mü" (kilit açma) histerezisli tespiti için ayrı listeler.
+        # Forward(sağ) liste + karşı(sol/overtake) şerit düğüm pozisyon KÜMESİ (subscriber'lar
+        # register olmadan, tek-thread doldur). forward: _sag_seritte histerezisi için (min mesafe);
+        # karsi (set): hem _sag_seritte hem "committed rota karşı şeride girdi mi" (kilit) için.
         self._karsi_seritler = set(G.graph.get('karsi_seritler', set()))
         self._forward_poz = [node_to_pos[n] for n, data in G.nodes(data=True)
                              if n in node_to_pos and data.get('lane') not in self._karsi_seritler]
-        self._karsi_poz = [node_to_pos[n] for n, data in G.nodes(data=True)
-                           if n in node_to_pos and data.get('lane') in self._karsi_seritler]
+        self._karsi_poz = {node_to_pos[n] for n, data in G.nodes(data=True)
+                           if n in node_to_pos and data.get('lane') in self._karsi_seritler}
 
         self._graph_loaded = True
         rospy.loginfo(
             f"[graph] Graf yapısından {len(self.planner.nodes)} düğüm başarıyla yüklendi "
-            f"({len(self._ayrim_poz_cache)} yol ayrımı)."
+            f"({len(self._karsi_poz)} karşı-şerit düğümü)."
         )
 
         if not self.geo_targets_built:
@@ -1768,11 +1762,6 @@ class HedefYoneticisi:
                 self._bloklu_engeller = taze
             return [(b['x'], b['y'], b['r']) for b in taze]
 
-    def _ayrim_pozlari(self):
-        """Yol-ayrımı (out-degree ≥ 2 = yolun dallandığı) düğüm pozisyonları.
-        _load_graph_from_import'ta doldurulur (kilitsiz/güvenli okuma)."""
-        return self._ayrim_poz_cache or []
-
     def _sag_seritte(self):
         """Araç şu an SAĞ (forward) şeritte mi — karşı/sollama şeridinde DEĞİL mi?
         HİSTEREZİSLİ: forward şerit düğümlerine en yakın mesafe (d_f) karşı şerit
@@ -1793,23 +1782,31 @@ class HedefYoneticisi:
         # arada: histerezis → _son_sag_serit değişmez
         return self._son_sag_serit
 
+    def _overtake_rotasi_mi(self, path):
+        """Verilen committed path KARŞI (sol/overtake) şeride giriyor mu — yani bu bir
+        SOLLAMA rotası mı? (Herhangi bir WP'si karşı-şerit düğüm kümesinde.) recalc'ta
+        sollama kararı verildiği AN kilitlemek için kullanılır."""
+        if not path or not self._karsi_poz:
+            return False
+        ks = self._karsi_poz
+        return any(wp in ks for wp in path)
+
     def _kilit_guncelle(self):
-        """HESAPLAMA KİLİDİ durumunu günceller (konum_callback'ten her poz'da; reroute
-        TETİKLEMEZ — yalnız kilit AÇILINCA bir temiz recalc çağırır). Kullanıcı kararı:
-        "burun bir yol ayrımını geçince blokaj; araç durup 15s beklemeden hesaplamasın."
-          • KİLİTLE: aracın BURUN_MESAFE_M önündeki burun noktası bir YOL AYRIMI düğümüne
-            YOL_AYRIMI_YAKIN_M'den yaklaşırsa → _hesap_kilitli=True. Kilitliyken recalc YOK
-            → araç sol şeride çıkmışken (mid-manevra) cusp/U-dönüşü re-plan'ı biter.
-          • AÇ: araç DURMA_HIZ_ESIK_MS altına inip DURMA_BEKLEME_SN saniye beklerse →
-            _hesap_kilitli=False + o STABİL konumdan bir temiz recalc (engeli sollar).
-        Hız ardışık poz'dan tahmin edilir."""
+        """HESAPLAMA KİLİDİ durumunu günceller (konum_callback'ten her poz'da). Kilit
+        recalc'ta SOLLAMA KARARIYLA kurulur (_overtake_rotasi_mi → _hesap_kilitli=True).
+        Burada AÇMA yönetilir (kullanıcı 2026-06-27: "sağ şeride döndüğü an bitsin"):
+          • Kilitliyken araç SOL şeride girince işaretle (_kilit_sol_serite_girdi).
+          • Sol'a girip SAĞ (forward) şeride DÖNÜNCE → AÇ + o stabil konumdan temiz recalc
+            (sonraki dubayı sağ şeritten planlar). COOLDOWN: churn engeli (203548Z).
+          • Fail-safe: kilitliyken araç durup DURMA_BEKLEME_SN beklerse (herhangi şerit) → AÇ.
+        AÇMA reroute TETİKLER (recalc), kilitlemenin kendisi recalc'ta yapılır."""
         if not HESAP_KILIDI_AKTIF:
             return
-        rx, ry, yaw = self.robot_x, self.robot_y, self.robot_yaw
+        rx, ry = self.robot_x, self.robot_y
         if rx is None or ry is None:
             return
         now = time.time()
-        # Hız tahmini (ardışık poz) → durma tespiti
+        # Hız tahmini (ardışık poz) → durma tespiti (fail-safe)
         hiz = None
         if self._son_poz_xy is not None and self._son_poz_t is not None:
             dt = now - self._son_poz_t
@@ -1817,49 +1814,33 @@ class HedefYoneticisi:
                 hiz = math.hypot(rx - self._son_poz_xy[0], ry - self._son_poz_xy[1]) / dt
         self._son_poz_xy = (rx, ry)
         self._son_poz_t = now
-        # Burun bir yol ayrımını geçti mi → KİLİTLE (yalnız araç SOL/karşı şeritteyse;
-        # sağ şeritte re-plan zaten güvenli → kilitleme gereksiz, hemen açılır + fork
-        # recalc churn'ü olurdu). Böylece kilit yalnız sollama ortasını kapsar.
-        if not self._hesap_kilitli and yaw is not None:
-            bx = rx + BURUN_MESAFE_M * math.cos(yaw)
-            by = ry + BURUN_MESAFE_M * math.sin(yaw)
-            if (any(math.hypot(bx - ax, by - ay) <= YOL_AYRIMI_YAKIN_M
-                    for (ax, ay) in self._ayrim_pozlari())
-                    and not self._sag_seritte()):
-                self._hesap_kilitli = True
-                self._durma_baslangic = None
-                rospy.loginfo_throttle(
-                    2.0, "[kilit] sol şeritte burun yol ayrımını geçti → hesaplama KİLİTLENDİ "
-                         "(sağ şerit / 15s durma açar)")
-        # 15s durma → KİLİDİ AÇ + bir temiz recalc
-        if self._hesap_kilitli:
-            # (1) SAĞ ŞERİDE dönünce aç (kullanıcı 2026-06-26): karşı şeritten çıkıp
-            #     forward/sağ şeride geçince re-plan güvenli (drivable) → beklemeden aç +
-            #     o stabil konumdan temiz recalc → sonraki dubayı sağ şeritten planlar
-            #     (15s/duba yavaşlığı biter). Kilit yalnız sol şeritteyken (mid-manevra) tutar.
-            #     COOLDOWN: açma recalc'ı KILIT_COOLDOWN_SN'den sık tetiklenmez → araç
-            #     şeritler arasında salınıp kilit aç-kapa yapsa bile recalc churn'ü olmaz.
-            if self._sag_seritte():
-                if now - self._son_kilit_recalc >= KILIT_COOLDOWN_SN:
-                    self._hesap_kilitli = False
-                    self._durma_baslangic = None
-                    self._son_kilit_recalc = now
-                    rospy.loginfo_throttle(2.0, "[kilit] araç sağ şeride döndü → hesaplama AÇILDI (temiz recalc)")
-                    self.recalculate_path_from_robot(reason="sag_serit")
-                # cooldown'daysa: kilidi açma, bekle (recalc churn engeli)
-            # (2) Sol şeritte takılı kaldıysa fail-safe: 15s durunca aç
-            elif hiz is not None and hiz < DURMA_HIZ_ESIK_MS:
-                if self._durma_baslangic is None:
-                    self._durma_baslangic = now
-                elif now - self._durma_baslangic >= DURMA_BEKLEME_SN:
-                    self._hesap_kilitli = False
-                    self._durma_baslangic = None
-                    self._son_kilit_recalc = now
-                    rospy.loginfo(
-                        f"[kilit] araç {DURMA_BEKLEME_SN:.0f}s durdu → hesaplama AÇILDI (temiz recalc)")
-                    self.recalculate_path_from_robot(reason="kilit_acildi")
-            else:
-                self._durma_baslangic = None   # hareket var → durma sayacı sıfırla
+        if not self._hesap_kilitli:
+            return
+        # ── AÇMA fail-safe: kilitli + durdu (herhangi şerit) → 15s sonra aç ──
+        if hiz is not None and hiz < DURMA_HIZ_ESIK_MS:
+            if self._durma_baslangic is None:
+                self._durma_baslangic = now
+            elif now - self._durma_baslangic >= DURMA_BEKLEME_SN:
+                self._kilit_ac(now, "kilit_acildi",
+                               f"araç {DURMA_BEKLEME_SN:.0f}s durdu (fail-safe)")
+                return
+        else:
+            self._durma_baslangic = None
+        # ── AÇMA asıl: sol şeride girip SAĞ şeride dönünce ──
+        if not self._sag_seritte():
+            self._kilit_sol_serite_girdi = True   # sollama ortası: sol şeride girdi
+        elif (self._kilit_sol_serite_girdi
+              and now - self._son_kilit_recalc >= KILIT_COOLDOWN_SN):
+            self._kilit_ac(now, "sag_serit", "araç sağ şeride döndü")
+
+    def _kilit_ac(self, now, reason, mesaj):
+        """Kilidi açar + o stabil konumdan tek temiz recalc (cooldown damgalar)."""
+        self._hesap_kilitli = False
+        self._kilit_sol_serite_girdi = False
+        self._durma_baslangic = None
+        self._son_kilit_recalc = now
+        rospy.loginfo_throttle(2.0, f"[kilit] {mesaj} → hesaplama AÇILDI (temiz recalc)")
+        self.recalculate_path_from_robot(reason=reason)
 
     def _engel_rotada(self, path, engeller):
         """Aktif engellerden HERHANGİ biri verilen (bloksuz baseline) rotanın
@@ -2383,6 +2364,16 @@ class HedefYoneticisi:
                 self.full_path_world   = path
                 self.current_wp_index = 0
                 self.is_path_calculated = True
+            # ── HESAPLAMA KİLİDİ: committed rota KARŞI (sol) şeride giriyorsa → SOLLAMA
+            #    kararı verildi → bu AN kilitle (kullanıcı 2026-06-27: "sollama yapmaya
+            #    karar verdiği an kilitlesin"). Sağ şeride dönünce _kilit_guncelle açar.
+            if (HESAP_KILIDI_AKTIF and not self._hesap_kilitli
+                    and self._overtake_rotasi_mi(path)):
+                self._hesap_kilitli = True
+                self._kilit_sol_serite_girdi = False
+                rospy.loginfo_throttle(
+                    2.0, "[kilit] sollama kararı (rota karşı şeride girdi) → KİLİTLENDİ "
+                         "(sağ şeride dönünce açılır)")
             print(f"{YESIL}>>> [ROTA] {len(path)} WP oluşturuldu.{SIFIRLA}")
         elif rota_reddedildi:
             # committed path KORUNUR (overwrite yok) → araç eski sürülebilir rotayı sürer.
