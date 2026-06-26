@@ -120,6 +120,12 @@ DONUS_CUSP_CEZA        = 1000.0 # cusp eşiği üstü dönüş için ek ceza (m)
 HEDEF_KOMUT_AKTIF      = True
 BLOK_TTL_S             = 3.0    # sollama bloğu bu kadar sn tazelenmezse düşer (karar ~1s'de tazeler)
 BLOK_MARJIN_M          = 1.5    # blok yarıçapına eklenen pay (m): araç ön çıkıntısı + kenar uzunluğu
+# Duba KONUM güncellemesi (kullanıcı 2026-06-27 "duba konumu tetiklesin güncellemeyi"):
+# Aynı duba (≤2m) tekrar gelince blok konumu HER ZAMAN en tazeye güncellenir; konum bu
+# kadar TAŞINDIYSA reroute de tetiklenir. Yoksa ilk (gürültülü, ör. track-dışı) konum
+# bloğun TTL'i (15s) boyunca donuyor, düzelmiş on-lane konum gelse de sollama gecikiyordu
+# (canlı 211236Z: duba (21.23,-35.95)→(20.53,-34.26) 1.83m taşındı ama 15s güncellenmedi).
+KONUM_DEGISIM_ESIK_M   = 0.5    # duba konumu bu kadar taşınınca güncelle + reroute (m)
 
 # ── SERT BLOK (engel çemberi) — kullanıcı kararı 2026-06-26 ───────────────
 # Kullanıcı: "karardan gelen engelin konumundan bir çember çiz ve 1m yarıçapındaki
@@ -1229,6 +1235,7 @@ class HedefYoneticisi:
                 donus_cusp_esik_deg=round(math.degrees(DONUS_CUSP_ESIK), 1),
                 hedef_komut=HEDEF_KOMUT_AKTIF,
                 blok_ttl_s=BLOK_TTL_S,
+                konum_degisim_esik_m=KONUM_DEGISIM_ESIK_M,
                 carpan_ters_yon=round(ceza_carpani(CEZA_TERS_YON), 3),
                 slalom_enjeksiyon=SLALOM_ENJEKSIYON_AKTIF,
                 ceza_ters_cikis=CEZA_TERS_CIKIS,
@@ -1704,7 +1711,15 @@ class HedefYoneticisi:
                 with self._komut_lock:
                     mevcut = self._yakin_blok_bul(ox, oy)
                     if mevcut is not None:
-                        mevcut['t'] = now          # tazeleme → reroute yok
+                        # KONUM güncelle (her zaman en tazeye) — eski/gürültülü konumda
+                        # donup kalma. Konum yeterince TAŞINDIYSA reroute de tetikle
+                        # (kullanıcı: "duba konumu tetiklesin güncellemeyi").
+                        tasindi = (math.hypot(mevcut['x'] - ox, mevcut['y'] - oy)
+                                   > KONUM_DEGISIM_ESIK_M)
+                        mevcut['x'], mevcut['y'], mevcut['r'], mevcut['t'] = ox, oy, r, now
+                        if tasindi:
+                            kume_degisti = True
+                            reroute_iste = True    # konum değişti → hemen yeniden planla
                     else:
                         self._bloklu_engeller.append(
                             {'x': ox, 'y': oy, 'r': r, 'taraf': taraf, 't': now})
