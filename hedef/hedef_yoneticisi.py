@@ -932,6 +932,12 @@ def build_track_graph():
     # Crossing listesini G üzerinde sakla (runtime _load_graph_from_import okur).
     G.graph['slalom_connections'] = slalom_connections_to_build
     G.graph['slalom_lane_segments'] = slalom_lane_segments
+    # KARŞI ŞERİTLER (sollama/overtake lane'leri) = her slalom çiftinin İKİNCİ şeridi
+    # (forward=ilk: A/C/E/H/K/N/M; karşı=ikinci: B/D/F/I/J/O/L). "Sağ şeride döndü mü"
+    # tespiti için (HESAPLAMA KİLİDİ sağ-şerit-açma): araç bu şeritlerdeyse sollama
+    # ortasında (recalc cusp üretir), değilse forward/sağ şeritte (re-plan güvenli).
+    G.graph['karsi_seritler'] = {G.nodes[l2[0]]['lane']
+                                 for (_l1, l2, _o) in slalom_segments if l2}
 
     # A şeridi ile P1 ve P7 arasındaki bağlantıyı dinamik olarak ekliyoruz
     a_nodes = [n for n in G.nodes() if G.nodes[n].get('lane') == 'A']
@@ -1162,9 +1168,11 @@ class HedefYoneticisi:
         self._bloklu_engeller = []
         self._komut_lock      = threading.Lock()
 
-        # ── HESAPLAMA KİLİDİ (yol ayrımı + 15s durma) durumu ──────────
+        # ── HESAPLAMA KİLİDİ (yol ayrımı + 15s durma + sağ-şerit açma) durumu ──
         self._ayrim_poz_cache = None    # yol-ayrımı (out-degree≥2) düğüm pozisyonları; load'da doldurulur
-        self._hesap_kilitli   = False   # True → recalc bastırılır (burun bir yol ayrımı geçti, 15s durma beklenir)
+        self._pos_lane        = None    # {poz: lane} — "sağ şeritte mi" tespiti; load'da doldurulur
+        self._karsi_seritler  = set()   # sollama/overtake lane kümesi (B/D/F/...); load'da doldurulur
+        self._hesap_kilitli   = False   # True → recalc bastırılır (burun bir yol ayrımı geçti, sağ şerit/15s açar)
         self._durma_baslangic = None    # araç "durdu" sayıldığı an (15s sayacı); hareket edince None
         self._son_poz_xy      = None    # hız tahmini için bir önceki poz (x,y)
         self._son_poz_t       = None    # ve zamanı
@@ -1369,6 +1377,10 @@ class HedefYoneticisi:
         # _ayrim_pozlari kilitsiz/güvenli okur. G (networkx) out-degree'yi verir.
         self._ayrim_poz_cache = [node_to_pos[n] for n in G.nodes()
                                  if n in node_to_pos and G.out_degree(n) >= 2]
+        # {poz: lane} + karşı-şerit kümesi → "araç sağ şeride döndü mü" (kilit açma)
+        self._pos_lane = {node_to_pos[n]: data.get('lane')
+                          for n, data in G.nodes(data=True) if n in node_to_pos}
+        self._karsi_seritler = set(G.graph.get('karsi_seritler', set()))
 
         self._graph_loaded = True
         rospy.loginfo(
@@ -1748,6 +1760,18 @@ class HedefYoneticisi:
         _load_graph_from_import'ta doldurulur (kilitsiz/güvenli okuma)."""
         return self._ayrim_poz_cache or []
 
+    def _sag_seritte(self):
+        """Araç şu an SAĞ (forward) şeritte mi — yani karşı/sollama şeridinde DEĞİL mi?
+        En yakın graf düğümünün lane'i `_karsi_seritler` (B/D/F/...) içinde DEĞİLse True.
+        Karşı şeritteyken (sollama ortası) recalc cusp üretir; sağ şeritte drivable →
+        re-plan güvenli (kullanıcı: "sağ şeride geçtikten sonra kilidi açalım").
+        Bilgi yoksa True (güvenli: kilit yine 15s ile açılır)."""
+        if not self._pos_lane or self.robot_x is None or self.robot_y is None:
+            return True
+        rx, ry = self.robot_x, self.robot_y
+        nearest = min(self._pos_lane, key=lambda p: (p[0] - rx) ** 2 + (p[1] - ry) ** 2)
+        return self._pos_lane.get(nearest) not in self._karsi_seritler
+
     def _kilit_guncelle(self):
         """HESAPLAMA KİLİDİ durumunu günceller (konum_callback'ten her poz'da; reroute
         TETİKLEMEZ — yalnız kilit AÇILINCA bir temiz recalc çağırır). Kullanıcı kararı:
@@ -1772,19 +1796,33 @@ class HedefYoneticisi:
                 hiz = math.hypot(rx - self._son_poz_xy[0], ry - self._son_poz_xy[1]) / dt
         self._son_poz_xy = (rx, ry)
         self._son_poz_t = now
-        # Burun bir yol ayrımını geçti mi → KİLİTLE
+        # Burun bir yol ayrımını geçti mi → KİLİTLE (yalnız araç SOL/karşı şeritteyse;
+        # sağ şeritte re-plan zaten güvenli → kilitleme gereksiz, hemen açılır + fork
+        # recalc churn'ü olurdu). Böylece kilit yalnız sollama ortasını kapsar.
         if not self._hesap_kilitli and yaw is not None:
             bx = rx + BURUN_MESAFE_M * math.cos(yaw)
             by = ry + BURUN_MESAFE_M * math.sin(yaw)
-            if any(math.hypot(bx - ax, by - ay) <= YOL_AYRIMI_YAKIN_M
-                   for (ax, ay) in self._ayrim_pozlari()):
+            if (any(math.hypot(bx - ax, by - ay) <= YOL_AYRIMI_YAKIN_M
+                    for (ax, ay) in self._ayrim_pozlari())
+                    and not self._sag_seritte()):
                 self._hesap_kilitli = True
                 self._durma_baslangic = None
                 rospy.loginfo_throttle(
-                    2.0, "[kilit] burun yol ayrımını geçti → hesaplama KİLİTLENDİ (15s durma açar)")
+                    2.0, "[kilit] sol şeritte burun yol ayrımını geçti → hesaplama KİLİTLENDİ "
+                         "(sağ şerit / 15s durma açar)")
         # 15s durma → KİLİDİ AÇ + bir temiz recalc
         if self._hesap_kilitli:
-            if hiz is not None and hiz < DURMA_HIZ_ESIK_MS:
+            # (1) SAĞ ŞERİDE dönünce aç (kullanıcı 2026-06-26): karşı şeritten çıkıp
+            #     forward/sağ şeride geçince re-plan güvenli (drivable) → beklemeden aç +
+            #     o stabil konumdan temiz recalc → sonraki dubayı sağ şeritten planlar
+            #     (15s/duba yavaşlığı biter). Kilit yalnız sol şeritteyken (mid-manevra) tutar.
+            if self._sag_seritte():
+                self._hesap_kilitli = False
+                self._durma_baslangic = None
+                rospy.loginfo_throttle(2.0, "[kilit] araç sağ şeride döndü → hesaplama AÇILDI (temiz recalc)")
+                self.recalculate_path_from_robot(reason="sag_serit")
+            # (2) Sol şeritte takılı kaldıysa fail-safe: 15s durunca aç
+            elif hiz is not None and hiz < DURMA_HIZ_ESIK_MS:
                 if self._durma_baslangic is None:
                     self._durma_baslangic = now
                 elif now - self._durma_baslangic >= DURMA_BEKLEME_SN:
@@ -2101,17 +2139,16 @@ class HedefYoneticisi:
                 self.planner.restore_edge_directed(n, start_node)
 
     def recalculate_path_from_robot(self, reason: str = "?") -> None:
-        # ── HESAPLAMA KİLİDİ (yol ayrımı + 15s durma) ──
-        # Burun bir yol ayrımını geçtiyse (_hesap_kilitli) ve elde committed path
-        # VARSA → YENİDEN HESAPLAMA (kullanıcı: "araç durup 15s beklemeden hesaplamasın").
-        # Mid-manevra cusp/U-dönüşü re-plan'ı tamamen biter; kilit yalnız 15s durma açar
-        # (_kilit_guncelle, reason="kilit_acildi" ile o stabil konumdan bir kez çağırır).
+        # ── HESAPLAMA KİLİDİ (yol ayrımı + sağ-şerit/15s açma) ──
+        # Burun bir yol ayrımını geçtiyse (_hesap_kilitli) ve elde committed path VARSA →
+        # YENİDEN HESAPLAMA. Mid-manevra (sol şeritte) cusp/U-dönüşü re-plan'ı biter.
+        # Kilit, araç SAĞ ŞERİDE dönünce ya da 15s durunca açılır; _kilit_guncelle o an
+        # _hesap_kilitli'yi False yapıp recalc'ı çağırdığı için bu kapı geçilir.
         # İlk rota (committed yok) daima geçer (araç başlasın).
-        if (HESAP_KILIDI_AKTIF and self._hesap_kilitli and self.full_path_world
-                and reason != "kilit_acildi"):
+        if HESAP_KILIDI_AKTIF and self._hesap_kilitli and self.full_path_world:
             rospy.loginfo_throttle(
-                2.0, f"[kilit] hesaplama kilitli (yol ayrımı geçildi) → recalc atlandı "
-                     f"({reason}); 15s durma açar")
+                2.0, f"[kilit] hesaplama kilitli (sol şerit / yol ayrımı) → recalc atlandı "
+                     f"({reason}); sağ şerit veya 15s durma açar")
             return
 
         if not self.geo_targets_world or not self.planner.nodes:
