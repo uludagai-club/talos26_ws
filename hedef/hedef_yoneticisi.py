@@ -138,20 +138,22 @@ BLOK_MARJIN_M          = 1.5    # blok yarıçapına eklenen pay (m): araç ön 
 BLOK_SERT_AKTIF        = True   # True → engel çemberini SERT sil (varsayılan); False → eski ağırlık-şişirme
 BLOK_YARICAP_M         = 1.0    # engel çemberi yarıçapı (m); etkin = max(engel_r, bu). Kullanıcı: 1m.
 
-# ── BLOK-VİRAJA-KADAR (latch) — kullanıcı kararı 2026-06-26 ───────────────
-# Kullanıcı: "dubanın olduğu waypoint'i yol viraja girene kadar kullanılamaz yap."
-# Engel bloğu, robot bir SONRAKİ viraja (köşe) yaklaşana kadar LATCH'lenir →
-# TTL bitişi VE kenar_serbest onu ERKEN DÜŞÜRMEZ. Kazanımlar:
-#   (a) blok düz boyunca KARARLI kalır → kenar_blok↔kenar_serbest FLIP-FLOP reroute
-#       biter (canlı log 20260626T103648Z: 122 hedef_komut / 27 reroute=true).
-#   (b) araç sollama ortasında karşı şeride/yola geri zıplamaz (off-road fix'i güçlendirir).
-#   (c) robot köşeye (viraj düğümü) gelince latch düşer → tek-yön loop grafı
-#       KALICI bozulmaz, sonraki düz için graf temizdir.
-# Fail-safe: viraja hiç ulaşılmazsa blok BLOK_LATCH_MAX_S sonra düşer. Latch
-# SERBEST bırakma reroute TETİKLEMEZ (yalnız blok düşer → committed path korunur).
-BLOK_VIRAJA_KADAR_AKTIF = True   # True → duba bloğu viraja kadar latch'li (kullanıcı isteği)
-VIRAJ_YAKIN_M           = 4.0    # robot bir 'viraj' düğümüne bu kadar yaklaşınca latch'ler serbest (m)
-BLOK_LATCH_MAX_S        = 30.0   # latch fail-safe üst sınırı (viraja hiç ulaşılmazsa blok düşer) (s)
+# ── HESAPLAMA KİLİDİ — yol ayrımı + durma-bekleme (kullanıcı kararı 2026-06-26) ──
+# Kullanıcı: "aracın 2m önünde koyduğumuz nokta YOL AYRIMINI geçtiği anda blokaj
+# yapalım; araç durup 15 sn beklemediği sürece hesaplamasın."
+# Mekanizma: aracın BURUN_MESAFE_M önündeki "burun" noktası bir YOL AYRIMI (grafta
+# yolun DALLANDIĞI düğüm — out-degree ≥ 2; kullanıcı seçimi) geçtiği an rota HESABI
+# KİLİTLENİR (_hesap_kilitli=True). Kilitliyken planlayıcı YENİDEN HESAPLAMAZ
+# (ne duba reroute'u ne sapma) → araç sol şeride çıkmışken (mid-manevra) cusp/
+# U-dönüşü re-plan'ı tamamen biter. Kilit YALNIZ araç durup DURMA_BEKLEME_SN saniye
+# bekleyince açılır → o STABİL konumdan tek bir temiz recalc yapılır. Duba kilitliyken
+# gelirse control e-stop ile durdurur → araç DURMA_BEKLEME_SN bekler → yeniden planlar
+# (engeli sollar). Bu, "viraja kadar latch"in yerini alır (viraj değil yol ayrımı).
+HESAP_KILIDI_AKTIF   = True   # False → kilit yok (her tetikte recalc — eski davranış)
+BURUN_MESAFE_M       = 2.0    # aracın önündeki burun noktası mesafesi (m); yol ayrımını bununla geçer
+DURMA_BEKLEME_SN     = 15.0   # kilidi açmak için aracın durup bekleyeceği süre (s)
+DURMA_HIZ_ESIK_MS    = 0.15   # ardışık poz'dan tahmini hız bunun altıysa "durdu" sayılır (m/s)
+YOL_AYRIMI_YAKIN_M   = 1.5    # burun bir yol-ayrımı düğümüne bu kadar yaklaşınca "geçti" → kilit (m)
 
 # ── Karşı-şerit (slalom) enjeksiyonu — plan §16 (S-A/S-B/S-C) ──────────────
 # Yalnız ağırlık şişirme rotayı SAPTIRMIYORDU (§10.3 bilinen kısıt): tek-yön
@@ -1155,13 +1157,17 @@ class HedefYoneticisi:
         self._wp_lock = threading.Lock()
 
         # ── Karar komutu (/hedef_komut) blok durumu ──────────────────
-        # Her blok: {x, y, r, taraf, t, t_create, latch}. latch=True (viraja-kadar)
-        # ise TTL/kenar_serbest bloğu düşürmez; konum_callback viraj-sweep'i veya
-        # BLOK_LATCH_MAX_S düşürür. _komut_lock callback↔recalc çakışmasını önler.
+        # Her blok: {x, y, r, taraf, t}. TTL içinde aktif (karar ~1s tazeler).
+        # _komut_lock callback↔recalc çakışmasını önler.
         self._bloklu_engeller = []
         self._komut_lock      = threading.Lock()
-        self._son_aktif_blok  = 0   # aktif blok sayısı (konum_callback'te her tick güncel); sapma off-road guard sinyali (_sapma_reroute_bastir)
-        self._viraj_poz_cache = None  # 'viraj' tipi düğüm pozisyonları (latch serbest kontrolü); load'da/lazy doldurulur
+
+        # ── HESAPLAMA KİLİDİ (yol ayrımı + 15s durma) durumu ──────────
+        self._ayrim_poz_cache = None    # yol-ayrımı (out-degree≥2) düğüm pozisyonları; load'da doldurulur
+        self._hesap_kilitli   = False   # True → recalc bastırılır (burun bir yol ayrımı geçti, 15s durma beklenir)
+        self._durma_baslangic = None    # araç "durdu" sayıldığı an (15s sayacı); hareket edince None
+        self._son_poz_xy      = None    # hız tahmini için bir önceki poz (x,y)
+        self._son_poz_t       = None    # ve zamanı
         # recalc'taki graf mutasyonunu (blok ağırlık-şişirme + slalom enjeksiyon)
         # serialize eder: konum_callback ile hedef_komut_callback ayrı thread'lerde
         # eşzamanlı recalc çağırırsa apply/restore çakışıp ağırlık sızdırmasın.
@@ -1219,6 +1225,11 @@ class HedefYoneticisi:
                 ceza_siyirma_m=CEZA_SIYIRMA_M,
                 blok_sert_aktif=BLOK_SERT_AKTIF,
                 blok_yaricap_m=BLOK_YARICAP_M,
+                hesap_kilidi_aktif=HESAP_KILIDI_AKTIF,
+                burun_mesafe_m=BURUN_MESAFE_M,
+                durma_bekleme_sn=DURMA_BEKLEME_SN,
+                durma_hiz_esik_ms=DURMA_HIZ_ESIK_MS,
+                yol_ayrimi_yakin_m=YOL_AYRIMI_YAKIN_M,
                 b_plan_yaw_rota=B_PLAN_YAW_ROTA_AKTIF,
                 b_plan_offset_m=B_PLAN_OFFSET_M,
                 b_plan_offset_marjin_m=B_PLAN_OFFSET_MARJIN_M,
@@ -1275,7 +1286,7 @@ class HedefYoneticisi:
         self.planner.adj_list.clear()
         self.planner.pred_list.clear()
         self.planner.edge_weights.clear()
-        self._viraj_poz_cache = None   # ÖNCE invalidate (aşağıdaki node_types.clear ile yarış penceresini kapat)
+        self._ayrim_poz_cache = None   # ÖNCE invalidate (aşağıdaki node_types.clear ile yarış penceresini kapat)
         self.planner.node_types.clear()
         self.planner.nodes.clear()
         self.pos_to_node = {}
@@ -1353,16 +1364,16 @@ class HedefYoneticisi:
         rospy.loginfo(f"[graph] {len(slalom_conns)} crossing + {len(slalom_segs)} "
                       f"karşı-şerit segment adayı saklandı (blok-tetikli enjeksiyon).")
 
-        # 'viraj' poz cache'ini YÜKLEME sırasında (subscriber'lar register olmadan,
-        # tek-thread) doldur → runtime'da _viraj_pozlari node_types'ı KİLİTSİZ iterate
-        # etmez (incele: dict-changed-size / stale-cache riski kapanır).
-        self._viraj_poz_cache = [p for p, t in self.planner.node_types.items()
-                                 if t == 'viraj']
+        # YOL AYRIMI (out-degree ≥ 2 = yolun dallandığı düğüm) pozisyonlarını YÜKLEME
+        # sırasında (subscriber'lar register olmadan, tek-thread) doldur → runtime'da
+        # _ayrim_pozlari kilitsiz/güvenli okur. G (networkx) out-degree'yi verir.
+        self._ayrim_poz_cache = [node_to_pos[n] for n in G.nodes()
+                                 if n in node_to_pos and G.out_degree(n) >= 2]
 
         self._graph_loaded = True
         rospy.loginfo(
             f"[graph] Graf yapısından {len(self.planner.nodes)} düğüm başarıyla yüklendi "
-            f"({len(self._viraj_poz_cache)} viraj)."
+            f"({len(self._ayrim_poz_cache)} yol ayrımı)."
         )
 
         if not self.geo_targets_built:
@@ -1461,14 +1472,12 @@ class HedefYoneticisi:
         # yeniden rota çizmiyoruz; araç committed overtake path'ini (B→A→hedef
         # döner) sürer. (Sadece sayacı izlemeye devam — başka tüketici yok.)
         if HEDEF_KOMUT_AKTIF:
-            # LATCH'li duba bloklarını viraja gelince/fail-safe'de serbest bırak
-            # (reroute YOK → committed path korunur). Sonra aktif blok sayısını izle.
-            # try/except: sweep konum_callback'i (üst-düzey guard'sız) çökertmesin.
+            # HESAPLAMA KİLİDİ: burun yol ayrımını geçince kilitle; araç 15s durunca aç
+            # (+ bir temiz recalc). try/except: konum_callback'i (üst-düzey guard'sız) çökertmesin.
             try:
-                self._latch_viraj_sweep()
+                self._kilit_guncelle()
             except Exception as e:  # noqa: BLE001
-                rospy.logwarn_throttle(5.0, f"[latch] sweep hatası: {e!r}")
-            self._son_aktif_blok = len(self._aktif_bloklar())
+                rospy.logwarn_throttle(5.0, f"[kilit] güncelleme hatası: {e!r}")
 
         # ── Otomatik WP geçişi: hafif map-matching ──────────────────
         # FAZ3: tek-tek +1 yerine, aracın rotadaki yerini İLERİ pencerede
@@ -1572,54 +1581,24 @@ class HedefYoneticisi:
 
             if (sapma_sureli
                     and now - self.son_hesaplama_zamani > 5.0):
-                # ── Off-road guard — sollama ortasında reroute YAPMA ──
-                # İki bastırma sebebi:
-                # (A) start ters-yön (REVİZYON 5): araç karşı şeride (tek-yön TERS lane)
-                #     geçince start çıkışı ancak U-dönüşüyle → recalc sürülemez rota
-                #     üretip aracı yoldan çıkarıyordu (manuel_20260626T141631Z).
-                # (B) AKTİF DUBA BLOĞU (kullanıcı 2026-06-26, canlı 185629Z @18:57:00):
-                #     araç sol şeride çıkmışken (sollama ortası) "sapma" BEKLENEN — araç
-                #     bilerek şerit dışında. Reroute, karşı-şerit start'ından min_yaricap
-                #     ~0.8m SÜRÜLEMEZ rota üretiyordu. (A) salt geometrik (U-dönüşü) olduğu
-                #     için dönüş ortasını (yaw~49°) kaçırdı; (B) blok-tabanlı olduğundan
-                #     yaw'dan bağımsız tüm sollama penceresini yakalar. Latch'li blok
-                #     viraja gelince düşünce (sweep) sapma normale döner → committed
-                #     overtake path (A→B→A) korunur.
-                bastir_neden = self._sapma_reroute_bastir()
-                if bastir_neden:
-                    rospy.logwarn_throttle(
-                        2.0, f"[sapma] {bastir_neden} → reroute bastırıldı; committed path "
-                             f"korunuyor (off-road guard)")
-                    if self.logger is not None:
-                        self.logger.log_event(
-                            "sapma_bastirildi", neden=bastir_neden,
-                            min_dist=round(min_dist, 2),
-                            robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
-                            yaw_deg=round(math.degrees(self.robot_yaw), 2)
-                            if self.robot_yaw is not None else None,
-                            wp_idx=self.current_wp_index)
-                    # Debounce'u SIFIRLA → bu hem structured log'u hem guard hesabını
-                    # kısar (her tick değil; sapma ESIK üstünde SAPMA_DEBOUNCE_SURE
-                    # sürünce bir kez), hem de araç ileri şeride dönünce sapma yeniden
-                    # birikip (~1.5s) tetiklenir. son_hesaplama_zamani'ne dokunma
-                    # (5s cooldown gerçek reroute içindir; guard reroute yapmadı).
-                    self._sapma_baslangic = None
-                else:
-                    sapma_suresi = now - self._sapma_baslangic
-                    print(f"{SARI}>>> [DİKKAT] Burun rotadan {min_dist:.1f}m uzak "
-                          f"({sapma_suresi:.1f}s süregeldi)! Güncelleniyor...{SIFIRLA}")
-                    if self.logger is not None:
-                        self.logger.log_event("sapma", min_dist=round(min_dist, 2),
-                                              esik=SAPMA_ESIK_METRE,
-                                              burun=[round(burun_x, 2), round(burun_y, 2)],
-                                              robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
-                                              yaw_deg=round(math.degrees(self.robot_yaw), 2)
-                                              if self.robot_yaw is not None else None,
-                                              wp_idx=self.current_wp_index,
-                                              task_idx=self.current_task_index)
-                    self.son_hesaplama_zamani = now
-                    self._sapma_baslangic = None   # FAZ2: reroute sonrası debounce sıfırla
-                    self.recalculate_path_from_robot(reason="sapma")
+                # Sapma → reroute. Mid-manevra (araç sol şeride çıkmışken) cusp/U-dönüşü
+                # re-plan'ını artık HESAPLAMA KİLİDİ engelliyor (burun yol ayrımını geçince
+                # kilitli; recalc kilitliyse erken döner) → ayrı off-road guard gereksiz.
+                sapma_suresi = now - self._sapma_baslangic
+                print(f"{SARI}>>> [DİKKAT] Burun rotadan {min_dist:.1f}m uzak "
+                      f"({sapma_suresi:.1f}s süregeldi)! Güncelleniyor...{SIFIRLA}")
+                if self.logger is not None:
+                    self.logger.log_event("sapma", min_dist=round(min_dist, 2),
+                                          esik=SAPMA_ESIK_METRE,
+                                          burun=[round(burun_x, 2), round(burun_y, 2)],
+                                          robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
+                                          yaw_deg=round(math.degrees(self.robot_yaw), 2)
+                                          if self.robot_yaw is not None else None,
+                                          wp_idx=self.current_wp_index,
+                                          task_idx=self.current_task_index)
+                self.son_hesaplama_zamani = now
+                self._sapma_baslangic = None   # FAZ2: reroute sonrası debounce sıfırla
+                self.recalculate_path_from_robot(reason="sapma")
 
         # ── Konum izi (kısılmış; pose.csv) ──────────────────────────
         # pose_due(): throttle hint — mesafe hesapları sadece yazılacaksa
@@ -1709,29 +1688,20 @@ class HedefYoneticisi:
                         mevcut['t'] = now          # tazeleme → reroute yok
                     else:
                         self._bloklu_engeller.append(
-                            {'x': ox, 'y': oy, 'r': r, 'taraf': taraf, 't': now,
-                             't_create': now, 'latch': BLOK_VIRAJA_KADAR_AKTIF})
+                            {'x': ox, 'y': oy, 'r': r, 'taraf': taraf, 't': now})
                         kume_degisti = True
-                        reroute_iste = True        # YENİ engel → bloklu reroute (gerekirse karşı şeride sap)
+                        reroute_iste = True        # YENİ engel → bloklu reroute (recalc kilidi izin verirse)
             elif komut == 'kenar_serbest':
-                # LATCH (viraja-kadar): latch'li blok kenar_serbest'le DÜŞMEZ — yalnız
-                # robot viraja gelince (konum_callback sweep) ya da fail-safe ile düşer.
-                # Bu, kenar_blok↔kenar_serbest flip-flop reroute'unu öldürür ve sollama
-                # ortasında geri-sapmayı engeller (kullanıcı: "viraja girene kadar").
                 ox, oy = _f(2), _f(3)
                 with self._komut_lock:
                     mevcut = (self._yakin_blok_bul(ox, oy)
                               if ox is not None and oy is not None else None)
                     if mevcut is not None:
-                        if not mevcut.get('latch'):
-                            self._bloklu_engeller.remove(mevcut)
-                            kume_degisti = True
-                        # latch'li ise: yok say (viraja kadar kullanılamaz kalsın)
-                    elif self._bloklu_engeller:        # eşleşme yoksa LATCH'siz olanları temizle
-                        kalan = [b for b in self._bloklu_engeller if b.get('latch')]
-                        if len(kalan) != len(self._bloklu_engeller):
-                            self._bloklu_engeller = kalan
-                            kume_degisti = True
+                        self._bloklu_engeller.remove(mevcut)
+                        kume_degisti = True
+                    elif self._bloklu_engeller:        # eşleşme yoksa hepsini temizle (güvenli)
+                        self._bloklu_engeller.clear()
+                        kume_degisti = True
                 # NOT: reroute_iste = False kalır → committed path'i koru (off-road fix)
             elif komut == 'replan':
                 kume_degisti = True
@@ -1764,85 +1734,67 @@ class HedefYoneticisi:
         return None
 
     def _aktif_bloklar(self):
-        """Aktif blokları döndürür. LATCH'siz blok: TTL içindeyse aktif. LATCH'li
-        (viraja-kadar) blok: TTL'den bağımsız HEP aktif — yalnız konum_callback
-        viraj-sweep'i (robot köşeye gelince) ya da BLOK_LATCH_MAX_S fail-safe düşürür.
-        Süresi geçen LATCH'siz blokları listeden ayıklar."""
+        """TTL içindeki blokları döndürür; süresi geçenleri listeden ayıklar.
+        (karar engeli ~1s'de tazeler; dropout'ta karar obstacle_memory köprüsü tutar.)"""
         now = time.time()
         with self._komut_lock:
-            taze = [b for b in self._bloklu_engeller
-                    if b.get('latch') or (now - b['t'] <= BLOK_TTL_S)]
+            taze = [b for b in self._bloklu_engeller if now - b['t'] <= BLOK_TTL_S]
             if len(taze) != len(self._bloklu_engeller):
                 self._bloklu_engeller = taze
             return [(b['x'], b['y'], b['r']) for b in taze]
 
-    def _viraj_pozlari(self):
-        """'viraj' tipi düğüm pozisyonları (latch serbest kontrolü). Bir kez
-        hesaplanıp cache'lenir (graf yeniden yüklenince _load_graph_from_import sıfırlar)."""
-        if self._viraj_poz_cache is None:
-            self._viraj_poz_cache = [p for p, t in self.planner.node_types.items()
-                                     if t == 'viraj']
-        return self._viraj_poz_cache
+    def _ayrim_pozlari(self):
+        """Yol-ayrımı (out-degree ≥ 2 = yolun dallandığı) düğüm pozisyonları.
+        _load_graph_from_import'ta doldurulur (kilitsiz/güvenli okuma)."""
+        return self._ayrim_poz_cache or []
 
-    def _latch_viraj_sweep(self):
-        """LATCH'li (viraja-kadar) blokları serbest bırakır (listeden çıkarır):
-          • robot ÖNÜNDEKİ bir 'viraj' düğümüne VIRAJ_YAKIN_M'den yaklaştıysa VE duba
-            artık GERİDE kaldıysa (yaw yönünde geçildi) → "yol viraja girdi, duba geçildi",
-          • ya da blok BLOK_LATCH_MAX_S'den eski (fail-safe; viraja hiç ulaşılmadı).
-        YÖN-FARKINDA (incele-algoritma YÜKSEK fix): viraj-yakınlık + duba-geride saf
-        mesafe DEĞİL, aracın yaw yönüne göre değerlendirilir. Yoksa köşeden yeni çıkışta
-        (GERİDE kalan köşe ≤VIRAJ_YAKIN_M + duba ileride) latch erken düşüp flip-flop'u
-        geri getirirdi. yaw bilinmiyorsa viraj-serbest YAPILMAZ (yalnız fail-safe TTL).
-        konum_callback'ten her poz'da çağrılır; reroute TETİKLEMEZ (committed path korunur)."""
-        if not (BLOK_VIRAJA_KADAR_AKTIF and HEDEF_KOMUT_AKTIF):
+    def _kilit_guncelle(self):
+        """HESAPLAMA KİLİDİ durumunu günceller (konum_callback'ten her poz'da; reroute
+        TETİKLEMEZ — yalnız kilit AÇILINCA bir temiz recalc çağırır). Kullanıcı kararı:
+        "burun bir yol ayrımını geçince blokaj; araç durup 15s beklemeden hesaplamasın."
+          • KİLİTLE: aracın BURUN_MESAFE_M önündeki burun noktası bir YOL AYRIMI düğümüne
+            YOL_AYRIMI_YAKIN_M'den yaklaşırsa → _hesap_kilitli=True. Kilitliyken recalc YOK
+            → araç sol şeride çıkmışken (mid-manevra) cusp/U-dönüşü re-plan'ı biter.
+          • AÇ: araç DURMA_HIZ_ESIK_MS altına inip DURMA_BEKLEME_SN saniye beklerse →
+            _hesap_kilitli=False + o STABİL konumdan bir temiz recalc (engeli sollar).
+        Hız ardışık poz'dan tahmin edilir."""
+        if not HESAP_KILIDI_AKTIF:
             return
         rx, ry, yaw = self.robot_x, self.robot_y, self.robot_yaw
         if rx is None or ry is None:
             return
         now = time.time()
-        fwd = (math.cos(yaw), math.sin(yaw)) if yaw is not None else None
-        # Yalnız ÖNDEKİ viraja yaklaşmak "viraja girdi" sayılır (geride bıraktığımız köşe değil).
-        viraj_yakin = bool(fwd) and any(
-            math.hypot(rx - vx, ry - vy) <= VIRAJ_YAKIN_M
-            and (vx - rx) * fwd[0] + (vy - ry) * fwd[1] > 0.0
-            for (vx, vy) in self._viraj_pozlari())
-        n_serbest = 0
-        with self._komut_lock:
-            kalan = []
-            for b in self._bloklu_engeller:
-                if b.get('latch'):
-                    # duba GERİDE mi (yaw yönünde ARKA KENARI geçildi, dot < -r)? Merkez
-                    # (dot<0) yerine -r eşiği: dönüş ortasında (duba henüz tam geçilmemiş)
-                    # latch erken düşmesin → sollama penceresi boyunca aktif kalır (sapma
-                    # off-road guard'ının sinyali). yaw yoksa serbest bırakma.
-                    cone_geride = (fwd is not None
-                                   and (b['x'] - rx) * fwd[0] + (b['y'] - ry) * fwd[1] < -b['r'])
-                    if viraj_yakin and cone_geride:
-                        continue   # yol viraja girdi + duba geçildi → serbest
-                    if now - b.get('t_create', b['t']) > BLOK_LATCH_MAX_S:
-                        continue   # fail-safe: viraja hiç ulaşılmadı → düşür
-                kalan.append(b)
-            if len(kalan) != len(self._bloklu_engeller):
-                n_serbest = len(self._bloklu_engeller) - len(kalan)
-                self._bloklu_engeller = kalan
-        if n_serbest:   # log _komut_lock DIŞINDA (kritik bölgeyi log I/O kadar uzatma)
-            rospy.loginfo_throttle(
-                2.0, f"[latch] {n_serbest} duba bloğu serbest (viraja girildi / fail-safe)")
-
-    def _sapma_reroute_bastir(self):
-        """Sapma (deviation) reroute'u bastırılmalı mı? Sebebi (str) döndürür, yoksa None.
-        TEK sebep — "sollama_aktif": aktif duba bloğu var (sollama ortası, araç bilerek
-        şerit dışında — sol şeritte). Bu konumdan reroute, karşı-şerit start'ından dar/
-        sürülemez (~0.8m yarıçap, canlı 185629Z @18:57:00) rota üretir; committed overtake
-        path (A→B→A) korunmalı. Latch'li blok viraja gelince düşünce sapma normale döner.
-        NOT: Eski "ters_yon_start" (başlangıç-düğümü U-dönüşü tahmini) KALDIRILDI →
-        çıktı cusp kapısı (recalc'ta, gerçek rotada cusp varsa COMMIT ETME) onu tetikleyiciden
-        BAĞIMSIZ ve daha sağlam kapsıyor (dokümante 141631Z vakası max-dönüş 167°=cusp idi).
-        sollama_aktif ise gerek var: o rota cusp değil ama dar (61°/0.8m) olabiliyor →
-        çıktı kapısı kesmez, bu girdi guard'ı keser."""
-        if HEDEF_KOMUT_AKTIF and self._son_aktif_blok > 0:
-            return "sollama_aktif"
-        return None
+        # Hız tahmini (ardışık poz) → durma tespiti
+        hiz = None
+        if self._son_poz_xy is not None and self._son_poz_t is not None:
+            dt = now - self._son_poz_t
+            if dt > 1e-3:
+                hiz = math.hypot(rx - self._son_poz_xy[0], ry - self._son_poz_xy[1]) / dt
+        self._son_poz_xy = (rx, ry)
+        self._son_poz_t = now
+        # Burun bir yol ayrımını geçti mi → KİLİTLE
+        if not self._hesap_kilitli and yaw is not None:
+            bx = rx + BURUN_MESAFE_M * math.cos(yaw)
+            by = ry + BURUN_MESAFE_M * math.sin(yaw)
+            if any(math.hypot(bx - ax, by - ay) <= YOL_AYRIMI_YAKIN_M
+                   for (ax, ay) in self._ayrim_pozlari()):
+                self._hesap_kilitli = True
+                self._durma_baslangic = None
+                rospy.loginfo_throttle(
+                    2.0, "[kilit] burun yol ayrımını geçti → hesaplama KİLİTLENDİ (15s durma açar)")
+        # 15s durma → KİLİDİ AÇ + bir temiz recalc
+        if self._hesap_kilitli:
+            if hiz is not None and hiz < DURMA_HIZ_ESIK_MS:
+                if self._durma_baslangic is None:
+                    self._durma_baslangic = now
+                elif now - self._durma_baslangic >= DURMA_BEKLEME_SN:
+                    self._hesap_kilitli = False
+                    self._durma_baslangic = None
+                    rospy.loginfo(
+                        f"[kilit] araç {DURMA_BEKLEME_SN:.0f}s durdu → hesaplama AÇILDI (temiz recalc)")
+                    self.recalculate_path_from_robot(reason="kilit_acildi")
+            else:
+                self._durma_baslangic = None   # hareket var → durma sayacı sıfırla
 
     def _engel_rotada(self, path, engeller):
         """Aktif engellerden HERHANGİ biri verilen (bloksuz baseline) rotanın
@@ -2149,6 +2101,19 @@ class HedefYoneticisi:
                 self.planner.restore_edge_directed(n, start_node)
 
     def recalculate_path_from_robot(self, reason: str = "?") -> None:
+        # ── HESAPLAMA KİLİDİ (yol ayrımı + 15s durma) ──
+        # Burun bir yol ayrımını geçtiyse (_hesap_kilitli) ve elde committed path
+        # VARSA → YENİDEN HESAPLAMA (kullanıcı: "araç durup 15s beklemeden hesaplamasın").
+        # Mid-manevra cusp/U-dönüşü re-plan'ı tamamen biter; kilit yalnız 15s durma açar
+        # (_kilit_guncelle, reason="kilit_acildi" ile o stabil konumdan bir kez çağırır).
+        # İlk rota (committed yok) daima geçer (araç başlasın).
+        if (HESAP_KILIDI_AKTIF and self._hesap_kilitli and self.full_path_world
+                and reason != "kilit_acildi"):
+            rospy.loginfo_throttle(
+                2.0, f"[kilit] hesaplama kilitli (yol ayrımı geçildi) → recalc atlandı "
+                     f"({reason}); 15s durma açar")
+            return
+
         if not self.geo_targets_world or not self.planner.nodes:
             rospy.logwarn("[recalculate] geo_targets veya planner.nodes boş!")
             return
