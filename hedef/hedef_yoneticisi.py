@@ -1524,21 +1524,45 @@ class HedefYoneticisi:
 
             if (sapma_sureli
                     and now - self.son_hesaplama_zamani > 5.0):
-                sapma_suresi = now - self._sapma_baslangic
-                print(f"{SARI}>>> [DİKKAT] Burun rotadan {min_dist:.1f}m uzak "
-                      f"({sapma_suresi:.1f}s süregeldi)! Güncelleniyor...{SIFIRLA}")
-                if self.logger is not None:
-                    self.logger.log_event("sapma", min_dist=round(min_dist, 2),
-                                          esik=SAPMA_ESIK_METRE,
-                                          burun=[round(burun_x, 2), round(burun_y, 2)],
-                                          robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
-                                          yaw_deg=round(math.degrees(self.robot_yaw), 2)
-                                          if self.robot_yaw is not None else None,
-                                          wp_idx=self.current_wp_index,
-                                          task_idx=self.current_task_index)
-                self.son_hesaplama_zamani = now
-                self._sapma_baslangic = None   # FAZ2: reroute sonrası debounce sıfırla
-                self.recalculate_path_from_robot(reason="sapma")
+                # ── Off-road guard (REVİZYON 5): slalom sırasında araç karşı şeride
+                # (tek-yön TERS lane) geçince sapma tetikleniyor; ama oradaki start
+                # düğümünden ileri çıkış ancak U-dönüşüyle → recalc sürülemez saçma
+                # rota üretip aracı yoldan çıkarıyordu (canlı manuel_20260626T141631Z:
+                # 4× ardışık sapma, start ters-yön B, min_yaricap 0.6m, max-dönüş 167°).
+                # Start ters-yön ise reroute YAPMA, committed slalom path'i koru.
+                if self._ters_yon_start_riski():
+                    rospy.logwarn_throttle(
+                        2.0, "[sapma] start ters-yön/karşı şerit → reroute U-dönüşü "
+                             "riski; committed path korunuyor (off-road guard)")
+                    if self.logger is not None:
+                        self.logger.log_event(
+                            "sapma_bastirildi", neden="ters_yon_start",
+                            min_dist=round(min_dist, 2),
+                            robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
+                            yaw_deg=round(math.degrees(self.robot_yaw), 2),
+                            wp_idx=self.current_wp_index)
+                    # Debounce'u SIFIRLA → bu hem structured log'u hem guard hesabını
+                    # kısar (her tick değil; sapma ESIK üstünde SAPMA_DEBOUNCE_SURE
+                    # sürünce bir kez), hem de araç ileri şeride dönünce sapma yeniden
+                    # birikip (~1.5s) tetiklenir. son_hesaplama_zamani'ne dokunma
+                    # (5s cooldown gerçek reroute içindir; guard reroute yapmadı).
+                    self._sapma_baslangic = None
+                else:
+                    sapma_suresi = now - self._sapma_baslangic
+                    print(f"{SARI}>>> [DİKKAT] Burun rotadan {min_dist:.1f}m uzak "
+                          f"({sapma_suresi:.1f}s süregeldi)! Güncelleniyor...{SIFIRLA}")
+                    if self.logger is not None:
+                        self.logger.log_event("sapma", min_dist=round(min_dist, 2),
+                                              esik=SAPMA_ESIK_METRE,
+                                              burun=[round(burun_x, 2), round(burun_y, 2)],
+                                              robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
+                                              yaw_deg=round(math.degrees(self.robot_yaw), 2)
+                                              if self.robot_yaw is not None else None,
+                                              wp_idx=self.current_wp_index,
+                                              task_idx=self.current_task_index)
+                    self.son_hesaplama_zamani = now
+                    self._sapma_baslangic = None   # FAZ2: reroute sonrası debounce sıfırla
+                    self.recalculate_path_from_robot(reason="sapma")
 
         # ── Konum izi (kısılmış; pose.csv) ──────────────────────────
         # pose_due(): throttle hint — mesafe hesapları sadece yazılacaksa
@@ -1681,6 +1705,43 @@ class HedefYoneticisi:
             if len(taze) != len(self._bloklu_engeller):
                 self._bloklu_engeller = taze
             return [(b['x'], b['y'], b['r']) for b in taze]
+
+    def _ters_yon_start_riski(self) -> bool:
+        """SAPMA reroute'unu tetiklemeden ÖNCE kontrol: aracın o anki konumunda
+        seçilecek start düğümünden ileri çıkış ancak U-DÖNÜŞÜYLE mümkün mü (ters-yön)?
+        Slalom sırasında araç karşı şeride (tek-yön TERS lane) geçince start o şeridin
+        düğümüne snap olur; oranın forward kenarları aracın yaw'ına ~180° ters → recalc
+        sürülemez saçma rota üretir (canlı: min_yaricap 0.6m, max-dönüş 167°, araç yoldan
+        çıktı). True → SAPMA reroute YAPMA, committed slalom path'i koru (A→B→A zaten
+        döner). Araç ileri şeride dönünce guard kalkar → sapma normal çalışır.
+        Bu, kenar_serbest off-road fix'inin (REVİZYON 4) SAPMA yoluna genişletilmiş hâli;
+        YALNIZ sapma için — blok (kenar_blok) reroute'u etkilenmez.
+        NOT: `_aktif_bloklar()` çağrısı yan etkili — TTL'i geçmiş blokları ayıklar.
+        Guard base adj_list'i (SERT blokla geçici silinen kenarları DEĞİL) okur;
+        amacı 'blok var mı' değil 'çıkış U-dönüşü mü' olduğundan bu doğru."""
+        if self.robot_yaw is None:
+            return False
+        rx, ry = self.robot_x, self.robot_y
+        # _aktif_bloklar _komut_lock alır → _graf_lock'tan ÖNCE çağır (nesting yok).
+        _ileri = (ILERI_MESAFE_BLOK_M if (HEDEF_KOMUT_AKTIF and self._aktif_bloklar())
+                  else ILERI_MESAFE_M)
+        fx = rx + _ileri * math.cos(self.robot_yaw)
+        fy = ry + _ileri * math.sin(self.robot_yaw)
+        # Graf okuması _graf_lock altında: hedef_komut_callback thread'i recalc'ta
+        # blok mutasyonu (kenar sil/enjekte) yaparken nodes/adj_list yarışmasın.
+        with self._graf_lock:
+            if not self.planner.nodes:
+                return False
+            start = min(self.planner.nodes,
+                        key=lambda n: (n[0] - fx) ** 2 + (n[1] - fy) ** 2)
+            nbrs = [n for n in self.planner.adj_list.get(start, []) if n != start]
+        if not nbrs:
+            return True   # çıkışsız düğüm → reroute saçma/yarım rota olur
+        # start'tan çıkan forward kenarların aracın yaw'ına göre EN KÜÇÜK başlangıç
+        # dönüşü cusp eşiğini aşıyorsa → tüm çıkışlar U-dönüşü gerektiriyor = ters-yön.
+        min_turn = min(_yon_farki(math.atan2(n[1] - start[1], n[0] - start[0]),
+                                  self.robot_yaw) for n in nbrs)
+        return min_turn >= DONUS_CUSP_ESIK
 
     def _blok_uygula(self):
         """Aktif blokları grafa uygular + engel çevresine karşı-şerit crossing
