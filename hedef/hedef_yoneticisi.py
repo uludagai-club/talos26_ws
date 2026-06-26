@@ -138,6 +138,21 @@ BLOK_MARJIN_M          = 1.5    # blok yarıçapına eklenen pay (m): araç ön 
 BLOK_SERT_AKTIF        = True   # True → engel çemberini SERT sil (varsayılan); False → eski ağırlık-şişirme
 BLOK_YARICAP_M         = 1.0    # engel çemberi yarıçapı (m); etkin = max(engel_r, bu). Kullanıcı: 1m.
 
+# ── BLOK-VİRAJA-KADAR (latch) — kullanıcı kararı 2026-06-26 ───────────────
+# Kullanıcı: "dubanın olduğu waypoint'i yol viraja girene kadar kullanılamaz yap."
+# Engel bloğu, robot bir SONRAKİ viraja (köşe) yaklaşana kadar LATCH'lenir →
+# TTL bitişi VE kenar_serbest onu ERKEN DÜŞÜRMEZ. Kazanımlar:
+#   (a) blok düz boyunca KARARLI kalır → kenar_blok↔kenar_serbest FLIP-FLOP reroute
+#       biter (canlı log 20260626T103648Z: 122 hedef_komut / 27 reroute=true).
+#   (b) araç sollama ortasında karşı şeride/yola geri zıplamaz (off-road fix'i güçlendirir).
+#   (c) robot köşeye (viraj düğümü) gelince latch düşer → tek-yön loop grafı
+#       KALICI bozulmaz, sonraki düz için graf temizdir.
+# Fail-safe: viraja hiç ulaşılmazsa blok BLOK_LATCH_MAX_S sonra düşer. Latch
+# SERBEST bırakma reroute TETİKLEMEZ (yalnız blok düşer → committed path korunur).
+BLOK_VIRAJA_KADAR_AKTIF = True   # True → duba bloğu viraja kadar latch'li (kullanıcı isteği)
+VIRAJ_YAKIN_M           = 4.0    # robot bir 'viraj' düğümüne bu kadar yaklaşınca latch'ler serbest (m)
+BLOK_LATCH_MAX_S        = 30.0   # latch fail-safe üst sınırı (viraja hiç ulaşılmazsa blok düşer) (s)
+
 # ── Karşı-şerit (slalom) enjeksiyonu — plan §16 (S-A/S-B/S-C) ──────────────
 # Yalnız ağırlık şişirme rotayı SAPTIRMIYORDU (§10.3 bilinen kısıt): tek-yön
 # şeritte alternatif yoksa engel kenarı pahalanır ama planlayıcı yine düz geçer.
@@ -156,10 +171,25 @@ BLOK_YARICAP_M         = 1.0    # engel çemberi yarıçapı (m); etkin = max(en
 # "ters şeritten kolay yol" bug'ı (§0) dönmez. Sürülemez U-dönüşlerini turn-aware
 # cusp kapısı eler → enjeksiyon YALNIZ TURN_AWARE iken.
 SLALOM_ENJEKSIYON_AKTIF = True
+# SLALOM_YALNIZ_GEREKINCE (kullanıcı 2026-06-26 "duba sol şeritte → hep sollamaya
+# çalışıyorsun"): enjeksiyonu recalc'ta ÖNCE DENEMEZ. SERT blok uygulanır, rota
+# enjeksiyonSUZ aranır → engel KARŞI ŞERİTTEYSE (kendi şeridini tıkamıyorsa) rota
+# zaten bulunur → karşı şeride GEÇİLMEZ (sollama YAPILMAZ, dubanın olduğu şeride
+# girilmez). YALNIZ kendi şerit gerçekten tıkalıysa (rota None) crossing enjekte
+# edilip tekrar aranır. Böylece "her duba görünce sollama" davranışı, "yalnız
+# kendi şeridindeki dubada dar/yerel sollama"ya iner. False → eski (her blokta
+# enjekte) davranış. Reversible.
+SLALOM_YALNIZ_GEREKINCE = True
+# "Engel kendi rotada mı" eşiği = SERT blok çemberiyle BİREBİR aynı: max(engel_r,
+# BLOK_YARICAP_M). Engel çemberi bloksuz baseline rotayı kesiyorsa rotayı tıkıyor
+# sayılır → sollama gerek. Aynı çember sert_blok'ta rota kenarını da sileceğinden
+# tutarlı (eşik küçük seçilse büyük-r engelde "rota dışı" derken sert_blok rotayı
+# kesip enjeksiyonsuz farklı-sokak yapabilirdi). r≈1m default'ta şerit ayrımı ~2m
+# olduğundan (A y≈-34.27 ↔ B y≈-32.29) kendi şerit (~0m) ile karşı şeridi (~2m) net ayırır.
 CEZA_TERS_CIKIS         = 90    # ters şerite ÇIKMA (crossing) cezası (4.6x) — PAHALI: az geçiş
 CEZA_TERS_KALMA         = 0     # ters şeritte KALMA (karşı-şerit ileri seyir) cezası (1.0x) — UCUZ: solda kal
 BLOK_EK_CEZA            = 50.0  # bloklu kenara TOPLAMSAL ceza (m) — detour'u baskın yap; sonlu (fail-safe)
-SLALOM_ENJEKSIYON_R     = 8.0   # crossing/segment endpoint'i engele bu kadar yakınsa enjekte (m)
+SLALOM_ENJEKSIYON_R     = 6.0   # crossing/segment endpoint'i engele bu kadar yakınsa enjekte (m) — 8→6 azalt (lokalize slalom)
 # Giriş crossing'i engeli SIYIRMASIN ("bir waypoint önce dön", kullanıcı 2026-06-24):
 # tek-dip girişi (A→B diyagonali) engele AT başlıyordu → engeli ~0.06m sıyırıp
 # (path engel DÜĞÜMÜnden geçince) karar `engel_blokaj` verip durduruyordu. Çözüm:
@@ -1125,10 +1155,13 @@ class HedefYoneticisi:
         self._wp_lock = threading.Lock()
 
         # ── Karar komutu (/hedef_komut) blok durumu ──────────────────
-        # Her blok: {x, y, r, taraf, t}. _komut_lock callback↔recalc çakışmasını önler.
+        # Her blok: {x, y, r, taraf, t, t_create, latch}. latch=True (viraja-kadar)
+        # ise TTL/kenar_serbest bloğu düşürmez; konum_callback viraj-sweep'i veya
+        # BLOK_LATCH_MAX_S düşürür. _komut_lock callback↔recalc çakışmasını önler.
         self._bloklu_engeller = []
         self._komut_lock      = threading.Lock()
         self._son_aktif_blok  = 0   # TTL düşüşünde tek-sefer reroute tetiği için
+        self._viraj_poz_cache = None  # 'viraj' tipi düğüm pozisyonları (latch serbest kontrolü); load'da/lazy doldurulur
         # recalc'taki graf mutasyonunu (blok ağırlık-şişirme + slalom enjeksiyon)
         # serialize eder: konum_callback ile hedef_komut_callback ayrı thread'lerde
         # eşzamanlı recalc çağırırsa apply/restore çakışıp ağırlık sızdırmasın.
@@ -1242,6 +1275,7 @@ class HedefYoneticisi:
         self.planner.adj_list.clear()
         self.planner.pred_list.clear()
         self.planner.edge_weights.clear()
+        self._viraj_poz_cache = None   # ÖNCE invalidate (aşağıdaki node_types.clear ile yarış penceresini kapat)
         self.planner.node_types.clear()
         self.planner.nodes.clear()
         self.pos_to_node = {}
@@ -1319,9 +1353,16 @@ class HedefYoneticisi:
         rospy.loginfo(f"[graph] {len(slalom_conns)} crossing + {len(slalom_segs)} "
                       f"karşı-şerit segment adayı saklandı (blok-tetikli enjeksiyon).")
 
+        # 'viraj' poz cache'ini YÜKLEME sırasında (subscriber'lar register olmadan,
+        # tek-thread) doldur → runtime'da _viraj_pozlari node_types'ı KİLİTSİZ iterate
+        # etmez (incele: dict-changed-size / stale-cache riski kapanır).
+        self._viraj_poz_cache = [p for p, t in self.planner.node_types.items()
+                                 if t == 'viraj']
+
         self._graph_loaded = True
         rospy.loginfo(
-            f"[graph] Graf yapısından {len(self.planner.nodes)} düğüm başarıyla yüklendi."
+            f"[graph] Graf yapısından {len(self.planner.nodes)} düğüm başarıyla yüklendi "
+            f"({len(self._viraj_poz_cache)} viraj)."
         )
 
         if not self.geo_targets_built:
@@ -1420,6 +1461,13 @@ class HedefYoneticisi:
         # yeniden rota çizmiyoruz; araç committed overtake path'ini (B→A→hedef
         # döner) sürer. (Sadece sayacı izlemeye devam — başka tüketici yok.)
         if HEDEF_KOMUT_AKTIF:
+            # LATCH'li duba bloklarını viraja gelince/fail-safe'de serbest bırak
+            # (reroute YOK → committed path korunur). Sonra aktif blok sayısını izle.
+            # try/except: sweep konum_callback'i (üst-düzey guard'sız) çökertmesin.
+            try:
+                self._latch_viraj_sweep()
+            except Exception as e:  # noqa: BLE001
+                rospy.logwarn_throttle(5.0, f"[latch] sweep hatası: {e!r}")
             self._son_aktif_blok = len(self._aktif_bloklar())
 
         # ── Otomatik WP geçişi: hafif map-matching ──────────────────
@@ -1652,20 +1700,29 @@ class HedefYoneticisi:
                         mevcut['t'] = now          # tazeleme → reroute yok
                     else:
                         self._bloklu_engeller.append(
-                            {'x': ox, 'y': oy, 'r': r, 'taraf': taraf, 't': now})
+                            {'x': ox, 'y': oy, 'r': r, 'taraf': taraf, 't': now,
+                             't_create': now, 'latch': BLOK_VIRAJA_KADAR_AKTIF})
                         kume_degisti = True
-                        reroute_iste = True        # YENİ engel → karşı şeride sap
+                        reroute_iste = True        # YENİ engel → bloklu reroute (gerekirse karşı şeride sap)
             elif komut == 'kenar_serbest':
+                # LATCH (viraja-kadar): latch'li blok kenar_serbest'le DÜŞMEZ — yalnız
+                # robot viraja gelince (konum_callback sweep) ya da fail-safe ile düşer.
+                # Bu, kenar_blok↔kenar_serbest flip-flop reroute'unu öldürür ve sollama
+                # ortasında geri-sapmayı engeller (kullanıcı: "viraja girene kadar").
                 ox, oy = _f(2), _f(3)
                 with self._komut_lock:
                     mevcut = (self._yakin_blok_bul(ox, oy)
                               if ox is not None and oy is not None else None)
                     if mevcut is not None:
-                        self._bloklu_engeller.remove(mevcut)
-                        kume_degisti = True
-                    elif self._bloklu_engeller:        # eşleşme yoksa hepsini temizle (güvenli)
-                        self._bloklu_engeller.clear()
-                        kume_degisti = True
+                        if not mevcut.get('latch'):
+                            self._bloklu_engeller.remove(mevcut)
+                            kume_degisti = True
+                        # latch'li ise: yok say (viraja kadar kullanılamaz kalsın)
+                    elif self._bloklu_engeller:        # eşleşme yoksa LATCH'siz olanları temizle
+                        kalan = [b for b in self._bloklu_engeller if b.get('latch')]
+                        if len(kalan) != len(self._bloklu_engeller):
+                            self._bloklu_engeller = kalan
+                            kume_degisti = True
                 # NOT: reroute_iste = False kalır → committed path'i koru (off-road fix)
             elif komut == 'replan':
                 kume_degisti = True
@@ -1698,13 +1755,67 @@ class HedefYoneticisi:
         return None
 
     def _aktif_bloklar(self):
-        """TTL içindeki blokları döndürür; süresi geçenleri listeden ayıklar."""
+        """Aktif blokları döndürür. LATCH'siz blok: TTL içindeyse aktif. LATCH'li
+        (viraja-kadar) blok: TTL'den bağımsız HEP aktif — yalnız konum_callback
+        viraj-sweep'i (robot köşeye gelince) ya da BLOK_LATCH_MAX_S fail-safe düşürür.
+        Süresi geçen LATCH'siz blokları listeden ayıklar."""
         now = time.time()
         with self._komut_lock:
-            taze = [b for b in self._bloklu_engeller if now - b['t'] <= BLOK_TTL_S]
+            taze = [b for b in self._bloklu_engeller
+                    if b.get('latch') or (now - b['t'] <= BLOK_TTL_S)]
             if len(taze) != len(self._bloklu_engeller):
                 self._bloklu_engeller = taze
             return [(b['x'], b['y'], b['r']) for b in taze]
+
+    def _viraj_pozlari(self):
+        """'viraj' tipi düğüm pozisyonları (latch serbest kontrolü). Bir kez
+        hesaplanıp cache'lenir (graf yeniden yüklenince _load_graph_from_import sıfırlar)."""
+        if self._viraj_poz_cache is None:
+            self._viraj_poz_cache = [p for p, t in self.planner.node_types.items()
+                                     if t == 'viraj']
+        return self._viraj_poz_cache
+
+    def _latch_viraj_sweep(self):
+        """LATCH'li (viraja-kadar) blokları serbest bırakır (listeden çıkarır):
+          • robot ÖNÜNDEKİ bir 'viraj' düğümüne VIRAJ_YAKIN_M'den yaklaştıysa VE duba
+            artık GERİDE kaldıysa (yaw yönünde geçildi) → "yol viraja girdi, duba geçildi",
+          • ya da blok BLOK_LATCH_MAX_S'den eski (fail-safe; viraja hiç ulaşılmadı).
+        YÖN-FARKINDA (incele-algoritma YÜKSEK fix): viraj-yakınlık + duba-geride saf
+        mesafe DEĞİL, aracın yaw yönüne göre değerlendirilir. Yoksa köşeden yeni çıkışta
+        (GERİDE kalan köşe ≤VIRAJ_YAKIN_M + duba ileride) latch erken düşüp flip-flop'u
+        geri getirirdi. yaw bilinmiyorsa viraj-serbest YAPILMAZ (yalnız fail-safe TTL).
+        konum_callback'ten her poz'da çağrılır; reroute TETİKLEMEZ (committed path korunur)."""
+        if not (BLOK_VIRAJA_KADAR_AKTIF and HEDEF_KOMUT_AKTIF):
+            return
+        rx, ry, yaw = self.robot_x, self.robot_y, self.robot_yaw
+        if rx is None or ry is None:
+            return
+        now = time.time()
+        fwd = (math.cos(yaw), math.sin(yaw)) if yaw is not None else None
+        # Yalnız ÖNDEKİ viraja yaklaşmak "viraja girdi" sayılır (geride bıraktığımız köşe değil).
+        viraj_yakin = bool(fwd) and any(
+            math.hypot(rx - vx, ry - vy) <= VIRAJ_YAKIN_M
+            and (vx - rx) * fwd[0] + (vy - ry) * fwd[1] > 0.0
+            for (vx, vy) in self._viraj_pozlari())
+        n_serbest = 0
+        with self._komut_lock:
+            kalan = []
+            for b in self._bloklu_engeller:
+                if b.get('latch'):
+                    # duba GERİDE mi (yaw yönünde geçildi)? yaw yoksa serbest bırakma.
+                    cone_geride = (fwd is not None
+                                   and (b['x'] - rx) * fwd[0] + (b['y'] - ry) * fwd[1] < 0.0)
+                    if viraj_yakin and cone_geride:
+                        continue   # yol viraja girdi + duba geçildi → serbest
+                    if now - b.get('t_create', b['t']) > BLOK_LATCH_MAX_S:
+                        continue   # fail-safe: viraja hiç ulaşılmadı → düşür
+                kalan.append(b)
+            if len(kalan) != len(self._bloklu_engeller):
+                n_serbest = len(self._bloklu_engeller) - len(kalan)
+                self._bloklu_engeller = kalan
+        if n_serbest:   # log _komut_lock DIŞINDA (kritik bölgeyi log I/O kadar uzatma)
+            rospy.loginfo_throttle(
+                2.0, f"[latch] {n_serbest} duba bloğu serbest (viraja girildi / fail-safe)")
 
     def _ters_yon_start_riski(self) -> bool:
         """SAPMA reroute'unu tetiklemeden ÖNCE kontrol: aracın o anki konumunda
@@ -1743,19 +1854,45 @@ class HedefYoneticisi:
                                   self.robot_yaw) for n in nbrs)
         return min_turn >= DONUS_CUSP_ESIK
 
-    def _blok_uygula(self):
-        """Aktif blokları grafa uygular + engel çevresine karşı-şerit crossing
-        (ÇIKMA) ve boylamasına segment (KALMA) kenarlarını GEÇİCİ enjekte eder (§16).
+    def _engel_rotada(self, path, engeller):
+        """Aktif engellerden HERHANGİ biri verilen (bloksuz baseline) rotanın
+        ÜZERİNDE mi — SERT blok çemberi (max(r, BLOK_YARICAP_M)) bir rota segmentini
+        kesiyor mu?
+          • True  → engel kendi şeridimizi tıkıyor → karşı-şerit enjeksiyonu (sollama) gerek.
+          • False → engel karşı şeritte / rota dışı (~2m yanal) → blokla ama SOLLAMA YOK.
+        path None/boşsa False (baseline yoksa karar veremeyiz → güvenli: sollama yok)."""
+        if not path or len(path) < 2 or not engeller:
+            return False
+        for (ox, oy, r) in engeller:
+            yaricap = max(r, BLOK_YARICAP_M)
+            for i in range(len(path) - 1):
+                if _nokta_segment_mesafe(ox, oy, path[i][0], path[i][1],
+                                         path[i + 1][0], path[i + 1][1]) <= yaricap:
+                    return True
+        return False
+
+    def _blok_uygula(self, enjekte=True, engeller=None):
+        """Aktif blokları grafa uygular + (enjekte=True ise) engel çevresine karşı-şerit
+        crossing (ÇIKMA) ve boylamasına segment (KALMA) kenarlarını GEÇİCİ enjekte eder (§16).
         İki blok modu:
           • SERT (BLOK_SERT_AKTIF=True, VARSAYILAN): engel çemberindeki kenarları
             grafdan SİLER → ileri şerit kesilir, planlayıcı karşı şeritten dolanmak
             ZORUNDA (kullanıcı kararı 2026-06-26). Silinen kenarlar `removed_set`'e
             yazılır → enjeksiyon bunları GERİ EKLEMESİN (yoksa ileri şerit yeniden açılır).
           • AĞIRLIK (False): eski sonlu ceza-şişirme (fail-safe ama farklı-sokak riski).
-        Döndürür: (saved, eklenen) — recalc finally'sinde geri yüklenir/kaldırılır."""
+        enjekte=False (SLALOM_YALNIZ_GEREKINCE, engel kendi rotada değil): SADECE
+        blok uygulanır, crossing EKLENMEZ → engel karşı şeritte (rota dışı) → araç
+        kendi şeridinde devam eder, karşı şeride GEÇMEZ (sollama YOK). Karar recalc'ta
+        (_engel_rotada) verilir.
+        engeller: çağıran _aktif_bloklar() snapshot'ını verirse onu kullanır; vermezse
+        kendi çağırır. Çağıran (recalc) _engel_rotada ile AYNI snapshot'ı geçirmeli →
+        D* araması sırasında /hedef_komut yeni blok eklerse enjekte_gerek↔blok seti
+        tutarsızlığı (TOCTOU) oluşmaz (incele bulgusu). Döndürür: (saved, eklenen) —
+        recalc finally'sinde geri yüklenir/kaldırılır."""
         saved = []
         eklenen = []
-        engeller = self._aktif_bloklar()
+        if engeller is None:
+            engeller = self._aktif_bloklar()
         if not engeller:
             return saved, eklenen
         # BASE predecessor snapshot — blok kenar SİLMEDEN ÖNCE al. "Bir waypoint
@@ -1767,6 +1904,8 @@ class HedefYoneticisi:
             saved, removed_set = self._sert_blok(engeller)
         else:
             saved, removed_set = self._agirlik_blok(engeller)
+        if not enjekte:
+            return saved, eklenen   # engel rota dışı → blokla, crossing enjekte etme (sollama yok)
         # Karşı-şerit enjeksiyonu (yalnız turn-aware açıkken → cusp kapısı sürülemez
         # U-dönüşlerini eler; klasik find_path'te bu güvenlik yok). removed_set:
         # SERT blokla silinmiş kenarları enjeksiyon geri eklemesin.
@@ -2093,16 +2232,46 @@ class HedefYoneticisi:
         #    recalc'lar ağırlık sızdırmasın). ──
         fallback_bloksuz = False
         with self._graf_lock:
-            blok_saved, blok_eklenen = (self._blok_uygula() if HEDEF_KOMUT_AKTIF
-                                        else ([], []))
-            if blok_eklenen:
-                rospy.loginfo_throttle(
-                    2.0, f"[slalom] {len(blok_eklenen)} karşı-şerit crossing "
-                         f"enjekte edildi (engel çevresi) → karşı şeritten reroute")
-            try:
-                path = self._rota_ara(start_node, goal_node, yaw0)
-            finally:
-                self._blok_geri_al(blok_saved, blok_eklenen)
+            # SLALOM_YALNIZ_GEREKINCE (kullanıcı 2026-06-26 "duba sol şeritte → hep
+            # sollamaya çalışıyorsun"): karşı-şerit crossing'i YALNIZ engel KENDİ
+            # ROTAMIZI tıkıyorsa enjekte et. Önce engeli hesaba katmadan bloksuz
+            # baseline rota çıkar; engelin çemberi bu rotayı KESMİYORSA (karşı şeritte,
+            # ~2m yanal) sollama gereksiz → enjekte ETME (blokla, kendi şeritte devam).
+            # KESİYORSA (kendi şeridimizde, ~0m) enjekte → karşı şeritten solla.
+            # (Not: graf bağlı olduğundan kendi şerit silinse bile "farklı sokak" rotası
+            # bulunur, path None olmaz → "None olunca enjekte et" yaklaşımı yetmez;
+            # bu yüzden engel-rotada testi yapılır.)
+            enjekte_gerek = True
+            path_base = None
+            # engeller_aktif TEK snapshot — _engel_rotada + _blok_uygula AYNI kümeyi
+            # kullansın (TOCTOU: D* araması sırasında yeni blok eklenirse tutarsızlık).
+            engeller_aktif = self._aktif_bloklar() if HEDEF_KOMUT_AKTIF else []
+            if engeller_aktif and SLALOM_YALNIZ_GEREKINCE and SLALOM_ENJEKSIYON_AKTIF:
+                path_base = self._rota_ara(start_node, goal_node, yaw0)
+                enjekte_gerek = self._engel_rotada(path_base, engeller_aktif)
+                if not enjekte_gerek:
+                    rospy.loginfo_throttle(
+                        2.0, "[slalom] engel kendi rotada DEĞİL (karşı şeritte) → "
+                             "sollama YOK, yalnız blokla + kendi şeritte devam")
+
+            blok_saved, blok_eklenen = ([], [])
+            if path_base is not None and not enjekte_gerek:
+                # Engel rota dışı (karşı şerit): SERT blok çemberi = _engel_rotada eşiği
+                # olduğundan blok baseline rotayı DEĞİŞTİRMEZ → baseline'ı doğrudan kullan
+                # (2. D* aramasını ATLA; engelin WP'si zaten rota dışı, blokla gerek yok).
+                path = path_base
+            else:
+                blok_saved, blok_eklenen = (
+                    self._blok_uygula(enjekte=enjekte_gerek, engeller=engeller_aktif)
+                    if HEDEF_KOMUT_AKTIF else ([], []))
+                if blok_eklenen:
+                    rospy.loginfo_throttle(
+                        2.0, f"[slalom] {len(blok_eklenen)} karşı-şerit crossing enjekte "
+                             f"(engel kendi rotayı tıkıyor) → karşı şeritten reroute")
+                try:
+                    path = self._rota_ara(start_node, goal_node, yaw0)
+                finally:
+                    self._blok_geri_al(blok_saved, blok_eklenen)
 
             # ── Fail-safe: SERT blokla yol YOK (karşı şerit yok / giriş kapalı) ──
             # FARKLI BİR SOKAĞA SAPMA. Blok geri alındıktan SONRA (graf temizken)
