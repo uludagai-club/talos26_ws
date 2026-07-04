@@ -20,7 +20,7 @@ class CANDecoder:
         raw_value = struct.unpack('<H', data[0:2])[0]
         
         # Ölçekle ve km/h'ye çevir
-        speed_kmh = raw_value * 0.04
+        speed_kmh = raw_value * 0.01
         return speed_kmh
     
     @staticmethod

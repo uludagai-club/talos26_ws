@@ -31,7 +31,7 @@
 #                          mutlak tavan 12 s · geçince düş (gövde ileri < -1.5 m)
 #                          → detektör kareyi düşürse de duba "orada" sayılır (anti flip-flop)
 #  ŞERİT DEĞİŞİMİ (levha):cooldown 4.0 s · manevra-tut 2.0 s (=control LANE_CHANGE_DURATION)
-#  ARAÇ GEOMETRİSİ:      wheelbase 1.78 m · max direksiyon 30°  (control.py ile eşit)
+#  ARAÇ GEOMETRİSİ:      wheelbase 1.86 m · max direksiyon 28.95°  (control.py ile eşit)
 #  DÖNGÜ:                10 Hz · DUR levhası bekleme 3.0 s · acil mühür çözme 8 tick
 #
 #  Sahiplik: karar/ = Enes (bu dosya). control_wp_near_m / wheelbase / max_steer
@@ -55,7 +55,7 @@ distances:
   yaya_acil_durus_m: 2.0   # eski MESAFE_ACIL_DURUS
   yaya_dur_m:        4.0
   yaya_yavas_m:     12.0
-  engel_acil_m:      1.2   # (ARTIK wp_planlama'dan türetiliyor — geri uyum için duruyor)
+  engel_acil_m:      0.7   # (ARTIK wp_planlama'dan türetiliyor — geri uyum için duruyor)
   engel_block_m:     2.0   # (ARTIK wp_planlama'dan türetiliyor — geri uyum için duruyor)
   engel_yan_clear_m: 3.0   # yan sektörde bu kadar boşluk varsa lane change makul
   levha_dur_m:       3.5
@@ -104,8 +104,8 @@ reroute:
 
 # Ackermann araç geometrisi (control.py ile EŞİT TUTULMALI)
 ackermann:
-  wheelbase_m:   1.78      # = control.py WHEELBASE
-  max_steer_deg: 30.0      # = control.py MAX_STEER_ANGLE
+  wheelbase_m:   1.86      # = control.py WHEELBASE
+  max_steer_deg: 28.95     # = control.py MAX_STEER_ANGLE (ackermann.py max_bicycle_angle())
 
 # Hıza-duyarlı tepki mesafesi.
 # efektif_esik = taban_esik + gain_s * hiz_mps  (max_extra_m ile sınırlı)

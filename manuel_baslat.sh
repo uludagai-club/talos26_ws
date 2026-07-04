@@ -2,14 +2,14 @@
 # ============================================================
 #  TALOS MANUEL SÜRÜŞ Başlatıcı (direksiyon seti ile)
 #  - Otonom sürüş (talos-controller / control.py) HARİÇ tüm sistem ayağa kalkar.
-#  - Aracı, Windows'taki USB direksiyon setiyle SSH -> vcan0 üzerinden sürersin.
+#  - Aracı, bu bilgisayara takılı USB direksiyon setiyle vcan0 üzerinden sürersin.
 #  - Diğer tüm modüller (konum, harita, hedef, engel, trafik, şerit, yaya,
 #    park, karar, can/state köprüleri, can-visualizer) çalışır -> manuel
 #    sürerken algı/karar çıktısını izleyebilirsin.
 #
 #  Zincir:
-#    Windows direksiyon -> SSH -> direksiyon_can_server -> vcan0
-#                       -> can-bridge -> /cart -> Gazebo aracı
+#    USB direksiyon -> direksiyon_teleop.py -> vcan0
+#                  -> can-bridge -> /cart -> Gazebo aracı
 #
 #  Kullanım:
 #    cd ~/talos-sim/scripts/talos26_ws && ./manuel_baslat.sh
@@ -27,6 +27,9 @@ YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
 AUTO="${AUTO:-off}"                 # on => kontrolcü release modu OLMADAN başlar (hemen sürer, çakışır)
 GUI="${GUI:-on}"                    # on => can-visualizer (gui profile) dahil
+WHEEL="${WHEEL:-local}"             # local => bu makinedeki USB direksiyon; ssh => sadece talimat bas
+WHEEL_DEV="${WHEEL_DEV:-/dev/input/js0}"
+WHEEL_ARGS="${WHEEL_ARGS:-}"
 # talos-controller HER ZAMAN açılır ama varsayılan olarak "release" modunda:
 # bus'a dokunmaz, direksiyon setinde BUTON 3 (0x500=1) ile otonom devralır,
 # tekrar buton 3 (0x500=0) ile manuel devralır. AUTO=on eski davranışa döner.
@@ -35,17 +38,24 @@ if [ "$AUTO" = on ]; then
 else
     export TALOS_BUS_RELEASE_ON_START=1
 fi
-# Manuel sürüş gaz gücü (köprüye env ile geçer). Otonom default 0.1; manuelde
-# daha çok gaz. İstersen: POWER=1.0 ./manuel_baslat.sh
-export TALOS_POWER_LIMIT="${POWER:-0.6}"
+# Manuel sürüş gaz gücü. ÖLÇEKLEME TEK NOKTADA yapılır: direksiyon_teleop.py'nin
+# --throttle-scale'i (POWER). Köprüye (can-bridge/can_to_talos_cart.py) giden
+# TALOS_POWER_LIMIT BİLEREK 1.0'da sabitlenir — aksi halde POWER hem teleop'ta
+# hem köprüde çarpılır ve efektif güç POWER^2 olurdu (ör. 0.6 -> 0.36); çift
+# ölçekleme düzeltmesi 2026-07-04. İstersen: POWER=1.0 ./manuel_baslat.sh
+POWER="${POWER:-0.6}"
+# ölçekleme teleop'ta --throttle-scale ile tek noktada; köprü limiti 1.0 —
+# çift çarpım düzeltmesi 2026-07-04
+export TALOS_POWER_LIMIT=1.0
 # Buton 3 ile otonom devralınca köprü bu daha düşük/güvenli güç limitine döner
-# (control.py 0.1'e ayarlı). Manuel 0.6 gaz otonomda araca geçmez.
+# (ölçekleme can_to_talos_cart.py'de). Manuel POWER gaz otonomda araca geçmez.
 export TALOS_POWER_LIMIT_AUTO="${POWER_AUTO:-0.1}"
 export TALOS_RAMP_UP="${RAMP_UP:-0.05}"
 export TALOS_RAMP_DOWN="${RAMP_DOWN:-0.05}"
 # Her manuel oturum kendi RUN_ID alt dizinine loglasin (yoksa hepsi dev/'e birikir)
 export RUN_ID="${RUN_ID:-manuel_$(date -u +%Y%m%dT%H%M%SZ)}"
 STARTED_GAZEBO=0
+WHEEL_PID=""
 
 echo -e "${CYAN}======================================================${NC}"
 echo -e "${CYAN}  TALOS MANUEL SÜRÜŞ (direksiyon seti)${NC}"
@@ -57,6 +67,11 @@ echo -e "${CYAN}======================================================${NC}"
 # -----------------------------------------------------------------
 cleanup() {
     echo -e "\n${BLUE}[*] Manuel sistem kapatılıyor...${NC}"
+    if [ -n "${WHEEL_PID:-}" ]; then
+        kill "$WHEEL_PID" 2>/dev/null || true
+        wait "$WHEEL_PID" 2>/dev/null || true
+        echo -e "${GREEN}[+] Yerel direksiyon teleop durduruldu${NC}"
+    fi
     (cd "$SCRIPT_DIR" && docker compose down --remove-orphans 2>/dev/null) || true
     # Konteyner root olusturdugu tani loglarini kullaniciya geri ver. TUM moduller
     # (karar, hedef, engel, konum, system, control) artik birlesik logs/$RUN_ID/
@@ -113,6 +128,51 @@ else
 fi
 echo -e "${GREEN}[+] vcan0 aktif${NC}"
 xhost +local:docker 2>/dev/null
+
+# -----------------------------------------------------------------
+# 2.5) Yerel USB direksiyon -> CAN teleop
+# -----------------------------------------------------------------
+if [ "$WHEEL" = "local" ]; then
+    echo -e "${BLUE}[2.5/6] Yerel USB direksiyon...${NC}"
+    if [ ! -e "$WHEEL_DEV" ]; then
+        echo -e "${RED}[X] $WHEEL_DEV bulunamadı. Direksiyonu bu bilgisayara tak veya WHEEL_DEV=/dev/input/jsX ver.${NC}"
+        echo -e "${YELLOW}    Cihazları görmek için: ls /dev/input/js*${NC}"
+        exit 1
+    fi
+    if ! python3 - <<'PY' >/dev/null 2>&1
+import can
+PY
+    then
+        echo -e "${RED}[X] Host Python'da python-can yok. Kur: sudo apt install python3-can veya pip3 install python-can${NC}"
+        exit 1
+    fi
+    nohup python3 "$SCRIPT_DIR/control/direksiyon_teleop.py" \
+        --dev "$WHEEL_DEV" \
+        --channel vcan0 \
+        --throttle-scale "$POWER" \
+        --steer-axis 0 \
+        --invert-steer \
+        --pedal-mode split \
+        --pedal-axis 1 \
+        --gear-fwd-btn 0 \
+        --gear-rev-btn 1 \
+        --gear-neutral-btn -1 \
+        --handbrake-btn 3 \
+        --estop-btn -1 \
+        --auto-toggle-btn 2 \
+        --verbose \
+        $WHEEL_ARGS >/tmp/manuel_direksiyon_teleop.log 2>&1 &
+    WHEEL_PID=$!
+    sleep 1
+    if ! kill -0 "$WHEEL_PID" 2>/dev/null; then
+        echo -e "${RED}[X] direksiyon_teleop.py başlatılamadı. Log: /tmp/manuel_direksiyon_teleop.log${NC}"
+        tail -20 /tmp/manuel_direksiyon_teleop.log 2>/dev/null || true
+        exit 1
+    fi
+    echo -e "${GREEN}[+] Yerel direksiyon teleop aktif: $WHEEL_DEV -> vcan0${NC}"
+    echo -e "${YELLOW}    Not: Linux js tarafında fiziksel buton 3 genelde b2'dir; auto-toggle varsayılanı budur.${NC}"
+    echo -e "${YELLOW}    Mapping gerekirse ayrı kalibre et: python3 control/direksiyon_teleop.py --kalibre${NC}"
+fi
 
 # -----------------------------------------------------------------
 # 3) Gazebo sim (zaten çalışmıyorsa başlat)
@@ -195,14 +255,19 @@ echo ""
 echo -e "${GREEN}[+] MANUEL SİSTEM HAZIR — otonom kontrolcü idle bekliyor${NC}"
 echo -e "${YELLOW}    Direksiyon setinde BUTON 3: otonom devral <-> manuel devral (toggle)${NC}"
 echo -e "${CYAN}======================================================${NC}"
-echo -e "${CYAN}  Aracı sürmek için Windows PC'de (cmd.exe) şunu çalıştır:${NC}"
-echo -e "${YELLOW}  powershell -ExecutionPolicy Bypass -File direksiyon_oku.ps1 | \\${NC}"
-echo -e "${YELLOW}    ssh hilmi@${HOST_IP:-<bu-makine-ip>} \"python3 ~/talos-sim/scripts/talos26_ws/control/direksiyon_can_server.py --verbose --invert-steer\"${NC}"
+if [ "$WHEEL" = "local" ]; then
+    echo -e "${CYAN}  Yerel direksiyon aktif: ${WHEEL_DEV}${NC}"
+    echo -e "${YELLOW}  Teleop logu: /tmp/manuel_direksiyon_teleop.log${NC}"
+else
+    echo -e "${CYAN}  Uzak Windows PC'den sürmek için (cmd.exe):${NC}"
+    echo -e "${YELLOW}  powershell -ExecutionPolicy Bypass -File direksiyon_oku.ps1 | \\${NC}"
+    echo -e "${YELLOW}    ssh hilmi@${HOST_IP:-<bu-makine-ip>} \"python3 ~/talos-sim/scripts/talos26_ws/control/direksiyon_can_server.py --verbose --invert-steer\"${NC}"
+fi
 echo -e "${CYAN}------------------------------------------------------${NC}"
 echo -e "${CYAN}  Çalışan modüller: konum, harita, hedef, engel, trafik,${NC}"
 echo -e "${CYAN}  şerit, yaya, park, karar + can/state köprüleri${NC}"
 echo -e "${CYAN}  can-bridge   => vcan0 (direksiyon) -> /cart -> Gazebo${NC}"
-echo -e "${CYAN}  Gaz gücü     => TALOS_POWER_LIMIT=${TALOS_POWER_LIMIT} (POWER=1.0 ile tam güç)${NC}"
+echo -e "${CYAN}  Gaz gücü     => teleop --throttle-scale=${POWER} (POWER=1.0 ile tam güç; köprü limiti sabit 1.0 — tek nokta ölçekleme)${NC}"
 echo -e "${YELLOW}  Ctrl+C => modülleri kapatır (compose down)${NC}"
 echo -e "${CYAN}======================================================${NC}"
 

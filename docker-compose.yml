@@ -86,12 +86,14 @@ services:
       - ROS_MASTER_URI=http://localhost:11311
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
-      # Kalıcı tanı logu kökü (host'ta ./hedef/logs altına bind-mount edilir).
+      # Kalıcı tanı logu kökü → ./logs/$RUN_ID/hedef/ (diğer servislerle aynı ağaç).
       - TALOS_LOG_ROOT=/app/logs
     volumes:
       - ./hedef/hedef_yoneticisi.py:/app/hedef_yoneticisi.py:ro
       - ./hedef/hedef_logger.py:/app/hedef_logger.py:ro
-      - ./hedef/logs:/app/logs
+      # Diğer servislerle AYNI log ağacı → ./logs/$RUN_ID/hedef/ (engel/karar/
+      # system ile yan yana). Logger zaten $RUN_ID/hedef alt dizini açar.
+      - ./logs:/app/logs
       - ./missions:/missions:ro
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
@@ -315,6 +317,13 @@ services:
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
+      # Gaz gücü/rampa — host env'inden geçer. Default 1.0 (urdf motor torku
+      # artık gerçekçi, yapay 0.1 tavanı kalktı; env ile hâlâ kısılabilir).
+      - TALOS_POWER_LIMIT=${TALOS_POWER_LIMIT:-1.0}
+      # Otonom devralınca (0x500=1) kullanılacak güç limiti.
+      - TALOS_POWER_LIMIT_AUTO=${TALOS_POWER_LIMIT_AUTO:-1.0}
+      - TALOS_RAMP_UP=${TALOS_RAMP_UP:-0.02}
+      - TALOS_RAMP_DOWN=${TALOS_RAMP_DOWN:-0.05}
     volumes:
       - ./control/can_to_talos_cart.py:/app/can_to_talos_cart.py:ro
       - ./control/can_decoder.py:/app/can_decoder.py:ro
@@ -365,8 +374,11 @@ services:
       - ROS_IP=127.0.0.1
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
+      # manuel_baslat.sh=1: idle başla (bus serbest), buton 1 ile devral. baslat.sh: 0.
+      - TALOS_BUS_RELEASE_ON_START=${TALOS_BUS_RELEASE_ON_START:-0}
     volumes:
       - ./control/control.py:/app/control.py:ro
+      - ./control/ackermann.py:/app/ackermann.py:ro
       - ./control/logs:/app/logs
       - ./talos_common:/app/talos_common:ro
       - ./missions:/missions:ro   # FIX 2 — GOREV_NOKTALARI GeoJSON yükleme

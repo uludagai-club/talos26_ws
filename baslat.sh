@@ -20,6 +20,18 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # =============================================================
+# COMPOSE DOSYA SEÇİMİ — beemobs (Bee1 araç arayüzü) modu opsiyonel katman
+# TALOS_BEEMOBS=1 ./baslat.sh -> can-bridge/state-bridge beemobs_*.py'ye döner
+# (bkz. docker-compose.beemobs.yml). TEK LAUNCHER kuralı: elle çift -f
+# komutu yalnız hata ayıklama içindir, normal akış bu script üzerindendir.
+# =============================================================
+COMPOSE_FILES="-f docker-compose.yml"
+if [ "${TALOS_BEEMOBS:-0}" = "1" ]; then
+    COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.beemobs.yml"
+    echo -e "${CYAN}[beemobs modu] docker-compose.beemobs.yml katmanı devrede (can-bridge/state-bridge -> beemobs_*).${NC}"
+fi
+
+# =============================================================
 # RUN ID + LOG DIZINI (KTR §9.14.3 + new plan §2.2)
 # =============================================================
 export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -60,7 +72,7 @@ cleanup() {
     [ -n "${GROUNDFILTER_PID:-}" ] && kill "$GROUNDFILTER_PID" 2>/dev/null
 
     # Compose down (degişiklik yapilmiş volume mount'lari da kapsar)
-    (cd "$SCRIPT_DIR" && docker compose down --remove-orphans 2>/dev/null) || true
+    (cd "$SCRIPT_DIR" && docker compose $COMPOSE_FILES down --remove-orphans 2>/dev/null) || true
 
     # Manifest end-of-run mühür
     if [ -f "$RUN_DIR/manifest.json" ]; then
@@ -242,10 +254,10 @@ docker rm -f konum-server talos-map-server hedef_teslimi engel-node \
 
 # Karar/engel/talos-controller dahil tum servisler ayaga kalkar.
 # can-visualizer 'gui' profile altinda; --profile gui ile dahil ediliyor.
-docker compose --profile gui up -d 2>&1 | tail -20
+docker compose $COMPOSE_FILES --profile gui up -d 2>&1 | tail -20
 
 sleep 3
-docker compose ps
+docker compose $COMPOSE_FILES ps
 
 # =============================================================
 # 6) DURUM
@@ -275,7 +287,7 @@ echo -e "${CYAN}======================================================${NC}"
 # =============================================================
 # 7) BACKGROUND — hedef_teslimi log arşivi (FILTER-DEBUG, U-DONUS-PLAN için)
 # =============================================================
-docker compose logs -f --no-color hedef-teslimi \
+docker compose $COMPOSE_FILES logs -f --no-color hedef-teslimi \
     > "$RUN_DIR/system/hedef_teslimi.log" 2>&1 &
 HEDEF_LOG_PID=$!
 echo -e "${GREEN}[+] hedef_teslimi log arşivi: $RUN_DIR/system/hedef_teslimi.log${NC}"
@@ -284,7 +296,7 @@ echo -e "${GREEN}[+] hedef_teslimi log arşivi: $RUN_DIR/system/hedef_teslimi.lo
 # 8) FOREGROUND — talos-controller log akisi (Ctrl+C ile cikis)
 # =============================================================
 echo -e "${BLUE}[8/8] talos-controller log akisi (Ctrl+C => kapanis)${NC}"
-docker compose logs -f --no-color talos-controller karar-node engel-node park-durak-node lane-follower yaya-gecidi-node 2>&1 || true
+docker compose $COMPOSE_FILES logs -f --no-color talos-controller karar-node engel-node park-durak-node lane-follower yaya-gecidi-node 2>&1 || true
 
 # Background hedef_teslimi log tail'ini kapat
 [ -n "${HEDEF_LOG_PID:-}" ] && kill "$HEDEF_LOG_PID" 2>/dev/null

@@ -1,0 +1,71 @@
+# TALOS BEEMOBS (Bee1) ARAÇ ARAYÜZÜ MODU — override dosyası
+# ==========================================================
+# Kullanım (önerilen — TEK LAUNCHER, baslat.sh bu dosyayı otomatik ekler):
+#   TALOS_BEEMOBS=1 ./baslat.sh
+#
+# Elle çift -f komutu (sadece hata ayıklama için):
+#   docker compose -f docker-compose.yml -f docker-compose.beemobs.yml --profile gui up -d
+#
+# Bu override, mevcut CAN köprülerinin YERİNE beemobs arayüzünü koyar:
+#   can-bridge   : can_to_talos_cart.py  ->  beemobs_bridge.py
+#                  (CAN 0x100/0x102/0x201 -> /beemobs/* komutları; FB -> 0x301 + /beemobs_odom)
+#   state-bridge : talos_state_to_can.py ->  beemobs_gazebo_emulatoru.py
+#                  (/beemobs/* -> /cart -> Gazebo; ground truth -> /beemobs/FB_*)
+#
+# control.py, can_to_talos_cart.py, talos_state_to_can.py ve docker-compose.yml
+# DEĞİŞMEZ; sadece bu override ile komutlar değiştirilir.
+#
+# !!! GERÇEK ARAÇTA: state-bridge'i (emülatörü) BAŞLATMA !!!
+#   Emülatör SADECE sim içindir. Araçta gerçek Bee1 /beemobs/* komutlarını yorumlar ve
+#   gerçek FB'yi kendisi yayınlar. Araçta yalnızca can-bridge (beemobs_bridge.py) koşmalı:
+#     docker compose -f docker-compose.yml -f docker-compose.beemobs.yml up -d can-bridge ...
+#   (state-bridge servisini listeye EKLEME).
+#
+# NOT: Docker Compose 'command'i (skaler) DEĞİŞTİRİR, ama 'volumes'/'environment'
+#      LİSTELERİNİ hedef/isim ile birleştirir (base mount'lar kalır). Bu yüzden burada
+#      gerekli tüm mount/env TEKRAR verilir; base'in can_to_talos_cart.py/
+#      talos_state_to_can.py mount'ları /app'te öylece durur (KOMUT onları çalıştırmaz,
+#      farklı hedef yolu -> zararsız). privileged/network_mode/cap_add base'ten miras alınır.
+
+services:
+
+  # =========================================================
+  # CAN <-> /beemobs/* KÖPRÜSÜ (gerçek araç arayüzü)
+  # =========================================================
+  can-bridge:
+    command: -c "source /opt/ros/noetic/setup.bash && export PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app && python3 -u /app/beemobs_bridge.py"
+    volumes:
+      - ./control/beemobs_bridge.py:/app/beemobs_bridge.py:ro
+      - ./control/can_decoder.py:/app/can_decoder.py:ro
+      - ./control/ackermann.py:/app/ackermann.py:ro
+      - ./talos_common:/app/talos_common:ro
+      - ./logs:/app/logs
+      - ~/talos-sim/devel:/talos-devel:ro
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - RUN_ID=${RUN_ID:-dev}
+      - TALOS_LOG_ROOT=/app/logs
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
+      - CAN_INTERFACE=${CAN_INTERFACE:-vcan0}
+      # beemobs mesaj paketi: gerçek araçta 'smart_can_msgs', sim'de cart_sim devel'e fallback.
+      - BEEMOBS_MSG_PAKETI=${BEEMOBS_MSG_PAKETI:-smart_can_msgs}
+
+  # =========================================================
+  # BEE1 GAZEBO EMÜLATÖRÜ (SADECE SİM — araçta başlatma!)
+  # =========================================================
+  state-bridge:
+    command: -c "source /opt/ros/noetic/setup.bash && export PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app && python3 -u /app/beemobs_gazebo_emulatoru.py"
+    volumes:
+      - ./control/beemobs_gazebo_emulatoru.py:/app/beemobs_gazebo_emulatoru.py:ro
+      - ./control/can_decoder.py:/app/can_decoder.py:ro
+      - ./control/ackermann.py:/app/ackermann.py:ro
+      - ./talos_common:/app/talos_common:ro
+      - ./logs:/app/logs
+      - ~/talos-sim/devel:/talos-devel:ro
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - RUN_ID=${RUN_ID:-dev}
+      - TALOS_LOG_ROOT=/app/logs
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
+      - CAN_INTERFACE=${CAN_INTERFACE:-vcan0}
+      - BEEMOBS_MSG_PAKETI=${BEEMOBS_MSG_PAKETI:-smart_can_msgs}

@@ -7,20 +7,23 @@ Gazebo simülasyonunda aracı waypoint'lere götüren CAN tabanlı kontrol siste
 CAN Mesajları:
     0x100: Gaz/Fren/Vites komutu gönder
     0x201: Direksiyon komutu gönder
-    0x301: Gerçek hız yayını (visualizer için)
+    0x301: Gerçek hız yayını - ARTIK BURADAN GÖNDERİLMEZ (C9): tek yazar
+           state-bridge (talos_state_to_can.py); control.py yalnız okur.
 """
 
 import rospy
 import can
 import json
 import math
-import struct
 import sys
 import os
 import threading
 import time
-import datetime
 import numpy as np
+try:
+    import ackermann
+except ImportError:
+    ackermann = None
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32, String
 from visualization_msgs.msg import Marker
@@ -55,16 +58,16 @@ def _yukle_gorev_geojson_for_control(yol='/missions/gorev.geojson'):
 
 
 # =============================================================================
-# C1 — ENGEL GEOMETRİSİ (saf, ROS'suz → standalone test edilebilir)
+# ENGEL GEOMETRİSİ (saf, ROS'suz → standalone test edilebilir)
 # =============================================================================
 # `/obstacles/poses` (geometry_msgs/PoseArray) konumları araç GÖVDE çerçevesinde,
 # REP-103: x ileri, y sol (talos_obstacle_detector velodyne frame'inde hesaplar;
-# karar/ros_bridge.py ile aynı konvansiyon). Bu fonksiyonlar control'ün "kör"
-# olmasını çözer: dubanın gerçek konumunu kullanıp kaçınma apeksini ve bitişini
-# rotayı bloklayan engele göre koyar (sabit ±offset / sabit pass-distance yerine).
+# karar/ros_bridge.py ile aynı konvansiyon). H-B e-stop güvenlik ağı: dead-ahead
+# yakındaki engeli seçip, mevcut direksiyonla (Ackermann yayı) GERÇEKTEN çarpacaksa
+# tam fren bas (sadece mesafe değil → keskin dönüşte aradan geçişe izin verir).
 
 def select_blocking_obstacle(points, fwd_min, fwd_max, corridor_m):
-    """Gövde-çerçevesi engel noktaları arasından rotayı bloklayan EN YAKIN olanı seç.
+    """Gövde-çerçevesi engel noktaları arasından yolu bloklayan EN YAKIN olanı seç.
 
     points: [(fwd, lat), ...]  (fwd ileri +, lat sol +; metre)
     Aday = önümüzde (fwd_min < fwd < fwd_max) ve koridor içinde (|lat| < corridor_m).
@@ -81,28 +84,47 @@ def select_blocking_obstacle(points, fwd_min, fwd_max, corridor_m):
     return best
 
 
-def obstacle_offset_target(obstacle_lat, direction, clearance_m, hard_max_m):
-    """Engeli `clearance_m` payıyla geçmek için İSTENEN işaretli yanal offset (m, +sol).
+def select_arc_blocking_obstacle(points, fwd_min, fwd_max, corridor_m,
+                                 steer_deg, wheelbase_m, safe_radius_m):
+    """Koridor adayları arasından mevcut direksiyon yayının GEÇEMEDİĞİ en yakın
+    engeli seç (yoksa None).
 
-    Araç merkezi rota frame'inde `offset` konumuna gider; engel `obstacle_lat`'te.
-    Aradaki ayrım = |offset − obstacle_lat| ≥ clearance olmalı, kaçış YÖNÜNDE
-    (direction: +1 sol / −1 sağ). Hedef konum = engel + yön*clearance:
-        offset = obstacle_lat + direction * clearance_m
-    Merkez duba (lat=0) → direction*clearance (eski sabit AVOID_OFFSET_MAX davranışı,
-    clearance=AVOID_OFFSET_MAX iken birebir). |offset| hard_max ile sınırlanır.
-    """
-    offset = obstacle_lat + direction * clearance_m
-    return float(max(-hard_max_m, min(hard_max_m, offset)))
+    İncele düzeltmesi (2026-07-04, CONFIRMED): eskiden yalnız en-yakın aday yay
+    testine sokuluyordu — yakın-ama-yanal (yayın zaten geçtiği) bir koni, biraz
+    uzaktaki tam-önde koniyi gölgeleyip e-stop'u susturabiliyordu (ör. A=(1.0,1.3)
+    seçilir ve 'geçer', B=(2.0,0.1) hiç denetlenmez). Artık TÜM adaylar yay
+    testinden geçirilir; yalnızca hepsi geçilirse yol açık sayılır."""
+    best = None
+    for fwd, lat in points:
+        if fwd <= fwd_min or fwd >= fwd_max:
+            continue
+        if abs(lat) >= corridor_m:
+            continue
+        if ackermann_path_clears(fwd, lat, steer_deg, wheelbase_m, safe_radius_m):
+            continue
+        if best is None or fwd < best[0]:
+            best = (fwd, lat)
+    return best
 
 
-def obstacle_passed(x, y, ox, oy, dir_x, dir_y, clearance_m):
-    """Araç, latch'lenmiş engeli (ox,oy) başlangıç-yönünde (dir) geçti mi?
+def ackermann_path_clears(fwd, lat, steer_deg, wheelbase_m, safe_radius_m):
+    """Araç MEVCUT direksiyonla (bisiklet/Ackermann yayı) gövde-çerçevesi engeli
+    (fwd, lat) `safe_radius` payıyla geçer mi?
 
-    gap = (araç − engel) · dir  > clearance  → geçildi (pozitif = araç önde).
-    dir birim olmasa da işaret doğru; |dir|≈1 (yaw'dan cos/sin) varsayılır.
-    """
-    gap = (x - ox) * dir_x + (y - oy) * dir_y
-    return gap > clearance_m, gap
+    Düz (~0°): yalnız yanal ayrım önemli (|lat| ≥ safe → geçer).
+    Dönüşte: arka-aks referanslı ICR (0, ±R), R = L/tan|δ| (δ>0 sol → ICR +y).
+    Engelin yay çemberine uzaklığı |d_c − R| ≥ safe → araç yayı engele değmeden geçer.
+    True = geçer (DURMA gerekmez); False = yay engele safe'ten yakın → tam fren.
+
+    Bu, "dubaya çarpacağını sanıp erken durma" sorununu çözer: araç yeterince
+    keskin dönüyorsa (yay engeli kaçırıyorsa) e-stop tetiklenmez (kullanıcı isteği)."""
+    delta = math.radians(steer_deg)
+    if abs(delta) < math.radians(1.0):
+        return abs(lat) >= safe_radius_m       # düz gidiş: yanal ayrım yeterli mi
+    R = wheelbase_m / math.tan(abs(delta))
+    cy = R if delta > 0.0 else -R              # sol dönüş (δ>0) → dönüş merkezi +y
+    d_c = math.hypot(fwd, lat - cy)
+    return abs(d_c - R) >= safe_radius_m
 
 
 # =============================================================================
@@ -110,7 +132,17 @@ def obstacle_passed(x, y, ox, oy, dir_x, dir_y, clearance_m):
 # =============================================================================
 
 class Logger:
-    """Log ve CSV kaydedici"""
+    """Log ve CSV kaydedici.
+
+    ZAMAN DAMGASI SÖZLEŞMESİ (diğer loglarla birebir aynı — karar/trace.csv,
+    hedef/pose.csv, *events.jsonl): her satır üç zaman taşır →
+        t_unix : time.time() epoch (round 3) — makine sıralama
+        t_iso  : UTC ISO 8601 + 'Z' (gmtime; TZ'den BAĞIMSIZ) — insan/eşleştirme
+        ros_t  : rospy.Time.now() (sim-time; use_sim_time) — rosbag/candump hizası
+    Eski tek-sütun ham epoch 'timestamp' (insan-okunmaz + ros_t yok) kaldırıldı;
+    artık CSV'yi karar/hedef logları ve rosbag ile saniyesine kadar eşleyebiliriz.
+    .log öneki de gmtime UTC'dir (eski datetime.now() yereldi → TZ değişirse
+    diğer UTC loglardan kayardı; tarih/Z/ros_t da yoktu)."""
 
     def __init__(self, log_dir='/app/logs/'):
         self.log_dir = log_dir
@@ -120,13 +152,16 @@ class Logger:
             self.log_dir = '/tmp/talos_logs/'
             os.makedirs(self.log_dir, exist_ok=True)
 
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        # Dosya adı UTC (gmtime) — RUN_ID ve t_iso ile aynı saat dilimi; konteyner
+        # TZ'i değişse bile karar/hedef RUN_ID'leriyle aynı damgayı taşır.
+        timestamp = time.strftime('%Y%m%d_%H%M%S', time.gmtime())
         self.log_file = os.path.join(self.log_dir, f'control_{timestamp}.log')
         self.csv_file = os.path.join(self.log_dir, f'control_{timestamp}.csv')
 
-        # CSV header
+        # CSV header — t_unix,t_iso,ros_t öneki karar/trace.csv & hedef/pose.csv ile aynı
         with open(self.csv_file, 'w') as f:
-            f.write('timestamp,x,y,yaw,speed_kmh,karar,target_x,target_y,throttle,brake,steer,gear\n')
+            f.write('t_unix,t_iso,ros_t,x,y,yaw,speed_kmh,karar,'
+                    'target_x,target_y,throttle,brake,steer,gear\n')
         # CSV'yi açık tut: per-tick open/close (50 Hz → 50 aç-kapa/sn) yerine
         # kalıcı handle + periyodik flush (rapor H5 perf). Ctrl+C'de en fazla
         # ~0.5 s satır kaybı (analiz için kabul edilebilir).
@@ -136,10 +171,29 @@ class Logger:
             self._csv_fh = None
         self._csv_since_flush = 0
 
+    @staticmethod
+    def _iso(t):
+        """UTC ISO 8601 + Z (hedef/karar logger ile birebir). gmtime → TZ-bağımsız."""
+        return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
+
+    @staticmethod
+    def _ros_t():
+        """sim-time (use_sim_time) saniye → rosbag/candump/karar ile hizalı.
+        Node init olmadan patlamasın diye korumalı. /clock henüz akmıyorken
+        rospy.Time.now() İSTİSNA atmaz, Time(0)=0.0 döner → yanıltıcı 'ros_t=0.000'
+        yerine None ver (ROS bulgusu, §incele)."""
+        try:
+            t = rospy.Time.now().to_sec()
+            return round(t, 3) if t > 0.0 else None
+        except Exception:
+            return None
+
     def log(self, message):
-        """Log mesajı yaz"""
-        ts = datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3]
-        line = f"[{ts}] {message}"
+        """Log mesajı yaz — öneki [t_iso ros=<ros_t>] (UTC, diğer loglarla hizalı)."""
+        t = time.time()
+        ros = self._ros_t()
+        ros_str = f"{ros:.3f}" if ros is not None else "--"
+        line = f"[{self._iso(t)} ros={ros_str}] {message}"
         try:
             with open(self.log_file, 'a') as f:
                 f.write(line + '\n')
@@ -148,12 +202,15 @@ class Logger:
         rospy.loginfo(message)
 
     def csv(self, x, y, yaw, speed_kmh, karar, target_x, target_y, throttle, brake, steer, gear):
-        """CSV satırı yaz"""
-        ts = time.time()
+        """CSV satırı yaz — t_unix,t_iso,ros_t üçlü zaman damgası ile."""
         if self._csv_fh is None:
             return
+        t = time.time()
+        ros = self._ros_t()
+        ros_str = f"{ros:.3f}" if ros is not None else ""
         try:
-            self._csv_fh.write(f'{ts},{x:.3f},{y:.3f},{yaw:.3f},{speed_kmh:.2f},{karar},'
+            self._csv_fh.write(f'{t:.3f},{self._iso(t)},{ros_str},'
+                               f'{x:.3f},{y:.3f},{yaw:.3f},{speed_kmh:.2f},{karar},'
                                f'{target_x:.3f},{target_y:.3f},{throttle:.1f},{brake:.1f},{steer:.1f},{gear}\n')
             self._csv_since_flush += 1
             if self._csv_since_flush >= 25:   # ~0.5 s @ 50 Hz
@@ -197,38 +254,41 @@ SLOWDOWN_BRAKE_MAX = 45.0    # % - yavaşlama freni tavanı (yumuşak; DUR/ACIL 
 KARAR_TIMEOUT = 1.0         # saniye - karar node bu süre sessiz kalırsa DUR (karar 10Hz)
 DUR_WAIT_TIME = 17.0        # saniye - durakta bekleme (yolcu al/bırak 15-20 sn şartı, +70/nokta — rapor §2/H5; eski 3.0 puan kaybı)
 PARK_WAIT_TIMEOUT = 8.0     # (KULLANILMIYOR — H5'te hedef=None creep'i kaldırıldı, anında dur. Eski 8 sn drift için duruyor.)
-# --- Engelden kaçınma: KAPALI-DÖNGÜ YANAL-OFFSET (H2, rapor §13.3) ---
-# Sabit ±20°/2 s açık-döngü darbe (§13.2-A: ~0.37 m, yetersiz) yerine Pure
-# Pursuit hedefini rotaya DİK kaydırırız: araç offset kadar yana açılır, engeli
-# geçer, offset 0'a inince rotaya PARALEL döner (eğik kalmaz, §13.2-B çözümü).
-AVOID_OFFSET_MAX = 1.8      # metre - hedef yanal açıklık (engel yarı-gen. + araç yarı-gen. + marj)
-AVOID_OFFSET_RATE = 2.5     # m/s - offset rampası. CANLI BULGU (run 165604, §12.12): 1.5 idi →
-                            # rampa 0.84m yol yiyordu; engel 3.5m'de iken sert direksiyon geç
-                            # devreye giriyordu. Hızlandırıldı → yanal hareket erken başlar.
-# Avoid sırasında KISA lookahead — "açı yeterli değil" düzeltmesi (§12.12).
-# CANLI BULGU: hız-bazlı Ld=1.0·v+2.5 düşük hızda bile ~3.25m kalıyor; 1.8m dik-offset
-# bu uzun lookahead'de yalnız ~15° direksiyon üretti (eğim 0.136 → 1.79m yanal için 13m
-# gerek, engel 3.5m'de). Kısa lookahead aynı offset'i çok daha keskin açıya çevirir
-# (Ld=2.0m → MAX_STEER'e yakın). Yalnız kaçınma aktifken (|offset|>eps) uygulanır.
-AVOID_LOOKAHEAD = 2.0       # metre - avoid sırasında Pure Pursuit lookahead tavanı (sert direksiyon)
-AVOID_OFFSET_RATE_DEFAULT = 1.5  # (referans — eski değer; gerekirse geri dön)
-AVOID_PASS_DISTANCE = 5.0   # metre - kaçış başından bu kadar ilerleyince "engel geçildi" → offset'i 0'a indir
-AVOID_ACTIVE_EPS = 0.05     # metre - |offset|>bu ise kaçınma sürüyor say (/line bastır, kaynak=AVOID/RETURN)
-LANE_CHANGE_ABORT_TURN_DEG = 35.0  # derece - kaçınmayı YALNIZ rota bu kadar keskin bükülünce iptal et (yaw_rate ile DEĞİL)
-LANE_CHANGE_TURN_RATE_MAX = 0.3    # rad/s - bu AKTİF dönüş hızının üstünde kaçınma BAŞLATMA (yaw_rate H4/§12.7 ile gerçek dt)
-# --- C1: Doğrudan engel kanalı (/obstacles/poses) — apeksi gerçek dubaya göre koy ---
-# Plan §3.4/§14.5-C1, §13.2-A kök neden. Engel görülürse kaçınma:
-#   (1) offset apeksini engelin gerçek yanal konumuna göre kurar (kör 1.8m değil),
-#   (2) engeli UZUNLAMASINA geçince biter (kör sabit AVOID_PASS_DISTANCE değil),
-# böylece §13.2-A "manevra engeli geçemiyor" (sabit 5m'de erken dönüş) çözülür.
-# Engel YOKKEN (detektör kapalı/stale) eski kör davranışa fallback → geriye uyum.
+# --- Engelden kaçınma MİMARİSİ (H-A/H-B, 2026-06-24) ---
+# KARAR (mimari dönüş): control artık sentetik yanal-offset manevrası YAPMAZ.
+# Kör ±offset (eski H2, §12.10/§12.12) iki canlı koşuda da engeli geçemedi —
+# 3.5 m tetik mesafesinde golf-cart geometrisi 1.8 m yanalı açacak yanal yetkiyi
+# üretemiyor (R≈3.08 m'de ~2.8 m gerek, rampa payı yiyor). Yeni mimari:
+#   • Kaçınma = PLANLAYICI işi: karar 6 m'de tetikler, hedef rotayı engelin
+#     etrafından (karşı şerit/slalom kenarları) çizer → control DÜZ TAKİP eder.
+#   • control = Pure Pursuit + /line düz takip (H-A: offset + abort/turn guard YOK).
+#   • Güvenlik ağı = doğrudan latched e-stop (H-B): /obstacles/poses dead-ahead
+#     dar koridorda yakınsa tam fren — /karar merdiveninin ÜSTÜNDE, 10 Hz BT
+#     gecikmesini atlar. Dar koridor → reroute'u ÖLDÜRMEZ (araç yana açılınca
+#     engel koridordan çıkar, e-stop bırakır). Tek-yön şeritte reroute yoksa
+#     araç engelde durur (çarpmaz) — güvenli; gerçek geçiş hedef'in slalom
+#     kenarlarına bağlı (Samed, Faz 1).
+# --- H-B: Doğrudan e-stop güvenlik ağı (/obstacles/poses, latched, Ackermann-farkında) ---
+# CANLI BULGU (run 185215): sabit 2.5 m/dar-koridor e-stop, araç reroute dönüşünü
+# tam yapmadan dubayı 2.4 m'de koridorda görüp DURDURDU — oysa keskin dönerse aradan
+# geçerdi (kullanıcı). Çözüm: e-stop sadece MESAFE değil, mevcut direksiyonun Ackermann
+# yayı engele GERÇEKTEN çarpıyorsa tetiklensin (+ çok-yakın hard floor son çare).
 OBSTACLE_TOPIC = '/obstacles/poses'  # geometry_msgs/PoseArray (gövde çerçevesi, x ileri / y sol)
-OBSTACLE_TIMEOUT = 0.5        # s - bu süre engel gelmezse kör moda düş (sabit pass-distance)
+OBSTACLE_TIMEOUT = 0.5        # s - tampon bu süre tazelenmezse "stale"; e-stop latch'i KORUNUR (donmada fren bırakmaz)
 OBSTACLE_FWD_MIN = 0.3        # m - tamponun dibindeki noktaları (kendi gövdemiz) yok say
-OBSTACLE_FWD_MAX = 12.0       # m - bu kadar ileriye kadar bir engel rotayı bloklayan aday sayılır
-OBSTACLE_CORRIDOR_M = 1.2     # m - engelin |yanal| uzaklığı bu kadarsa "rotamızı bloklar" (karar koridoru ~1.0)
-OBSTACLE_PASS_CLEARANCE = 2.0 # m - dubayı uzunlamasına bu kadar geçince kaçınma biter (araç ön çıkıntısı + emniyet)
-OBSTACLE_OFFSET_HARD_MAX = 2.5 # m - engel-farkında offset üst sınırı (şeritten tamamen çıkmamak için)
+ESTOP_HARD_M = 1.0            # m - bu kadar yakın + dar koridor → KOŞULSUZ tam fren (son çare, çok geç)
+ESTOP_FWD_M = 2.5             # m - bu menzile kadar Ackermann-yay kontrolü yapılır (çarpacaksa dur)
+ESTOP_CORRIDOR_M = 0.7        # m - hard floor DAR koridoru (gerçekten yolun ortasındaki engel)
+ESTOP_CHECK_CORRIDOR_M = 1.5  # m - Ackermann kontrolü için (genişçe) aday koridoru; yay yine de geçerse durmaz
+ESTOP_SAFE_RADIUS = 0.9       # m - yay-engel açıklık payı (araç yarı-gen. ~0.6 + duba ~0.15 + marj); düşür=daha cesur geçiş
+ESTOP_RELEASE_S = 0.5         # s - tazece TEMİZ kalınca e-stop'u bırakmadan önceki debounce
+ESTOP_CRAWL_KMH = 1.5         # km/h - SOFT (Ackermann-yay) e-stop: tam fren YERİNE bu hıza
+                              #   sınırla → S-manevra/pursuit engeli sollayabilsin (deadlock fix,
+                              #   run 214118). HARD floor (<ESTOP_HARD_M) hâlâ koşulsuz tam fren.
+# Keskin dönüş (waypoint'e doğru): heading hatası büyükse Pure Pursuit lookahead'i
+# KISALT → daha sert direksiyon → reroute'u tam takip eder (CANLI: 12° yumuşak kaldı).
+SHARP_TURN_DEG = 15.0         # derece - lookahead noktasına |açı| bunu aşınca kısa lookahead'e geç
+SHARP_LOOKAHEAD = 2.0         # m - keskin dönüşte lookahead tavanı (sert direksiyon)
 
 # Gercek gorev duraklari (hedef_yoneticisi'ndeki GeoJSON ile ayni).
 # FIX 2 — boş liste yerine başlangıçta GeoJSON'dan yüklenir; başarısız
@@ -248,14 +308,28 @@ WP_NEAR_DISTANCE = 1.5      # metre - WP1'e yakinken WP2'ye gec (lookahead)
 # ARAÇ PARAMETRELERİ - TÜM AYARLAR BURADA
 # =============================================================================
 
+# --- Döngü ---
+LOOP_RATE_HZ = 50                            # Ana kontrol döngüsü frekansı (run loop + slew dt)
+LOOP_DT = 1.0 / LOOP_RATE_HZ                 # saniye - slew-rate ve zaman hesapları bu sabiti kullanır
+
 # --- Hız Ayarları ---
 MAX_SPEED_KMH = 5.0                          # Maksimum hız (km/h)
 MAX_SPEED_MS = MAX_SPEED_KMH / 3.6           # Maksimum hız (m/s) - otomatik hesaplanır
 # --- Direksiyon Ayarları ---
-MAX_STEER_ANGLE = 30.0                       # Maksimum direksiyon açısı (derece)
+try:
+    MAX_STEER_ANGLE = ackermann.max_bicycle_angle()  # ≈28.95° — Bee1 teker limitlerinden (ackermann.py)
+except Exception:
+    MAX_STEER_ANGLE = 28.95                  # fallback (ackermann.py import edilemedi)
+# Direksiyon SLEW-RATE limiti (anti-oscillation, §17 teşhisi). Direksiyon tek
+# tick'te bundan hızlı DEĞİŞEMEZ → flip-flop snap'i (+9°→−30° tek tick) yumuşar,
+# line-gate/sharp-gate süreksizliklerinden artan titreme sönümlenir. Gerçek
+# direksiyon aktüatörünün fiziksel hız sınırını da taklit eder.
+# 200°/s @ 50 Hz = 4°/tick: düz pursuit (~<2°/tick) etkilenmez; 39°'lik snap
+# ~0.2 s'de rampalanır; 11°/tick line-chatter 4'e kırpılır. TUNABLE (canlı ayar).
+STEER_RATE_MAX_DEG_S = 200.0
 
 # --- Pure Pursuit Direksiyon Kontrolü ---
-WHEELBASE = 1.78             # metre - ön/arka aks mesafesi (golf.urdf'ten türetildi)
+WHEELBASE = 1.86             # metre - Bee1 dingil mesafesi (golf.urdf da 2026-07-04'te 1.86'ya hizalandı)
 LOOKAHEAD_K = 1.0            # lookahead hız katsayısı (Ld = K*v + B, v: m/s)
 LOOKAHEAD_B = 2.5            # metre - sabit lookahead bileşeni (v=0'da Ld)
 LOOKAHEAD_MIN = 1.5          # metre - lookahead alt sınırı (aşırı direksiyon koruması)
@@ -282,6 +356,39 @@ LINE_WEIGHT = 0.9                            # Şerit düzeltme ağırlığı
 LINE_TIMEOUT = 0.5                           # Veri timeout süresi (saniye)
 LINE_MAX_ANGLE = 25.0                        # Güvenilir maksimum açı (derece)
 LINE_OFFSET = 0.0                            # Kamera kalibrasyonu offset (derece)
+# /line BASTIRMA (anti-oscillation, §17 BİRİNCİL kök neden). /line bir CRUISE
+# şerit-ortalayıcıdır; engel-yakını/slalom (karar≠normal) bağlamında rota zaten
+# yanal manevra yapıyor → /line ters yöne (~−11°) basıp pure-pursuit'le bang-bang
+# yapıyordu (heading 12° kapısında titreme). Engel bağlamında /line susturulur;
+# karar normal'e döndükten LINE_SUPPRESS_TTL sn sonra tekrar açılır (slalom
+# içindeki kısa 'normal' blip'lerinde /line geri gelip titretmesin).
+LINE_SUPPRESS_TTL = 2.0                       # saniye - son engel-bağlamı kararından sonra /line susuk kalır
+
+# --- KESKİN S-MANEVRA (slalom, §18) ---
+# Kullanıcı direktifi: dubayı gör + reroute WP gelince control deterministik
+# TAM SOL yapar, sol-şerit WP hizasına gelene kadar direksiyonu TOPLAMAZ, sonra
+# TAM SAĞ ile ikinci keskin dönüşü yapar (simetrik, geniş-salınımlı S). Manevra
+# aktifken steering'i o SAHİPLENİR → pursuit + /line + sharp-gate bypass; latched
+# WP referansı sayesinde hedef flip-flop'undan (§17 mek-3) ETKİLENMEZ. §16 slalom
+# için revize (control düz-takip yetersizdi: pursuit sola zayıf çıkıp sağa
+# full-lock snap atıyordu — CANLI run 135822). Tetik: yalnız hedef reroute WP
+# sıçraması (kullanıcı Q2; /obstacles bağımlılığı YOK). H-B e-stop güvenlik ağı
+# manevranın ÜSTÜNDE çalışmaya devam eder.
+SMANEUVER_ENABLED = True
+SMANEUVER_REROUTE_LATERAL_M = 1.8   # m - /hedef WP tek güncellemede bu kadar YANA adımlarsa = reroute (slalom) tetik
+                                    # (1.2→1.8: keskin track virajında ardışık WP yanal adımı ~1.4m olabiliyor;
+                                    #  reroute sıçraması ~2.3m → 1.8 ikisini ayırır. + engel-bağlamı kapısı, aşağı)
+SMANEUVER_CTX_TTL = 3.0             # s - tetik yalnız engel-bağlamında (son karar≠normal'den bu süre içinde) geçerli;
+                                    # engelsiz track virajı (karar=normal) yanlış S-manevra başlatmasın (§incele algo)
+# Faz TAM SOL bitişi: araç (başlangıç-yönü çerçevesinde) sol-WP'nin YANAL hizasına
+# gelince VEYA heading swing'i SWING_DEG'i aşınca → TAM SAĞ'a geç. Swing kapısı
+# ŞART: golf-cart yavaşken (2.5 km/h, full-lock ~13°/s) "2.2m WP'ye kadar tut"
+# ~73° dönüş = AŞIRI DÖNME/döngü demek (offline bisiklet-sim kanıtı). Swing kapısı
+# bunu keser; hız yeterse WP yanal hizası baskın olur (kullanıcı niyeti korunur).
+SMANEUVER_MAX_SWING_DEG = 45.0     # derece - faz TAM SOL maksimum heading swing'i (döngü-önleme)
+SMANEUVER_ALIGN_DEG = 8.0          # derece - faz TAM SAĞ: heading başlangıç-yönüne bu kadar dönünce manevra biter (pursuit devralır)
+SMANEUVER_TIMEOUT = 6.0            # s - faz başına süre güvenliği; aşılırsa pursuit'e dön
+SMANEUVER_PENDING_TTL = 1.0       # s - reroute tetiği bu kadar taze olmalı (eski sıçramayla başlamasın)
 
 # --- Vites Sabitleri (değiştirmeyin) ---
 GEAR_NEUTRAL = 1
@@ -522,23 +629,28 @@ class CANWaypointFollower:
         self.post_stop_time = 0.0           # Son durak bekleme bitiş zamanı (flip-flop grace)
         self._stall_start_time = None       # FIX 4: anti-stall kick-start timer
 
-        # Karar durumu
+        # Karar durumu (H-A: control yanal-offset manevrası YAPMAZ → lane_change state YOK)
         self.karar = Karar.NORMAL
         self.last_karar_time = None   # /karar son geliş zamanı (watchdog; ilk karar gelince silahlanır)
-        self.lane_change_active = False      # engelden kaçınma (yanal-offset) sürüyor mu
-        self.lane_change_dir = 0             # -1: sağ, +1: sol
-        self.lateral_offset = 0.0            # H2: uygulanan yanal offset (m, +sol), rampalı
-        self.avoid_start_x = 0.0             # kaçınma başlangıç konumu (kör fallback pass-distance ölçümü)
-        self.avoid_start_y = 0.0
-        self._last_steer_source = "PURSUIT"  # direksiyon kaynağı geçiş logu için
-        # C1: engel-farkında kaçınma latch'leri (manevra başında bir kez doldurulur)
-        self.avoid_offset_target = 0.0       # işaretli hedef offset (m, +sol); kör→dir*AVOID_OFFSET_MAX
-        self.avoid_obstacle_world = None     # (ox, oy) latch'lenmiş duba dünya konumu, ya da None (kör)
-        self.avoid_dir_vec = (1.0, 0.0)      # manevra başındaki rota yönü (cos yaw, sin yaw) — gap ölçümü için
-        # C1: /obstacles/poses tamponu (gövde çerçevesi noktaları) + tazelik + lock
+        self._last_steer_source = "PURSUIT"  # direksiyon kaynağı geçiş logu için (PURSUIT / PURSUIT+LINE)
+        self._prev_cmd_steer = 0.0           # son GERÇEKTEN gönderilen direksiyon (slew-rate + Ackermann e-stop referansı; §17/§incele)
+        self._last_obstacle_ctx_t = 0.0      # son engel-bağlamı kararı (slow/sol/sag/dur/acil) zamanı → /line bastırma (§17)
+        # --- KESKİN S-MANEVRA (slalom, §18) state ---
+        self._sman_phase = 'IDLE'            # IDLE / TOWARD (tam sol) / AWAY (tam sağ)
+        self._sman_dir = 0                   # +1 ilk dönüş sola, −1 sağa (reroute WP tarafı)
+        self._sman_left_wp = None            # latched reroute (sol-şerit) WP dünya konumu (yanal hiza referansı)
+        self._sman_start_xy = None           # manevra başlangıç konumu (yanal ilerleme ölçümü)
+        self._sman_fwd_yaw = 0.0             # manevra başlangıç yön'ü (heading swing + nominal-çerçeve referansı)
+        self._sman_phase_t = 0.0             # faz başlangıç zamanı (timeout)
+        self._sman_pending = None            # (wp_x, wp_y, dir, t) — _hedef_callback'in tetik latch'i
+        # H-B: /obstacles/poses tamponu (gövde çerçevesi) + tazelik + lock + e-stop latch
         self._obstacle_lock = threading.Lock()
         self._obstacle_points = []           # [(fwd, lat), ...] son PoseArray (gövde çerçevesi)
         self._obstacle_time = 0.0            # son PoseArray geliş zamanı (tazelik)
+        self._estop_active = False           # latched e-stop durumu (donmada KORUNUR)
+        self._estop_hard = False             # True ise HARD floor (<1.0m) → koşulsuz tam fren;
+                                             #   False ise SOFT Ackermann-yay → emekle + S-manevra
+        self._estop_clear_since = None       # koridor tazece temiz olduğu an (release debounce)
 
         # Araç durumu
         self.x = 0.0
@@ -624,11 +736,6 @@ class CANWaypointFollower:
         self.can_thread.daemon = True
         self.can_thread.start()
 
-        # Hız yayıncı thread (0x301 CAN mesajı)
-        self.speed_pub_thread = threading.Thread(target=self._speed_publisher)
-        self.speed_pub_thread.daemon = True
-        self.speed_pub_thread.start()
-
         self.logger.log("=" * 60)
         self.logger.log("  CAN Waypoint Follower Başlatıldı (Karar Entegrasyonlu)")
         self.logger.log(f"  Maksimum Hız: {MAX_SPEED_KMH} km/h")
@@ -670,8 +777,9 @@ class CANWaypointFollower:
         """Hedef tesliminden gelen mikro-waypoint (String: 'x1,y1|x2,y2')
 
         D* Lite hedef yoneticisi 10Hz'de yuzlerce mikro-waypoint gonderir.
-        Flip-flop filtresi: Hedef 10m'den fazla ziplayip 1sn icinde geri donerse
+        Flip-flop filtresi: Hedef >3m ziplayip arkaya (>90°) isaret ederse
         (hedef_yoneticisi sapma recalculate kaynaklı) reddedilir.
+        Ayrıca KESKİN S-MANEVRA tetiği: reroute WP yanal sıçraması (§18).
         """
         try:
             raw = msg.data.strip()
@@ -690,12 +798,16 @@ class CANWaypointFollower:
                 x2, y2 = float(parts2[0]), float(parts2[1])
 
             # --- FLIP-FLOP FİLTRESİ ---
-            # Hedef >10m ziplayinca: yon kontrolu yap
+            # Hedef >3m ziplayinca (§17: 5→3m): yon kontrolu yap
             # Aracin mevcut yonune gore >90° arkaya isaret ediyorsa REDDET
             # İstisna: Durak sonrası 3 saniye grace period - doğru yeni hedefleri kabul et
             if self.dynamic_target is not None:
                 jump_dist = math.sqrt((x - self.dynamic_target[0])**2 + (y - self.dynamic_target[1])**2)
-                if jump_dist > 5.0:
+                # 5.0→3.0 m (§17): slalom reroute flip-flop'u ~3 m'lik yanal
+                # sıçramalar üretiyor; eşik düştü ki >90° geriye işaret eden
+                # flip-flop reversal'ları yakalansın. İleri WP ilerlemesi her
+                # zaman <90° önde → reddedilmez (yalnız geriye-dönük sıçrama).
+                if jump_dist > 3.0:
                     in_grace = (time.time() - self.post_stop_time) < 3.0
                     if not in_grace:
                         # Yeni hedefin aracin arkasinda olup olmadigini kontrol et
@@ -712,6 +824,21 @@ class CANWaypointFollower:
             else:
                 self.next_target = None
             self.target_none_since = None
+
+            # --- KESKİN S-MANEVRA tetiği (§18): reroute WP YANAL sıçraması ---
+            # Yeni WP eskisine göre gövde-çerçevesinde > eşik YANA adımladıysa =
+            # planlayıcı karşı şeride reroute verdi (slalom). Latch'le; manevrayı
+            # run loop (_sman_update) başlatır. (Tetik yalnız reroute WP — kullanıcı
+            # Q2; /obstacles bağımlılığı YOK. İleri WP ilerlemesi ~0 yanal → tetiklemez.)
+            # ENGEL-BAĞLAMI KAPISI: yalnız karar≠normal yakınken (cone var) → engelsiz
+            # keskin track virajı yanlış S-manevra başlatmasın (§incele algo bulgusu).
+            if (SMANEUVER_ENABLED and old_target is not None
+                    and (time.time() - self._last_obstacle_ctx_t) < SMANEUVER_CTX_TTL):
+                _, lat_new = self._body_frame(x, y)
+                _, lat_old = self._body_frame(*old_target)
+                lat_step = lat_new - lat_old
+                if abs(lat_step) > SMANEUVER_REROUTE_LATERAL_M:
+                    self._sman_pending = (x, y, 1 if lat_step > 0 else -1, time.time())
 
             # Sadece hedef belirgin degistiginde logla (spam onleme)
             if old_target is None or self._distance_between(old_target, (x, y)) > 2.0:
@@ -756,44 +883,35 @@ class CANWaypointFollower:
             m2.color.b = 1.0; m2.color.a = 1.0  # Mavi
             self.pub_marker.publish(m2)
 
-    def _is_in_turn(self, threshold_deg=15):
-        """Aracın aktif virajda olup olmadığını kontrol et"""
-        if self.dynamic_target is None:
-            return False
-        heading_err = abs(self._heading_error(self.dynamic_target[0], self.dynamic_target[1]))
-        return heading_err > math.radians(threshold_deg)
-
     def _karar_callback(self, msg):
-        """Karar node'undan gelen durum (String: 'normal'/'slow'/'dur'/'acildurus'/'sag'/'sol')"""
+        """Karar node'undan gelen durum (String: 'normal'/'slow'/'dur'/'acildurus'/'sag'/'sol').
+
+        H-A: control artık kendi yanal-offset manevrasını YAPMAZ. SAG/SOL yalnız
+        bir HIZ ipucu (yavaş kal — engel yakını); rotadan SAPMA hedef planlayıcının
+        işidir (karşı-şerit/slalom kenarları). Eski _start_lane_change/turn-guard
+        zinciri kaldırıldı (iki canlı koşuda da engeli geçemedi, §12.12 / H-A)."""
         new_karar = msg.data.strip().lower()
         old_karar = self.karar
-        self.last_karar_time = time.time()   # watchdog: her karar mesajında tazele
+        now = time.time()
+        self.last_karar_time = now   # watchdog: her karar mesajında tazele
 
-        if new_karar == Karar.DUR and old_karar != Karar.DUR:
-            self.logger.log("KARAR: DUR")
-        elif new_karar == Karar.ACIL_DURUS:
-            self.logger.log("KARAR: ACIL DURUS!")
-        elif new_karar == Karar.SAG and old_karar != Karar.SAG:
-            if self._turn_blocks_lane_change():
-                self.logger.log(f"KARAR: SAG REDDEDILDI - aktif dönüşte (yaw_rate={math.degrees(self.yaw_rate):.1f}°/s)")
-                new_karar = Karar.NORMAL  # SAG'ı yoksay, NORMAL olarak devam et
-            else:
-                self._start_lane_change(-1)  # sağa şerit değiştir
-                self.logger.log("KARAR: SAĞ - şerit değiştirme başladı")
-        elif new_karar == Karar.SOL and old_karar != Karar.SOL:
-            if self._turn_blocks_lane_change():
-                self.logger.log(f"KARAR: SOL REDDEDILDI - aktif dönüşte (yaw_rate={math.degrees(self.yaw_rate):.1f}°/s)")
-                new_karar = Karar.NORMAL  # SOL'u yoksay, NORMAL olarak devam et
-            else:
-                self._start_lane_change(1)  # sola şerit değiştir
-                self.logger.log("KARAR: SOL - şerit değiştirme başladı")
-        elif new_karar == Karar.SLOW and old_karar != Karar.SLOW:
-            self.logger.log(f"KARAR: YAVAŞ - hız limiti {LIMIT_SLOW} km/h")
-        elif new_karar == Karar.NORMAL and old_karar != Karar.NORMAL:
-            # NOT: NORMAL kaçınmayı YARIDA kesmez (H2) — engel geçişi pass-distance
-            # ile tamamlanır; karar anlık normal derken araç hâlâ engelin yanında
-            # olabilir, erken dönüş onu engele geri sokar. Bitiş _avoidance_target_offset'te.
-            self.logger.log("KARAR: NORMAL")
+        # Engel-bağlamı (normal DIŞI her karar) zaman damgası → /line bastırma (§17).
+        # slalom içindeki kısa 'normal' blip'lerinde TTL ile /line susuk kalır.
+        if new_karar != Karar.NORMAL:
+            self._last_obstacle_ctx_t = now
+
+        if new_karar != old_karar:
+            if new_karar == Karar.DUR:
+                self.logger.log("KARAR: DUR")
+            elif new_karar == Karar.ACIL_DURUS:
+                self.logger.log("KARAR: ACIL DURUS!")
+            elif new_karar in (Karar.SAG, Karar.SOL):
+                self.logger.log(f"KARAR: {new_karar.upper()} - engel yakını, yavaş düz takip "
+                                f"(rota sapması planlayıcıda)")
+            elif new_karar == Karar.SLOW:
+                self.logger.log(f"KARAR: YAVAŞ - hız limiti {LIMIT_SLOW} km/h")
+            elif new_karar == Karar.NORMAL:
+                self.logger.log("KARAR: NORMAL")
 
         self.karar = new_karar
 
@@ -868,23 +986,70 @@ class CANWaypointFollower:
     def _obstacles_callback(self, msg):
         """`/obstacles/poses` (PoseArray, gövde çerçevesi) → tampon + tazelik damgası.
 
-        Boş array de geçerli (engel yok). Yalnız konumu saklarız; rotayı bloklayan
-        seçimi `_fresh_blocking_obstacle()` yapar (manevra başında okunur)."""
+        Boş array de geçerli (engel yok). E-stop kararını `_update_estop()` verir."""
         pts = [(p.position.x, p.position.y) for p in msg.poses]  # (fwd, lat) gövde çerçevesi
         with self._obstacle_lock:
             self._obstacle_points = pts
             self._obstacle_time = time.time()
 
-    def _fresh_blocking_obstacle(self):
-        """Taze (≤OBSTACLE_TIMEOUT) tampondan rotayı bloklayan EN YAKIN dubayı döndür.
+    def _update_estop(self):
+        """H-B: doğrudan LATCHED + Ackermann-farkında e-stop güvenlik ağı.
 
-        Döner: (fwd, lat) gövde çerçevesi, ya da None (engel yok / stale / kör)."""
+        İki kademe:
+          (1) HARD FLOOR: çok yakın (ESTOP_HARD_M) + dar koridor → KOŞULSUZ fren
+              (bu mesafede direksiyon kurtaramaz; son çare).
+          (2) ACKERMANN: ESTOP_FWD_M içinde aday engel varsa, mevcut direksiyonun
+              yayı engele ESTOP_SAFE_RADIUS'tan yakınsa fren. Araç yeterince keskin
+              dönüyorsa (yay engeli kaçırıyorsa) DURMAZ → "dubaya çarpacak sanıp erken
+              durma" çözülür (kullanıcı isteği, CANLI run 185215).
+        Latched: tampon donarsa (stale) durum KORUNUR (plan §3.4). Bırakma: tazece
+        ESTOP_RELEASE_S temiz kalınca. Döner: True ise bu tick TAM FREN."""
+        now = time.time()
         with self._obstacle_lock:
-            if time.time() - self._obstacle_time > OBSTACLE_TIMEOUT:
-                return None
+            stale = (now - self._obstacle_time) > OBSTACLE_TIMEOUT
             pts = list(self._obstacle_points)
-        return select_blocking_obstacle(
-            pts, OBSTACLE_FWD_MIN, OBSTACLE_FWD_MAX, OBSTACLE_CORRIDOR_M)
+        if stale:
+            # Veri donmuş: latch'i KORU. Mesafeyi artık doğrulayamayız → SOFT iken
+            # bile güvenli tarafa kaç (tam fren), emekleyerek köre yaklaşma.
+            if self._estop_active:
+                self._estop_hard = True
+            return self._estop_active
+
+        reason = None
+        hard = select_blocking_obstacle(pts, OBSTACLE_FWD_MIN, ESTOP_HARD_M, ESTOP_CORRIDOR_M)
+        if hard is not None:
+            reason = f"hard floor {hard[0]:.1f}m (yanal {hard[1]:+.2f}m)"
+        else:
+            # Ackermann yay'ı GERÇEKTEN gönderilen son direksiyona göre değerlendir
+            # (`_prev_cmd_steer`, _send_can_command'da her tick tazelenir). Eski
+            # `_last_steer_deg` yalnız SÜRÜŞ dalında güncellenirdi → e-stop sürerken
+            # donmuş pre-e-stop steer'le (ör. +28°) yay "yol açık" deyip fren'i erken
+            # bırakabiliyordu; oysa gerçek komut steer=0 idi (güvenlik bulgusu, §incele).
+            # 2026-07-04: TÜM koridor adayları yay testinden geçirilir (en-yakın-aday
+            # gölgeleme düzeltmesi — bkz. select_arc_blocking_obstacle docstring).
+            cand = select_arc_blocking_obstacle(
+                pts, OBSTACLE_FWD_MIN, ESTOP_FWD_M, ESTOP_CHECK_CORRIDOR_M,
+                self._prev_cmd_steer, WHEELBASE, ESTOP_SAFE_RADIUS)
+            if cand is not None:
+                reason = (f"Ackermann yay çarpıyor: engel {cand[0]:.1f}m "
+                          f"(yanal {cand[1]:+.2f}m), steer {self._prev_cmd_steer:+.1f}°")
+
+        if reason is not None:
+            self._estop_hard = (hard is not None)   # HARD floor mu, SOFT yay mı?
+            if not self._estop_active:
+                kademe = "TAM FREN" if self._estop_hard else "YAVAŞLA+MANEVRA"
+                self.logger.log(f"[E-STOP] {reason} — {kademe}")
+            self._estop_active = True
+            self._estop_clear_since = None
+        elif self._estop_active:
+            # Yol açık (yay geçiyor / koridor temiz) — debounce sonra bırak.
+            if self._estop_clear_since is None:
+                self._estop_clear_since = now
+            elif now - self._estop_clear_since >= ESTOP_RELEASE_S:
+                self._estop_active = False
+                self._estop_clear_since = None
+                self.logger.log("[E-STOP] Yol açık — fren bırakıldı")
+        return self._estop_active
 
     # =========================================================================
     # KARAR YARDIMCI FONKSİYONLARI
@@ -896,145 +1061,10 @@ class CANWaypointFollower:
             return 0.0
         elif self.karar == Karar.DUR:
             return 0.0
-        elif self.karar in (Karar.SLOW, Karar.SAG, Karar.SOL) or self.lane_change_active:
-            return LIMIT_SLOW  # kaçınma sürerken de yavaş kal (yanal manevra kontrolü)
+        elif self.karar in (Karar.SLOW, Karar.SAG, Karar.SOL):
+            return LIMIT_SLOW  # engel yakınında (sag/sol/slow) yavaş düz takip
         else:
             return MAX_SPEED_KMH
-
-    def _turn_blocks_lane_change(self):
-        """Şu an viraj/dönüş şerit değiştirmeyi engelliyor mu? (manevra-bilinçli)
-
-        Eski kapı `_is_in_turn()` (hedefe heading hatası) araç KENDİ yarım
-        açık-döngü manevrasından eğik kalınca (§13.2-B) o eğikliği "rota virajı"
-        sanıp her SOL/SAG retry'ını reddediyordu (§13.2-C → ölüm sarmalı
-        §13.2-D: SOL reddedilince Pure Pursuit + /line tekeri engele geri
-        sürüyordu). `yaw_rate` (H4/§12.7 ile artık GERÇEK dt) tilt'ten
-        ETKİLENMEZ: gerçekten aktif dönüşteysek yüksek, eğik ama düz/duruyorsak
-        ~0. O yüzden "viraj" kararını aracın AKTİF dönüşüne bağlıyoruz, statik
-        eğikliğine değil. (Mid-manevra rota-virajı koruması ayrı:
-        `_should_abort_lane_change`, orada heading-hatası kullanılır çünkü
-        manevranın kendisi zaten yaw üretir.)
-        """
-        return abs(self.yaw_rate) > LANE_CHANGE_TURN_RATE_MAX
-
-    def _start_lane_change(self, direction):
-        """Engelden kaçınmayı başlat/yenile (direction: -1=sağ, +1=sol).
-
-        H2 kapalı-döngü: sabit steer yerine Pure Pursuit hedefini rotaya dik
-        kaydırırız (offset rampalı). C1: manevra başında `/obstacles/poses`'tan
-        rotayı bloklayan dubayı LATCH'leriz → offset apeksi gerçek açıklığa
-        (lat + yön*clearance), bitiş ise dubayı UZUNLAMASINA geçince olur.
-        Engel görünmezse kör fallback (dir*AVOID_OFFSET_MAX + pass-distance).
-        Aynı/yeni komut gelince yeniden latch'lenir → ardışık engel/slalom'da
-        kaçınma uzar ve yön/apeks tazelenir."""
-        # Manevra-bilinçli viraj kapısı (§13.2-C / H1): araç KENDİ eğikliğinden
-        # değil, yalnız AKTİF dönüşte reddet (bkz _turn_blocks_lane_change).
-        if self._turn_blocks_lane_change():
-            self.logger.log(f"KAÇINMA REDDEDİLDİ: aktif dönüşte (yaw_rate={math.degrees(self.yaw_rate):.1f}°/s)")
-            return
-
-        obs = self._fresh_blocking_obstacle()   # (fwd, lat) gövde çerçevesi ya da None
-        cos_y, sin_y = math.cos(self.yaw), math.sin(self.yaw)
-        self.avoid_dir_vec = (cos_y, sin_y)      # manevra başı rota yönü (gap ölçümü)
-        self.avoid_start_x = self.x              # kör fallback pass-distance referansı
-        self.avoid_start_y = self.y
-
-        if obs is not None:
-            fwd, lat = obs
-            # Engeli dünya çerçevesine taşı (gövde: x ileri, y sol) ve LATCH'le.
-            self.avoid_obstacle_world = (
-                self.x + fwd * cos_y - lat * sin_y,
-                self.y + fwd * sin_y + lat * cos_y,
-            )
-            # Apeks: araç merkezini engelden AVOID_OFFSET_MAX (=yanal clearance)
-            # kadar kaçış yönünde ayır. Merkez duba (lat≈0) → eski dir*1.8 ile aynı.
-            self.avoid_offset_target = obstacle_offset_target(
-                lat, direction, AVOID_OFFSET_MAX, OBSTACLE_OFFSET_HARD_MAX)
-            # Karar'ın seçtiği taraf dubanın yanal işaretiyle çelişiyorsa (kaçış
-            # yönünde engele DOĞRU gidiyoruz) uyar — yön karar'ın işi (§3.3), biz
-            # yalnız doğrularız; offset_target zaten geçecek kadar büyür.
-            if direction * lat > OBSTACLE_CORRIDOR_M:
-                self.logger.log(
-                    f"UYARI: kaçış yönü ({'SOL' if direction > 0 else 'SAĞ'}) duba "
-                    f"yanalına (lat={lat:+.2f}m) DOĞRU — açıklık ters tarafta olabilir")
-        else:
-            self.avoid_obstacle_world = None     # kör mod
-            self.avoid_offset_target = direction * AVOID_OFFSET_MAX
-
-        if not self.lane_change_active or direction != self.lane_change_dir:
-            if obs is not None:
-                self.logger.log(
-                    f"KAÇINMA {'SOL' if direction > 0 else 'SAĞ'} (engel: ileri={obs[0]:.1f}m "
-                    f"yanal={obs[1]:+.2f}m → offset hedef {self.avoid_offset_target:+.2f}m, "
-                    f"engeli geçince biter)")
-            else:
-                self.logger.log(
-                    f"KAÇINMA {'SOL' if direction > 0 else 'SAĞ'} (engel GÖRÜNMÜYOR — kör: "
-                    f"offset hedef {self.avoid_offset_target:+.1f}m, {AVOID_PASS_DISTANCE:.0f}m'de biter)")
-        self.lane_change_active = True
-        self.lane_change_dir = direction
-
-    def _should_abort_lane_change(self):
-        """Aktif kaçınmayı YARIDA kesmeli miyiz? Sebep (str) ya da None.
-
-        Yalnız ROTA gerçekten keskin büküldüğünde (hedefe heading hatası >
-        LANE_CHANGE_ABORT_TURN_DEG) iptal — manevranın kendi yaw'ıyla DEĞİL.
-        (yaw_rate burada YANLIŞ sinyal: offset/manevra zaten yaw üretir; §12.3
-        self-cancel dersi.) Ayrı/açık tutuldu ki neyin kestiği logda görünsün."""
-        if self._is_in_turn(threshold_deg=LANE_CHANGE_ABORT_TURN_DEG):
-            return f"rota keskin virajda (>{LANE_CHANGE_ABORT_TURN_DEG:.0f}°)"
-        return None
-
-    def _end_lane_change(self, reason):
-        """Kaçınmayı bitir (offset doğal olarak 0'a rampalanıp rotaya döner). TEK yer."""
-        if not self.lane_change_active:
-            return
-        self.lane_change_active = False
-        self.avoid_obstacle_world = None   # C1 latch'ini temizle (sonraki manevra taze latch'ler)
-        self.logger.log(f"KAÇINMA BİTTİ ({self.lane_change_dir:+d}): {reason}")
-
-    def _avoidance_target_offset(self):
-        """Kaçınma için İSTENEN işaretli yanal offset (m, +sol). Aktif değil /
-        geçildi / iptal → 0.0.
-
-        Tamamlanma: (a) rota keskin virajı (her zaman), sonra (b) C1 latch varsa
-        dubayı UZUNLAMASINA geçince (engel-farkında), yoksa kör pass-distance."""
-        if not self.lane_change_active:
-            return 0.0
-        abort = self._should_abort_lane_change()
-        if abort is not None:
-            self._end_lane_change(f"iptal — {abort}")
-            return 0.0
-        if self.avoid_obstacle_world is not None:
-            # Engel-farkında bitiş: dubayı başlangıç-yönünde geçtik mi? (§13.2-A çözümü —
-            # sabit 5m'de erken dönüş yerine GERÇEK engeli geçene kadar offset'i tut.)
-            ox, oy = self.avoid_obstacle_world
-            dx, dy = self.avoid_dir_vec
-            passed, gap = obstacle_passed(self.x, self.y, ox, oy, dx, dy, OBSTACLE_PASS_CLEARANCE)
-            if passed:
-                self._end_lane_change(f"engel geçildi (gap={gap:.1f} m)")
-                return 0.0
-        else:
-            # Kör fallback (engel görünmüyor): eski sabit kat-edilen-yol ölçütü.
-            traveled = math.hypot(self.x - self.avoid_start_x, self.y - self.avoid_start_y)
-            if traveled >= AVOID_PASS_DISTANCE:
-                self._end_lane_change(f"engel geçildi — kör ({traveled:.1f} m)")
-                return 0.0
-        return self.avoid_offset_target
-
-    def _update_lateral_offset(self):
-        """self.lateral_offset'i hedef offset'e doğru rampala; güncel değeri döndür.
-
-        AVOID_OFFSET_RATE (m/s) hızında yaklaşır → ani hedef sıçraması yerine
-        yumuşak yanal açılma; kaçınma bitince hedef 0 olur, offset 0'a inerken
-        araç rotaya PARALEL döner (eğik kalmaz)."""
-        target = self._avoidance_target_offset()
-        step = AVOID_OFFSET_RATE * 0.02   # 50 Hz tick
-        if self.lateral_offset < target:
-            self.lateral_offset = min(self.lateral_offset + step, target)
-        elif self.lateral_offset > target:
-            self.lateral_offset = max(self.lateral_offset - step, target)
-        return self.lateral_offset
 
     def _check_gorev_arrival(self):
         """Robot konumunu gercek gorev duraklarina karsi kontrol et.
@@ -1106,18 +1136,6 @@ class CANWaypointFollower:
             if dist < min_dist:
                 min_dist = dist
         return min_dist
-
-    def _speed_publisher(self):
-        """Hız yayını thread'i - 0x301 CAN mesajı ile hızı yayınla (100ms aralık)"""
-        while self.is_running and not rospy.is_shutdown():
-            try:
-                speed_raw = int(self.speed_ms * 3.6 * 100)  # km/h * 100
-                data = struct.pack('<H', speed_raw) + bytes(6)
-                msg = can.Message(arbitration_id=0x301, data=data, is_extended_id=False)
-                self.bus.send(msg)
-            except (can.CanError, struct.error):
-                pass
-            time.sleep(0.1)
 
     # =========================================================================
     # PID VE SÜRÜŞ YARDIMCI FONKSİYONLARI
@@ -1197,7 +1215,11 @@ class CANWaypointFollower:
 
             # Direksiyon mesajı (ID: 0x201)
             # Format: (açı + 500) * 10
-            steer_clamped = np.clip(steer_deg, -MAX_STEER_ANGLE, MAX_STEER_ANGLE)
+            steer_clamped = float(np.clip(steer_deg, -MAX_STEER_ANGLE, MAX_STEER_ANGLE))
+            # Slew-rate limiti referansını GERÇEK gönderilen değere senkronla (§17):
+            # tüm dallar (sürüş + e-stop/dur/acil = steer 0) buradan geçer → bir
+            # sonraki tick'in rampası fiziksel direksiyon konumundan başlar.
+            self._prev_cmd_steer = steer_clamped
             steer_raw = int((steer_clamped + 500) * 10)
 
             data_steer = steer_raw.to_bytes(2, 'little') + bytes(6)
@@ -1270,8 +1292,102 @@ class CANWaypointFollower:
             return secondary
         return (ax + t * dx, ay + t * dy)
 
-    def _pure_pursuit_steer(self, primary, secondary, lateral_offset=0.0):
-        """Pure Pursuit geometrik direksiyon kontrolü.
+    def _body_frame(self, px, py):
+        """Dünya noktasını araç gövde çerçevesine çevir → (fwd ileri, lat sol)."""
+        dx = px - self.x
+        dy = py - self.y
+        c = math.cos(self.yaw)
+        s = math.sin(self.yaw)
+        return c * dx + s * dy, -s * dx + c * dy
+
+    def _sman_swing_deg(self):
+        """Manevra başlangıç yönüne göre işaretli heading swing (derece, dir yönünde +)."""
+        d = self.yaw - self._sman_fwd_yaw
+        while d > math.pi:  d -= 2 * math.pi
+        while d < -math.pi: d += 2 * math.pi
+        return math.degrees(self._sman_dir * d)
+
+    def _sman_lateral_progress(self):
+        """Başlangıç-yönü (nominal) çerçevesinde aracın dir yönünde kat ettiği yanal mesafe (m)."""
+        sx, sy = self._sman_start_xy
+        dx, dy = self.x - sx, self.y - sy
+        lat = -math.sin(self._sman_fwd_yaw) * dx + math.cos(self._sman_fwd_yaw) * dy
+        return self._sman_dir * lat
+
+    def _sman_wp_lateral(self):
+        """Latched sol-WP'nin nominal çerçevedeki dir-yönlü yanal offset'i (m) — faz1 hedefi."""
+        sx, sy = self._sman_start_xy
+        dx, dy = self._sman_left_wp[0] - sx, self._sman_left_wp[1] - sy
+        lat = -math.sin(self._sman_fwd_yaw) * dx + math.cos(self._sman_fwd_yaw) * dy
+        return self._sman_dir * lat
+
+    def _sman_update(self):
+        """KESKİN S-MANEVRA durum makinesi (§18). Aktifse direksiyon (derece)
+        döner ve steering'i SAHİPLENİR (pursuit/​/line/sharp-gate bypass); IDLE
+        ise None döner (pursuit devralır). Faz geçişleri latched WP + nominal
+        çerçeveden türer; canlı `target` KULLANILMAZ (flip-flop-bağımsızlık).
+
+        Akış (kullanıcı tarifi + golf-cart geometri düzeltmesi):
+          IDLE   → reroute WP tetiği taze + manevra kapalı → TAM SOL (TOWARD)
+          TOWARD → steer = dir·MAX (TAM SOL); direksiyon TOPLANMAZ. Araç sol-WP'nin
+                   YANAL hizasına gelince (yanal ilerleme ≥ WP yanal offset'i) VEYA
+                   heading swing'i SWING_DEG'i aşınca → AWAY. (Swing kapısı ŞART:
+                   yavaş golf-cart full-lock'ta "2.2m WP'ye kadar" ~73° dönüp
+                   DÖNGÜye giriyordu — offline sim kanıtı; swing kapısı keser.)
+          AWAY   → steer = −dir·MAX (TAM SAĞ, ikinci keskin dönüş); heading
+                   başlangıç-yönüne ALIGN_DEG'e dönünce → IDLE (pursuit devralır)
+        Her fazda TIMEOUT güvenliği. Latched WP + nominal çerçeve sayesinde hedef
+        flip-flop'undan (§17 mek-3) bağımsız — manevra kendi geometrisini sürer."""
+        if not SMANEUVER_ENABLED:
+            return None
+        now = time.time()
+
+        if self._sman_phase == 'IDLE':
+            # Atomik al-ve-temizle (TOCTOU): callback thread aynı anda yeni tetik
+            # yazarsa kaybolmasın diye tek ifadede swap (ROS bulgusu, §incele).
+            p, self._sman_pending = self._sman_pending, None
+            if p is not None and (now - p[3]) < SMANEUVER_PENDING_TTL:
+                self._sman_dir = p[2]
+                self._sman_left_wp = (p[0], p[1])
+                self._sman_start_xy = (self.x, self.y)   # nominal çerçeve sıfırı
+                self._sman_fwd_yaw = self.yaw            # başlangıç yönü (dönmeden ÖNCE)
+                self._sman_phase = 'TOWARD'
+                self._sman_phase_t = now
+                yon = "SOL" if p[2] > 0 else "SAĞ"
+                self.logger.log(f"S-MANEVRA BAŞLADI: TAM {yon} (reroute WP "
+                                f"({p[0]:.1f},{p[1]:.1f}), yanal hiza={self._sman_wp_lateral():.1f}m'e "
+                                f"veya swing {SMANEUVER_MAX_SWING_DEG:.0f}°'e kadar tut)")
+                return self._sman_dir * MAX_STEER_ANGLE
+            return None
+
+        # Süre güvenliği — takılırsa pursuit'e dön
+        if (now - self._sman_phase_t) > SMANEUVER_TIMEOUT:
+            self.logger.log(f"S-MANEVRA İPTAL: {self._sman_phase} timeout "
+                            f"({SMANEUVER_TIMEOUT:.0f}s) → pursuit")
+            self._sman_phase = 'IDLE'
+            return None
+
+        if self._sman_phase == 'TOWARD':
+            reached_wp = self._sman_lateral_progress() >= self._sman_wp_lateral()
+            swing_capped = self._sman_swing_deg() >= SMANEUVER_MAX_SWING_DEG
+            if reached_wp or swing_capped:
+                self._sman_phase = 'AWAY'
+                self._sman_phase_t = now
+                yon = "SAĞ" if self._sman_dir > 0 else "SOL"
+                neden = "sol-WP hizası" if reached_wp else f"swing {SMANEUVER_MAX_SWING_DEG:.0f}°"
+                self.logger.log(f"S-MANEVRA: {neden} → TAM {yon} (dönüş)")
+                return -self._sman_dir * MAX_STEER_ANGLE
+            return self._sman_dir * MAX_STEER_ANGLE
+
+        # AWAY (TAM SAĞ): heading başlangıç-yönüne düzelince pursuit'e bırak
+        if self._sman_swing_deg() <= SMANEUVER_ALIGN_DEG:
+            self.logger.log("S-MANEVRA BİTTİ: heading düzeldi → pursuit devraldı")
+            self._sman_phase = 'IDLE'
+            return None
+        return -self._sman_dir * MAX_STEER_ANGLE
+
+    def _pure_pursuit_steer(self, primary, secondary):
+        """Pure Pursuit geometrik direksiyon kontrolü (düz takip — H-A).
 
             delta = atan2(2 * L * sin(alpha), Ld)
 
@@ -1282,10 +1398,12 @@ class CANWaypointFollower:
         Lookahead mesafesi hıza göre uyarlanır: Ld = K*v + B (eski KTR raporu).
         Düşük hızda kısa, yüksek hızda uzun lookahead -> salınımsız takip.
 
-        lateral_offset (m, +sol): H2 engelden kaçınma. Lookahead noktası rotaya
-        DİK kaydırılır → araç offset kadar yana açılıp rotaya PARALEL gider;
-        offset 0'a inince rotaya döner. (Sabit steer override DEĞİL — kapalı
-        döngü, çünkü Pure Pursuit kaydırılmış hedefi sürekli kovalar.)
+        H-A: sentetik yanal-offset kaçınma KALDIRILDI (kör manevra engeli geçemedi,
+        §12.12). Kaçınma artık planlayıcıda; control rotayı düz takip eder.
+
+        KESKİN DÖNÜŞ (§12.14): waypoint'e açı büyükse (reroute) lookahead'i KISALT →
+        daha sert direksiyon → reroute'u tam takip eder (CANLI: uzun lookahead ile
+        reroute dönüşü 12°'de yumuşak kalıp duba koridordan çıkmıyordu).
 
         Dönüş: direksiyon açısı (derece, + sol / - sağ).
         """
@@ -1293,27 +1411,16 @@ class CANWaypointFollower:
             LOOKAHEAD_K * self.speed_ms + LOOKAHEAD_B,
             LOOKAHEAD_MIN, LOOKAHEAD_MAX
         ))
-        # Kaçınma aktifken lookahead'i KISALT → aynı dik-offset çok daha keskin
-        # direksiyon üretir (§12.12: uzun Ld 1.79m offset'i yalnız ~15°'ye çeviriyordu,
-        # yanal yetki 4× yetersizdi). Yalnız offset belirginken; düz/normal sürüşte
-        # uzun lookahead korunur (salınımsız takip).
-        if abs(lateral_offset) > AVOID_ACTIVE_EPS:
-            ld_desired = min(ld_desired, AVOID_LOOKAHEAD)
         lx, ly = self._select_lookahead_point(primary, secondary, ld_desired)
-
-        # H2: lookahead'i rotaya dik kaydır. Rota yönü: primary→secondary (yoksa
-        # araç→lookahead). Perp-sol birim = (-sin rh, cos rh) → +offset sola.
-        if abs(lateral_offset) > 1e-3:
-            if secondary is not None:
-                rh = math.atan2(secondary[1] - primary[1], secondary[0] - primary[0])
-            else:
-                rh = math.atan2(ly - self.y, lx - self.x)
-            lx += -math.sin(rh) * lateral_offset
-            ly += math.cos(rh) * lateral_offset
-
         alpha = self._heading_error(lx, ly)
-        ld_actual = max(self._distance_to(lx, ly), LOOKAHEAD_MIN)
 
+        # Keskin dönüş gerekiyorsa (lookahead noktasına büyük açı) lookahead'i kısalt
+        # ve yeniden seç → çok daha sert direksiyon (reroute'u keskin takip).
+        if abs(alpha) > math.radians(SHARP_TURN_DEG) and ld_desired > SHARP_LOOKAHEAD:
+            lx, ly = self._select_lookahead_point(primary, secondary, SHARP_LOOKAHEAD)
+            alpha = self._heading_error(lx, ly)
+
+        ld_actual = max(self._distance_to(lx, ly), LOOKAHEAD_MIN)
         delta_rad = math.atan2(2.0 * WHEELBASE * math.sin(alpha), ld_actual)
         return math.degrees(delta_rad)
 
@@ -1362,6 +1469,28 @@ class CANWaypointFollower:
                 rospy.loginfo_throttle(2.0, "[MANUEL] Direksiyon seti devraldı - otonom duraklatıldı")
                 rate.sleep()
                 continue
+
+            # ========== H-B: DOĞRUDAN E-STOP GÜVENLİK AĞI (/karar merdiveni ÜSTÜNDE) ==========
+            # karar BT'nin 10 Hz + String gecikmesini ATLA: dead-ahead dar koridorda
+            # engel yakınsa control DOĞRUDAN /obstacles/poses'tan tam fren basar.
+            # Latched (tampon donarsa korunur), dar koridor reroute'u öldürmez (§3.4 / H-B).
+            # Her tick çağrılır → latch/release debounce düzgün işler.
+            estop_active = self._update_estop()
+            if estop_active and self._estop_hard:
+                # (1) HARD FLOOR (<ESTOP_HARD_M, dar koridor): gerçek acil → KOŞULSUZ
+                #     tam fren + vites N, latched. Bu kademe DOKUNULMAZ (son çare).
+                self._send_can_command(throttle_pct=0, brake_pct=100, steer_deg=0, gear=GEAR_NEUTRAL)
+                rospy.logwarn_throttle(1.0, "[E-STOP] Hard floor engel — doğrudan tam fren")
+                rate.sleep()
+                continue
+            # (2) SOFT Ackermann-yay e-stop (ESTOP_HARD_M..ESTOP_FWD_M): DURMA.
+            #     Eski "steer=0 + tam fren + continue" düz yayı hiç bırakmadığı için
+            #     dead-ahead dubada KİLİTLENİYORDU (run 214118). Artık döngüye düşürülür:
+            #     hız aşağıda ESTOP_CRAWL_KMH'e sınırlanır + S-manevra/pursuit direksiyonu
+            #     sürer → dönen yay engeli kaçırınca _update_estop debounce ile bırakır.
+            #     Backstop hâlâ HARD floor (1.0m) + S-manevra timeout/swing kapısı.
+            if estop_active:
+                rospy.logwarn_throttle(1.0, "[E-STOP] Soft yay engeli — yavaşla + manevra")
 
             # ========== /karar STALENESS WATCHDOG (fail-safe) ==========
             # karar node çökerse/donarsa control son karara asılı kalmasın → DUR.
@@ -1452,8 +1581,17 @@ class CANWaypointFollower:
             # Açı hatasını hesapla
             heading_error = self._heading_error(target_x, target_y)
 
-            # U-dönüşü koruması: Hedef aracın arkasındaysa (>90°)
-            if abs(heading_error) > math.radians(90) and distance < ARRIVAL_THRESHOLD * 3:
+            # U-dönüşü koruması: Hedef aracın arkasındaysa (>90°). S-MANEVRA
+            # aktifken ATLA (§18) — manevra steering'i sahiplenir; planlayıcı
+            # restore edince hedef geçici 'arkada' görünse de manevra latched
+            # sol-WP'ye göre sürdüğü için durmamalı (yoksa manevra yarıda kesilir).
+            # GÜVENLİK (§incele): bypass sırasında DUR yetkisi kapalı ama manevra
+            # SINIRLI — TOWARD swing kapısı (≤45°+rampa), AWAY heading'i geri
+            # yakınsar, her faz SMANEUVER_TIMEOUT=6s backstop'ı var ve H-B e-stop
+            # bu döngünün ÜSTÜNDE çalışmaya devam eder → serbest dönme/runaway sınırlı.
+            if (self._sman_phase == 'IDLE'
+                    and abs(heading_error) > math.radians(90)
+                    and distance < ARRIVAL_THRESHOLD * 3):
                 resolved = False
                 if self.next_target is not None:
                     # WP2'ye yonlenmeyi dene
@@ -1509,6 +1647,12 @@ class CANWaypointFollower:
                 base_speed *= heading_factor
 
             target_speed_kmh = max(base_speed, TURN_MIN_SPEED)
+
+            # SOFT Ackermann-yay e-stop aktif: yalnız EMEKLE → manevranın engeli
+            # kaçırması için alan aç (hard floor 1.0m backstop). Hard floor/stale
+            # zaten yukarıda continue ile tam fren bastı; buraya yalnız soft düşer.
+            if estop_active:
+                target_speed_kmh = min(target_speed_kmh, ESTOP_CRAWL_KMH)
 
             # Hız hatası
             current_speed_kmh = self.speed_ms * 3.6
@@ -1574,35 +1718,47 @@ class CANWaypointFollower:
                 throttle_pct = 0
                 brake_pct = 0
 
-            # ========== DİREKSİYON ARBİTRASYONU (TEK yer, kaynak loglanır) ==========
-            # H2: engelden kaçınma artık sabit steer override DEĞİL — Pure Pursuit
-            # hedefini rotaya dik kaydıran YANAL-OFFSET (rampalı). Engeli geçince
-            # offset 0'a iner, araç rotaya PARALEL döner (eğik kalmaz, yank-back yok).
-            # Kaynaklar açık+loglu:
-            #   AVOID(+x.xxm) : kaçınma aktif, offset açılıyor/tutuluyor (/line YOK)
-            #   RETURN(+x.xxm): kaçınma bitti, offset 0'a iniyor — rotaya dönüş (/line YOK)
-            #   PURSUIT[+LINE]: offset ~0; düz kesimde /line düzeltmesi eklenir
-            offset = self._update_lateral_offset()
-            steer_deg = self._pure_pursuit_steer(
-                (target_x, target_y), lookahead_secondary, lateral_offset=offset)
-
-            if abs(offset) > AVOID_ACTIVE_EPS:
-                steer_source = ("AVOID" if self.lane_change_active else "RETURN") + f"({offset:+.2f}m)"
+            # ========== DİREKSİYON ==========
+            # Önce KESKİN S-MANEVRA (§18): reroute WP gelince aktifleşir ve
+            # steering'i SAHİPLENİR (TAM SOL → hiza → TAM SAĞ). Pursuit/​/line/
+            # sharp-gate bypass; latched WP sayesinde hedef flip-flop'undan bağımsız.
+            sman_steer = self._sman_update()
+            if sman_steer is not None:
+                steer_deg = sman_steer
+                steer_source = "S-MANEVRA"
             else:
+                # Düz takip — H-A: Pure Pursuit + /line (kaçınma planlayıcıda).
+                #   PURSUIT      : saf Pure Pursuit (virajda /line bastırılır)
+                #   PURSUIT+LINE : düz kesimde /line düzeltmesi eklenir
+                steer_deg = self._pure_pursuit_steer((target_x, target_y), lookahead_secondary)
                 steer_source = "PURSUIT"
-                # /line yalnız offset ~0 ve düz kesimde (virajda PP zaten yönetir).
-                if abs(heading_error) < math.radians(LINE_GATE_MAX_HEADING):
+                # /line yalnız (a) düz kesimde (virajda PP zaten yönetir) VE
+                # (b) engel-bağlamı DIŞINDA uygulanır (§17 BİRİNCİL fix). Engel
+                # yakını/slalomda (karar≠normal, TTL'li) /line bastırılır: rota yanal
+                # manevra yaparken /line ters basıp 12° kapısında bang-bang üretiyordu.
+                line_suppressed = (time.time() - self._last_obstacle_ctx_t) < LINE_SUPPRESS_TTL
+                if (not line_suppressed
+                        and abs(heading_error) < math.radians(LINE_GATE_MAX_HEADING)):
                     steer_deg += self._get_line_correction()
                     steer_source = "PURSUIT+LINE"
 
-            # Sınıf değişince logla (offset değeri her tick oynar; AVOID(..)/RETURN(..) parantezini at)
-            src_class = steer_source.split("(")[0]
-            if src_class != self._last_steer_source:
-                self.logger.log(f"DİREKSİYON KAYNAĞI: {self._last_steer_source} → {src_class}")
-                self._last_steer_source = src_class
+            if steer_source != self._last_steer_source:
+                self.logger.log(f"DİREKSİYON KAYNAĞI: {self._last_steer_source} → {steer_source}")
+                self._last_steer_source = steer_source
 
-            # Direksiyon limitlerini uygula
-            steer_deg = np.clip(steer_deg, -MAX_STEER_ANGLE, MAX_STEER_ANGLE)
+            # SLEW-RATE limiti (anti-oscillation, §17): direksiyon son GERÇEKTEN
+            # gönderilen değerden (_prev_cmd_steer, _send_can_command'da tazelenir)
+            # tek tick'te STEER_RATE_MAX_DEG_S·dt'den fazla sapamaz → flip-flop
+            # snap'i (+9°→−30°) rampaya iner + line/sharp-gate artığı titreme
+            # sönümlenir. E-stop/dur dalları steer=0 gönderdiğinde _prev_cmd_steer
+            # de 0 olur → sürüş dönünce 0'dan rampalar (fiziksel olarak doğru).
+            max_delta = STEER_RATE_MAX_DEG_S * LOOP_DT
+            steer_deg = float(np.clip(steer_deg,
+                                      self._prev_cmd_steer - max_delta,
+                                      self._prev_cmd_steer + max_delta))
+            # Direksiyon limitlerini uygula (son komut _send_can_command'da
+            # _prev_cmd_steer'e yazılır → Ackermann e-stop + slew referansı oradan).
+            steer_deg = float(np.clip(steer_deg, -MAX_STEER_ANGLE, MAX_STEER_ANGLE))
 
             # Komutu gönder
             self._send_can_command(

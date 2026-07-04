@@ -64,7 +64,12 @@ class KonumYoneticisi:
             if not msg.data or '|' not in msg.data:
                 return
 
-            wp1_str, wp2_str = msg.data.split('|')
+            # hedef_yoneticisi artık 5 ileri-WP yayınlıyor (x,y,tip|...×5).
+            # İlk iki WP yeterli: wp1=hedef, wp2=bakış yönü. Fazla alanları yok say.
+            parts = msg.data.split('|')
+            if len(parts) < 2:
+                return
+            wp1_str, wp2_str = parts[0], parts[1]
             
             # WP1 (Gidilecek ana nokta)
             wp1_data = wp1_str.split(',')

@@ -32,7 +32,7 @@ VIEW_MARGIN = 4.0       # Metre — tüm-harita görünümünde kenar payı
 # Araç boyutları (TALOS golf arabası, metre)
 VEHICLE_LENGTH = 2.5
 VEHICLE_WIDTH  = 1.2
-WHEELBASE      = 1.8
+WHEELBASE      = 1.86  # Bee1 dingil (2026-07-04 hizalama; control.py ile eşit)
 WHEEL_LENGTH   = 0.4
 WHEEL_WIDTH    = 0.15
 
