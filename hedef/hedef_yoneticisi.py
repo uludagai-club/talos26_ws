@@ -252,6 +252,21 @@ B_PLAN_OFFSET_M        = 2.3    # karşı şeride yanal offset (m, ~pist genişl
 B_PLAN_OFFSET_MARJIN_M = 1.0    # engel r'sine eklenen pay → offset = max(r+pay, OFFSET_M)
 B_PLAN_LEAD_M          = 3.0    # offset waypoint'lerin engel önü/arkası mesafesi (m)
 
+# ════════════════════════════════════════════════════════════════════════
+#   CANLI PARAMETRELER (restart'sız ayar) — config/canli_params.yaml 'hedef:'
+#   Yukarıdaki sabitleri ÇALIŞIRKEN override eder (~1 sn). DİKKAT: graf-kuruluma
+#   gömülenler (CEZA_DUZ_SERIT/CEZA_BAGLANTI, IKI_YONLU_DURAK_*, R_DURAK_M,
+#   ENABLE_GUI) başlangıçta bir kez okunur → değişiklikleri RESTART ister;
+#   arama/reroute anında okunanlar (SAPMA_*, MATCH_*, ILERI_MESAFE_*, blok/
+#   kilit/slalom parametreleri) canlı etkilidir. Bkz: talos_common/canli_params.py
+# ════════════════════════════════════════════════════════════════════════
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle("hedef", globals())
+except Exception as _canli_e:  # noqa: BLE001
+    _canli_izleyici = None
+    sys.stderr.write(f"[hedef_yoneticisi] canli_params yok, statik parametreler: {_canli_e}\n")
+
 
 def ceza_carpani(ceza_puani: float) -> float:
     """0-100 ceza puanını D* kenar ağırlık çarpanına çevirir (1.0 + p/100 * CEZA_ETKI).
