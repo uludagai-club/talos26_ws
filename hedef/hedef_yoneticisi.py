@@ -101,11 +101,22 @@ R_DURAK_M              = 7.0    # durak goal'ünün bu yarıçapındaki kenarlar
 # (cusp) neredeyse yasak. Böylece iki-yönlü durakta DÖNÜLEBİLİR girişi seçer.
 TURN_AWARE_AKTIF       = True
 ARAC_DINGIL_M          = 1.86   # Bee1 dingil mesafesi (wheelbase, m)
-ARAC_MAX_DIREKSIYON    = math.radians(32.5)  # Bee1 maks teker açısı (iç, rad)
+# Bisiklet-modeli maks direksiyon: 28.95° = iç teker 32.5°/dış 30.0° limitlerinin
+# bisiklet eşdeğeri (ackermann.py max_bicycle_angle, doc/saha_hazirlik/05). Eski
+# 32.5° İÇ TEKER açısıydı → min yarıçapı 2.92m sanıyordu; gerçek araç (ve 2026-07-04
+# hizalamasından beri sim/control clamp'i) 28.95° → min dönüş yarıçapı ≈3.36 m.
+ARAC_MAX_DIREKSIYON    = math.radians(28.95)
 DONUS_CEZA_AGIRLIK     = 1.5    # (δ/δ_max)² → dönüş cezası (m-eşdeğeri); yumuşak tercih
 DONUS_CEZA_MAX         = 4.0    # tek dönüş cezası üst sınırı (m) — büyük mesafe kazancını ezmesin
 DONUS_CUSP_ESIK        = math.radians(150)   # bu açının üstü U-dönüşü → ağır ceza (pratikte yasak)
 DONUS_CUSP_CEZA        = 1000.0 # cusp eşiği üstü dönüş için ek ceza (m)
+# B2 (risk kaydı / doc 05, R≥3.4 kısıtı) NOTU — 2026-07-04 denendi ve GERİ ALINDI:
+# δ>δ_max köşeye toplamsal +50 ceza, kaba grafta (düğüm ~2m) şerit-değiştirme
+# köşeleri de δ>δ_max göründüğünden §16 "karşı şeritte KAL" maliyet dengesini bozdu
+# (test_hedef_slalom_reroute 91→90; 103605Z naif-eşik dersinin arama-tarafı tekrarı).
+# R≥3.4 kısıtı hâlâ AÇIK İŞ: köşe açısından değil, YUMUŞATILMIŞ rota eğriliğinden
+# hesaplanmalı. Bu dosyadaki mevcut koruma: (δ/δ_max)² cezası (28.95° ile dürüst
+# ölçek) + DONUS_CUSP_ESIK≥150° çıkış kapısı.
 
 # ── Karar → hedef komutu (/hedef_komut) — sollama / kenar bloğu ───────────
 # karar (BT) sollamaya çıkınca engelin DÜNYA konumunu /hedef_komut ile yollar
@@ -1760,9 +1771,13 @@ class HedefYoneticisi:
                     if mevcut is not None:
                         self._bloklu_engeller.remove(mevcut)
                         kume_degisti = True
-                    elif self._bloklu_engeller:        # eşleşme yoksa hepsini temizle (güvenli)
-                        self._bloklu_engeller.clear()
-                        kume_degisti = True
+                    elif self._bloklu_engeller:
+                        # Eşleşmeyen serbest TÜM blokları SİLMEZ (çoklu-koni: başka
+                        # koninin bloğunu düşürmek rotayı koninin üstünden geçirir).
+                        # Bayat blok zaten BLOK_TTL_S ile kendiliğinden düşer.
+                        rospy.logwarn_throttle(
+                            5.0, f"[hedef_komut] kenar_serbest ({ox},{oy}) hiçbir "
+                                 f"blokla eşleşmedi — yok sayıldı (TTL düşürür)")
                 # NOT: reroute_iste = False kalır → committed path'i koru (off-road fix)
             elif komut == 'replan':
                 kume_degisti = True
