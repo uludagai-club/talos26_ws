@@ -149,6 +149,39 @@ services:
     restart: "no"
 
   # =========================================================
+  # ENGEL ALGILAMA — MAP-DIFF (kerem talos_obstacle_detector, C++/PCL)
+  # =========================================================
+  # Diger node'lardan farkli olarak C++ derleme gerektirir → talos-all yerine
+  # kendi imajinda (lidar/Dockerfile) build edilir. Statik PCD haritasi repoda
+  # gelir (lidar/talos_obstacle_detector/maps/clean.pcd) ve /maps/clean.pcd'ye
+  # mount edilir (.dockerignore ile imaja baked degil). Farkli harita:
+  #   TALOS_MAP_PCD=/yol/harita.pcd docker compose up obstacle-detector
+  # Girdi:  /cart/center_laser/scan (+ /map_cloud, map_publisher_node uretir)
+  # Cikti:  /obstacles, /obstacles/poses, /obstacles/cloud, /obstacles/markers
+  obstacle-detector:
+    build:
+      context: .
+      dockerfile: lidar/Dockerfile
+    image: talos-obstacle-detector:latest
+    container_name: obstacle-detector
+    network_mode: host
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - RUN_ID=${RUN_ID:-dev}
+      - TALOS_LOG_ROOT=/app/logs
+    volumes:
+      # config/launch uzerine mount → parametreleri rebuild'siz degistir
+      - ./lidar/talos_obstacle_detector/config:/ws/src/talos_obstacle_detector/config:ro
+      - ./lidar/talos_obstacle_detector/launch:/ws/src/talos_obstacle_detector/launch:ro
+      # statik harita (repoda gelir) — TALOS_MAP_PCD ile override edilebilir
+      - ${TALOS_MAP_PCD:-./lidar/talos_obstacle_detector/maps/clean.pcd}:/maps/clean.pcd:ro
+      - ./logs:/app/logs
+    entrypoint: bash
+    command: -c "source /ws/devel/setup.bash && roslaunch talos_obstacle_detector obstacle_detector.launch pcd_path:=/maps/clean.pcd"
+    logging: *log-defaults
+    restart: "no"
+
+  # =========================================================
   # TRAFIK ISARETI ALGILAMA (GPU)
   # =========================================================
   traffic-node:

@@ -71,30 +71,47 @@ aşan kümeler (duvar/bariyer) elenir. Ayrıca kutunun uzun ekseni boyunca iki u
 sudo apt install ros-noetic-jsk-recognition-msgs ros-noetic-jsk-rviz-plugins
 ```
 
-## Derleme
+## Çalıştırma — Docker (önerilen, sistemin geri kalanıyla aynı)
 
-Paketi catkin workspace'inizin `src/` dizinine koyun:
+Bu node C++/PCL derlemesi gerektirdiğinden (Python node'ların aksine) `talos-all`
+runtime imajında değil, **kendi imajında** (`lidar/Dockerfile`) derlenir — `control/`
+ve `karar/` ile aynı per-modül Dockerfile desenidir. `docker-compose.yml`'de
+`obstacle-detector` servisi olarak tanımlıdır ve `baslat.sh` ile tüm sistemle
+birlikte ayağa kalkar.
+
+```bash
+# tüm sistemle birlikte
+./baslat.sh
+
+# yalnız bu servis
+docker compose up --build obstacle-detector
+# özel harita yolu
+TALOS_MAP_PCD=/yol/harita.pcd docker compose up --build obstacle-detector
+```
+
+Statik harita **repoda gelir**: `maps/clean.pcd` (~37 MB, `.PCD v0.7`,
+`mapping_node.py`'nin Open3D çıktısı). `.dockerignore` ile imaja gömülmez;
+compose volume ile konteynere `/maps/clean.pcd` olarak mount edilir, böylece
+harita rebuild'siz değiştirilebilir. Başka harita: `TALOS_MAP_PCD=/yol/harita.pcd`.
+
+## Derleme — host catkin (alternatif / geliştirme)
 
 ```bash
 cd ~/catkin_ws && catkin_make -j6
 source devel/setup.bash
-```
-
-## Çalıştırma
-
-Statik haritanız `~/talos_maps/clean.pcd` konumundayken (veya `pcd_path` argümanıyla):
-
-```bash
+# pcd_path varsayilani $(find talos_obstacle_detector)/maps/clean.pcd — repodaki harita
 roslaunch talos_obstacle_detector obstacle_detector.launch
-# özel harita yolu:
-roslaunch talos_obstacle_detector obstacle_detector.launch pcd_path:=/yol/harita.pcd
 ```
 
 RViz'de kutuları görmek için **BoundingBoxArray** display'i ekleyip topic'i
 `/obstacles` yapın (jsk_rviz_plugins gerekir), fixed frame `map`.
 
-> Not: `map` çerçevesi ile sensör çerçevesi arasındaki TF ağacının canlı olması
-> gerekir (aksi halde düğüm `TF lookup failed` uyarısı verir ve kare atlar).
+> **Sert runtime bağımlılıkları** (paketleme bunları çözmez):
+> 1. Statik harita `maps/clean.pcd` repoda gelir (veya `TALOS_MAP_PCD`) — silinirse
+>    `map_publisher_node` çıkar ve hiç engel yayınlanmaz.
+> 2. `map → sensör` TF ağacı canlı olmalı — yoksa düğüm `TF lookup failed` verip
+>    her kareyi atlar.
+> 3. Girdi konusu `/cart/center_laser/scan` yayında olmalı.
 
 ## Parametreler (`config/params.yaml`)
 

@@ -1,0 +1,4 @@
+# Docker build context'ine (imaja) girmesi gereksiz agir asset'ler.
+# Statik PCD haritalari compose volume ile mount edilir → imaja baked DEGIL,
+# boylece imaj yalin kalir ve harita rebuild'siz degistirilebilir.
+**/*.pcd

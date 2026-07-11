@@ -186,26 +186,21 @@ else
 fi
 
 # =============================================================
-# 3b) ENGEL ALGILAMA (kerem talos_obstacle_detector) — HOST node'lari
-# C++ binary host catkin'inde (devel) derli; talos-all imajinda pcl/jsk runtime
-# olmadigindan container yerine host'ta calistirilir. Girdi /cart/points_noground
-# icin minimal zemin-ayiklama (ground_filter.py) onunde kosar. Binary yoksa
-# (kerem branch build edilmemis) sessizce atlanir — baslat.sh akisi bozulmaz.
-# Kapatmak: OBSTACLE_DETECTOR=off ./baslat.sh
+# 3b) ENGEL ALGILAMA (kerem talos_obstacle_detector) — ARTIK COMPOSE SERVISI
+# C++/PCL node artik diger node'lar gibi konteynerde kosar: 'obstacle-detector'
+# servisi (lidar/Dockerfile) asagidaki 'docker compose up' ile ayaga kalkar.
+# Host catkin binary'sine (devel) ve host'ta ground_filter.py'ye artik gerek yok
+# (map-diff yaklasimi /cart/points_noground yerine /cart/center_laser/scan +
+# statik PCD haritasini kullanir). Harita REPODA gelir; TALOS_MAP_PCD ile
+# baska bir haritaya isaret edilebilir.
+# Kapatmak:  docker compose stop obstacle-detector
 # =============================================================
-OBSTACLE_DETECTOR="${OBSTACLE_DETECTOR:-auto}"
-DET_BIN="$PROJECT_ROOT/devel/lib/talos_obstacle_detector/obstacle_detector_node"
-if [ "$OBSTACLE_DETECTOR" != "off" ] && [ -x "$DET_BIN" ] && [ -f "$SCRIPT_DIR/lidar/ground_filter.py" ]; then
-    nohup python3 "$SCRIPT_DIR/lidar/ground_filter.py" \
-        > "$RUN_DIR/system/ground_filter.log" 2>&1 &
-    GROUNDFILTER_PID=$!
-    nohup roslaunch talos_obstacle_detector obstacle_detector.launch \
-        > "$RUN_DIR/system/obstacle_detector.log" 2>&1 &
-    DETECTOR_PID=$!
-    echo -e "${GREEN}[+] engel algilama aktif — ground_filter (PID=$GROUNDFILTER_PID) + obstacle_detector (PID=$DETECTOR_PID)${NC}"
-    echo -e "${CYAN}    /cart/center_laser/scan → /cart/points_noground → /obstacles/poses${NC}"
+MAP_PCD="${TALOS_MAP_PCD:-$SCRIPT_DIR/lidar/talos_obstacle_detector/maps/clean.pcd}"
+if [ ! -f "$MAP_PCD" ]; then
+    echo -e "${YELLOW}[!] Harita PCD bulunamadi ($MAP_PCD) — obstacle-detector harita yayinlayamaz, engel uretmez.${NC}"
+    echo -e "${YELLOW}    Harita yolunu TALOS_MAP_PCD ile verin.${NC}"
 else
-    echo -e "${YELLOW}[!] talos_obstacle_detector binary yok veya OBSTACLE_DETECTOR=off — engel algilama atlandi (legacy /engel* kullanilir)${NC}"
+    echo -e "${GREEN}[+] Engel algilama: obstacle-detector compose servisi (harita: $MAP_PCD)${NC}"
 fi
 
 # =============================================================
@@ -232,7 +227,7 @@ echo -e "${BLUE}[5/8] Docker compose up...${NC}"
 cd "$SCRIPT_DIR" || exit 1
 
 # Eski container kalintilari (manuel docker run'dan) — temizle
-docker rm -f konum-server talos-map-server hedef_teslimi engel-node \
+docker rm -f konum-server talos-map-server hedef_teslimi engel-node obstacle-detector \
               traffic-node park-durak-node lane-follower yaya-gecidi-node karar-node \
               talos-can-bridge talos-state-bridge talos-controller \
               talos-can-visualizer 2>/dev/null

@@ -1,5 +1,5 @@
 <launch>
-  <arg name="pcd_path" default="$(env HOME)/talos_maps/clean.pcd"/>
+  <arg name="pcd_path" default="$(find talos_obstacle_detector)/maps/clean.pcd"/>
   <arg name="map_topic" default="/map_cloud"/>
   <arg name="map_frame" default="map"/>
 
