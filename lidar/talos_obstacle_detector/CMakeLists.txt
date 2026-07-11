@@ -10,6 +10,8 @@ find_package(catkin REQUIRED COMPONENTS
   visualization_msgs
   pcl_ros
   pcl_conversions
+  tf2_ros
+  tf2_sensor_msgs
   jsk_recognition_msgs
 )
 
@@ -23,6 +25,8 @@ catkin_package(
     visualization_msgs
     pcl_ros
     pcl_conversions
+    tf2_ros
+    tf2_sensor_msgs
     jsk_recognition_msgs
 )
 
@@ -31,13 +35,19 @@ include_directories(
   ${PCL_INCLUDE_DIRS}
 )
 
+add_executable(map_publisher_node src/map_publisher_node.cpp)
+target_link_libraries(map_publisher_node
+  ${catkin_LIBRARIES}
+  ${PCL_LIBRARIES}
+)
+
 add_executable(obstacle_detector_node src/obstacle_detector_node.cpp)
 target_link_libraries(obstacle_detector_node
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
 )
 
-install(TARGETS obstacle_detector_node
+install(TARGETS map_publisher_node obstacle_detector_node
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

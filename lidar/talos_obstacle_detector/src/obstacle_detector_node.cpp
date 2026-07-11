@@ -1,22 +1,3 @@
-// =============================================================================
-//  talos_obstacle_detector  -  DBSCAN kumeleme + PCA tabanli OBB + zamansal takip
-// -----------------------------------------------------------------------------
-//  Akis:
-//    /cart/points_noground (Patchwork++ zemin ayiklamasi ciktisi, engel adaylari)
-//      -> DBSCAN (epsilon, MinPts) ile gurultu eleme + kumeleme
-//      -> her kume icin PCA ile Oriented Bounding Box (konum/boyut/yonelim)
-//      -> tracker: kareler arasi esleme + EMA yumusatma + histerezis
-//      -> /obstacles (jsk BoundingBoxArray), /obstacles/poses, /obstacles/markers,
-//         /obstacles/clusters (renkli debug bulutu)
-//
-//  Tum hesap girdi bulutunun frame'inde (velodyne) yapilir: TF interpolasyon
-//  hatasi olmadan en yuksek geometrik dogruluk.
-//
-//  Tracker neden var: kare kare DBSCAN+PCA kutulari "git gel" yapar
-//  (seyrek LiDAR'da kume yanip soner; PCA baskin ekseni ~90 derece atlar).
-//  Takip + yumusatma bunlari giderir, kutulari kararli kilar.
-// =============================================================================
-
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <geometry_msgs/PoseArray.h>
@@ -24,469 +5,338 @@
 #include <jsk_recognition_msgs/BoundingBox.h>
 #include <jsk_recognition_msgs/BoundingBoxArray.h>
 
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.h>
+#include <tf2/LinearMath/Quaternion.h>
+
 #include <pcl/point_types.h>
 #include <pcl/point_cloud.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree_flann.h>
-#include <pcl/common/centroid.h>
+#include <pcl/segmentation/extract_clusters.h>
+#include <pcl/common/common.h>
 
 #include <Eigen/Dense>
-#include <vector>
-#include <algorithm>
+#include <mutex>
+#include <memory>
 #include <cmath>
-
-using PointT = pcl::PointXYZ;
-using CloudT = pcl::PointCloud<PointT>;
-
-namespace
-{
-// aci farki [-pi, pi]
-inline double angDiff(double a, double b)
-{
-  return std::atan2(std::sin(a - b), std::cos(a - b));
-}
-inline Eigen::Quaternionf yawQuat(double yaw)
-{
-  return Eigen::Quaternionf(Eigen::AngleAxisf(static_cast<float>(yaw),
-                                              Eigen::Vector3f::UnitZ()));
-}
-}  // namespace
-
-// tek karede uretilen ham olcum
-struct Detection
-{
-  Eigen::Vector3f   pos;
-  Eigen::Vector3f   dim;
-  Eigen::Quaternionf quat;
-  double            yaw;   // vertical_box modunda gecerli
-  int               npts;
-};
-
-// zaman icinde takip edilen, yumusatilmis engel
-struct Track
-{
-  int               id;
-  Eigen::Vector3f   pos;
-  Eigen::Vector3f   dim;
-  Eigen::Quaternionf quat;
-  double            yaw;
-  int               npts;
-  int               hits   = 0;
-  int               misses = 0;
-  bool              confirmed = false;
-};
 
 class ObstacleDetector
 {
 public:
   ObstacleDetector(ros::NodeHandle& nh, ros::NodeHandle& pnh)
+    : tf_listener_(tf_buffer_)
   {
-    pnh.param<std::string>("input_topic", input_topic_, "/cart/points_noground");
-
-    // --- DBSCAN parametreleri (dokumandaki epsilon ve MinPts) ---
-    pnh.param("eps", eps_, 0.5);
-    pnh.param("min_pts", min_pts_, 5);
-
-    // --- kume kabul filtreleri ---
-    pnh.param("min_cluster_size", min_cluster_size_, 10);
+    pnh.param<std::string>("map_topic", map_topic_, "/map_cloud");
+    pnh.param<std::string>("input_topic", input_topic_, "/cart/center_laser/scan");
+    pnh.param<std::string>("output_frame", output_frame_, "map");
+    pnh.param("novel_threshold", novel_threshold_, 0.30);
+    pnh.param("cluster_tolerance", cluster_tolerance_, 0.40);
+    pnh.param("min_cluster_size", min_cluster_size_, 8);
     pnh.param("max_cluster_size", max_cluster_size_, 25000);
-    pnh.param("max_extent_xy", max_extent_xy_, 15.0);
-    pnh.param("max_height", max_height_, 6.0);
+    pnh.param("max_extent_xy", max_extent_xy_, 5.0);
+    pnh.param("map_voxel_leaf", map_voxel_leaf_, 0.10);
+    pnh.param("input_voxel_leaf", input_voxel_leaf_, 0.15);
+    pnh.param("tf_timeout", tf_timeout_, 0.10);
+    pnh.param("min_range", min_range_, 2.5);
 
-    // OBB modeli: true -> Z dik, yaw PCA'dan; false -> tam 3B PCA
-    pnh.param("vertical_box", vertical_box_, true);
+    boxes_pub_    = nh.advertise<jsk_recognition_msgs::BoundingBoxArray>("/obstacles", 1);
+    poses_pub_    = nh.advertise<geometry_msgs::PoseArray>("/obstacles/poses", 1);
+    cloud_pub_    = nh.advertise<sensor_msgs::PointCloud2>("/obstacles/cloud", 1);
+    marker_pub_   = nh.advertise<visualization_msgs::MarkerArray>("/obstacles/markers", 1);
+    extremes_pub_ = nh.advertise<geometry_msgs::PoseArray>("/obstacles/x_extremes", 1);
 
-    // --- tracker (zamansal kararlilik) ---
-    pnh.param("track_enable", track_enable_, true);
-    pnh.param("assoc_dist", assoc_dist_, 1.5);   // esleme kapisi (m)
-    pnh.param("pos_alpha", pos_alpha_, 0.5);     // pozisyon EMA katsayisi
-    pnh.param("dim_alpha", dim_alpha_, 0.3);     // boyut EMA katsayisi
-    pnh.param("yaw_alpha", yaw_alpha_, 0.3);     // yonelim EMA katsayisi
-    pnh.param("min_hits", min_hits_, 2);         // onaylanma icin gereken toplam kare
-    pnh.param("max_misses", max_misses_, 5);     // kaybolunca canli tutma karesi
+    map_sub_   = nh.subscribe(map_topic_, 1, &ObstacleDetector::mapCallback, this);
+    input_sub_ = nh.subscribe(input_topic_, 5, &ObstacleDetector::inputCallback, this);
 
-    boxes_pub_   = nh.advertise<jsk_recognition_msgs::BoundingBoxArray>("/obstacles", 1);
-    poses_pub_   = nh.advertise<geometry_msgs::PoseArray>("/obstacles/poses", 1);
-    marker_pub_  = nh.advertise<visualization_msgs::MarkerArray>("/obstacles/markers", 1);
-    cluster_pub_ = nh.advertise<sensor_msgs::PointCloud2>("/obstacles/clusters", 1);
-
-    sub_ = nh.subscribe(input_topic_, 5, &ObstacleDetector::cloudCb, this);
-
-    ROS_INFO("obstacle_detector: input=%s eps=%.2f min_pts=%d vertical_box=%s track=%s",
-             input_topic_.c_str(), eps_, min_pts_,
-             vertical_box_ ? "true" : "false", track_enable_ ? "true" : "false");
+    ROS_INFO("obstacle_detector: waiting for map on %s and clouds on %s (min_range=%.2f)",
+             map_topic_.c_str(), input_topic_.c_str(), min_range_);
   }
 
 private:
-  // --- DBSCAN: etiketleri doldurur (>=0 kume id, NOISE gurultu) -------------
-  static constexpr int UNCLASSIFIED = -2;
-  static constexpr int NOISE        = -1;
-
-  int dbscan(const CloudT::Ptr& cloud, std::vector<int>& labels)
+  void mapCallback(const sensor_msgs::PointCloud2ConstPtr& msg)
   {
-    const int n = static_cast<int>(cloud->size());
-    labels.assign(n, UNCLASSIFIED);
+    std::lock_guard<std::mutex> lock(map_mutex_);
 
-    pcl::KdTreeFLANN<PointT> tree;
-    tree.setInputCloud(cloud);
-
-    std::vector<int>   idx;
-    std::vector<float> dist;
-    int cid = 0;
-
-    for (int i = 0; i < n; ++i)
-    {
-      if (labels[i] != UNCLASSIFIED) continue;
-
-      tree.radiusSearch(cloud->points[i], eps_, idx, dist);
-      if (static_cast<int>(idx.size()) < min_pts_)
-      {
-        labels[i] = NOISE;
-        continue;
-      }
-
-      labels[i] = cid;
-      std::vector<int> seeds(idx.begin(), idx.end());
-      for (size_t s = 0; s < seeds.size(); ++s)
-      {
-        const int q = seeds[s];
-        if (labels[q] == NOISE) labels[q] = cid;
-        if (labels[q] != UNCLASSIFIED) continue;
-        labels[q] = cid;
-
-        std::vector<int> idx2; std::vector<float> dist2;
-        tree.radiusSearch(cloud->points[q], eps_, idx2, dist2);
-        if (static_cast<int>(idx2.size()) >= min_pts_)
-          seeds.insert(seeds.end(), idx2.begin(), idx2.end());
-      }
-      ++cid;
-    }
-    return cid;
-  }
-
-  // --- PCA ile OBB: kume noktalarindan konum/boyut/yonelim ------------------
-  bool computeOBB(const CloudT::Ptr& c, Detection& det)
-  {
-    Eigen::Vector4f centroid4;
-    pcl::compute3DCentroid(*c, centroid4);
-    const Eigen::Vector3f centroid = centroid4.head<3>();
-
-    Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
-    double yaw = 0.0;
-
-    if (vertical_box_)
-    {
-      Eigen::Matrix2f cov2 = Eigen::Matrix2f::Zero();
-      for (const auto& p : c->points)
-      {
-        const float dx = p.x - centroid.x();
-        const float dy = p.y - centroid.y();
-        cov2(0, 0) += dx * dx; cov2(0, 1) += dx * dy;
-        cov2(1, 0) += dx * dy; cov2(1, 1) += dy * dy;
-      }
-      cov2 /= static_cast<float>(c->size());
-
-      Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> es(cov2);
-      const Eigen::Vector2f axis = es.eigenvectors().col(1);  // en buyuk ozdeger
-      yaw = std::atan2(axis.y(), axis.x());
-      const float cy = std::cos(yaw), sy = std::sin(yaw);
-      R << cy, -sy, 0.0f,
-           sy,  cy, 0.0f,
-           0.0f, 0.0f, 1.0f;
-    }
-    else
-    {
-      Eigen::Matrix3f cov;
-      pcl::computeCovarianceMatrixNormalized(*c, centroid4, cov);
-      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> es(cov);
-      R = es.eigenvectors();
-      R.col(2) = R.col(0).cross(R.col(1));
-    }
-
-    Eigen::Vector3f lo( std::numeric_limits<float>::max(),
-                        std::numeric_limits<float>::max(),
-                        std::numeric_limits<float>::max());
-    Eigen::Vector3f hi(-std::numeric_limits<float>::max(),
-                       -std::numeric_limits<float>::max(),
-                       -std::numeric_limits<float>::max());
-    const Eigen::Matrix3f Rt = R.transpose();
-    for (const auto& p : c->points)
-    {
-      const Eigen::Vector3f local = Rt * (Eigen::Vector3f(p.x, p.y, p.z) - centroid);
-      lo = lo.cwiseMin(local);
-      hi = hi.cwiseMax(local);
-    }
-
-    const Eigen::Vector3f dim        = hi - lo;
-    const Eigen::Vector3f local_cntr = 0.5f * (lo + hi);
-
-    if (dim.x() > max_extent_xy_ || dim.y() > max_extent_xy_ || dim.z() > max_height_)
-      return false;
-
-    det.pos  = centroid + R * local_cntr;
-    det.dim  = dim.cwiseMax(0.05f);
-    det.quat = Eigen::Quaternionf(R);
-    det.yaw  = yaw;
-    return true;
-  }
-
-  // --- tracker: olcumleri mevcut izlere esle, yumusat, histerezis -----------
-  void updateTracks(std::vector<Detection>& dets)
-  {
-    const int N = static_cast<int>(tracks_.size());
-    const int M = static_cast<int>(dets.size());
-
-    std::vector<char> det_used(M, 0);
-    std::vector<char> trk_matched(N, 0);
-
-    // tum gecerli (iz, olcum) ciftlerini mesafeye gore sirala -> kararli greedy
-    struct Pair { float d; int t; int m; };
-    std::vector<Pair> pairs;
-    for (int t = 0; t < N; ++t)
-      for (int m = 0; m < M; ++m)
-      {
-        const float dx = tracks_[t].pos.x() - dets[m].pos.x();
-        const float dy = tracks_[t].pos.y() - dets[m].pos.y();
-        const float d  = std::sqrt(dx * dx + dy * dy);
-        if (d <= assoc_dist_) pairs.push_back({d, t, m});
-      }
-    std::sort(pairs.begin(), pairs.end(),
-              [](const Pair& a, const Pair& b) { return a.d < b.d; });
-
-    for (const auto& p : pairs)
-    {
-      if (trk_matched[p.t] || det_used[p.m]) continue;
-      trk_matched[p.t] = 1;
-      det_used[p.m]    = 1;
-      updateMatched(tracks_[p.t], dets[p.m]);
-    }
-
-    // eslesmeyen izler: kacirildi (hits sifirLANMAZ; toplam birikim korunur ki
-    // arada bir kare cakilan gercek engel onayini kaybetmesin)
-    for (int t = 0; t < N; ++t)
-      if (!trk_matched[t])
-        ++tracks_[t].misses;
-
-    // eslesmeyen olcumler: yeni iz
-    for (int m = 0; m < M; ++m)
-      if (!det_used[m])
-      {
-        Track tr;
-        tr.id   = next_id_++;
-        tr.pos  = dets[m].pos;
-        tr.dim  = dets[m].dim;
-        tr.quat = dets[m].quat;
-        tr.yaw  = dets[m].yaw;
-        tr.npts = dets[m].npts;
-        tr.hits = 1;
-        tracks_.push_back(tr);
-      }
-
-    // bayatlamis izleri sil
-    tracks_.erase(std::remove_if(tracks_.begin(), tracks_.end(),
-                    [this](const Track& t) { return t.misses > max_misses_; }),
-                  tracks_.end());
-  }
-
-  void updateMatched(Track& tr, Detection& det)
-  {
-    tr.misses = 0;
-    ++tr.hits;
-    if (tr.hits >= min_hits_) tr.confirmed = true;
-
-    const float pa = static_cast<float>(pos_alpha_);
-    const float da = static_cast<float>(dim_alpha_);
-
-    // pozisyon EMA
-    tr.pos = (1.0f - pa) * tr.pos + pa * det.pos;
-
-    if (vertical_box_)
-    {
-      // yaw'i izin yaw'ina en yakin 90 derece esitine cek (eksen sicramasi onlenir);
-      // 90 derecelik kayma boyut x/y takasini gerektirir
-      double bestY = det.yaw;
-      bool   swap  = false;
-      double bestd = 1e9;
-      for (int k = -2; k <= 2; ++k)
-      {
-        const double y = det.yaw + k * M_PI / 2.0;
-        const double d = std::fabs(angDiff(y, tr.yaw));
-        if (d < bestd) { bestd = d; bestY = y; swap = (std::abs(k) % 2 == 1); }
-      }
-      if (swap) std::swap(det.dim.x(), det.dim.y());
-
-      tr.yaw  = tr.yaw + yaw_alpha_ * angDiff(bestY, tr.yaw);
-      tr.quat = yawQuat(tr.yaw);
-    }
-    else
-    {
-      tr.quat = tr.quat.slerp(static_cast<float>(yaw_alpha_), det.quat);
-    }
-
-    // boyut EMA
-    tr.dim  = (1.0f - da) * tr.dim + da * det.dim;
-    tr.npts = det.npts;
-  }
-
-  void cloudCb(const sensor_msgs::PointCloud2ConstPtr& msg)
-  {
-    CloudT::Ptr cloud(new CloudT());
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
     pcl::fromROSMsg(*msg, *cloud);
 
-    CloudT::Ptr clean(new CloudT());
-    clean->reserve(cloud->size());
-    for (const auto& p : cloud->points)
-      if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
-        clean->push_back(p);
-
-    const std_msgs::Header hdr = msg->header;
-
-    pcl::PointCloud<pcl::PointXYZRGB> colored;
-    std::vector<Detection> dets;
-
-    if (!clean->empty())
+    if (map_voxel_leaf_ > 0.0)
     {
-      std::vector<int> labels;
-      const int ncl = dbscan(clean, labels);
+      pcl::VoxelGrid<pcl::PointXYZ> vg;
+      vg.setInputCloud(cloud);
+      vg.setLeafSize(map_voxel_leaf_, map_voxel_leaf_, map_voxel_leaf_);
+      pcl::PointCloud<pcl::PointXYZ>::Ptr ds(new pcl::PointCloud<pcl::PointXYZ>());
+      vg.filter(*ds);
+      cloud = ds;
+    }
 
-      std::vector<std::vector<int>> groups(ncl);
-      for (int i = 0; i < static_cast<int>(labels.size()); ++i)
-        if (labels[i] >= 0) groups[labels[i]].push_back(i);
+    map_cloud_ = cloud;
+    map_kdtree_.reset(new pcl::KdTreeFLANN<pcl::PointXYZ>());
+    map_kdtree_->setInputCloud(map_cloud_);
+    map_frame_ = msg->header.frame_id;
+    map_ready_ = true;
 
-      int cidx = 0;
-      for (const auto& g : groups)
+    ROS_INFO("obstacle_detector: map ready (%zu points, frame=%s)",
+             map_cloud_->size(), map_frame_.c_str());
+  }
+
+  void inputCallback(const sensor_msgs::PointCloud2ConstPtr& msg)
+  {
+    if (!map_ready_) return;
+
+    // 1) radius filter in sensor frame (sensor origin = (0,0,0) in cloud frame)
+    pcl::PointCloud<pcl::PointXYZ>::Ptr filtered(new pcl::PointCloud<pcl::PointXYZ>());
+    {
+      pcl::PointCloud<pcl::PointXYZ>::Ptr raw(new pcl::PointCloud<pcl::PointXYZ>());
+      pcl::fromROSMsg(*msg, *raw);
+      const double r2 = min_range_ * min_range_;
+      filtered->reserve(raw->size());
+      for (const auto& p : raw->points)
       {
-        const int sz = static_cast<int>(g.size());
-        if (sz < min_cluster_size_ || sz > max_cluster_size_) continue;
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+        if (p.x * p.x + p.y * p.y + p.z * p.z < r2) continue;
+        filtered->push_back(p);
+      }
+    }
+    if (filtered->empty()) return;
 
-        CloudT::Ptr c(new CloudT());
-        c->reserve(sz);
-        for (int i : g) c->push_back(clean->points[i]);
+    sensor_msgs::PointCloud2 filtered_msg;
+    pcl::toROSMsg(*filtered, filtered_msg);
+    filtered_msg.header = msg->header;
 
-        Detection det;
-        if (!computeOBB(c, det)) continue;
-        det.npts = sz;
-        dets.push_back(det);
-
-        const float r  = (cidx * 73  % 255) / 255.0f;
-        const float gg = (cidx * 151 % 255) / 255.0f;
-        const float b  = (cidx * 223 % 255) / 255.0f;
-        for (const auto& p : c->points)
-        {
-          pcl::PointXYZRGB cp;
-          cp.x = p.x; cp.y = p.y; cp.z = p.z;
-          cp.r = static_cast<uint8_t>(r * 255);
-          cp.g = static_cast<uint8_t>(gg * 255);
-          cp.b = static_cast<uint8_t>(b * 255);
-          colored.push_back(cp);
-        }
-        ++cidx;
+    // 2) transform to output frame
+    sensor_msgs::PointCloud2 cloud_out;
+    try
+    {
+      auto tf = tf_buffer_.lookupTransform(output_frame_, msg->header.frame_id,
+                                           msg->header.stamp, ros::Duration(tf_timeout_));
+      tf2::doTransform(filtered_msg, cloud_out, tf);
+    }
+    catch (tf2::TransformException&)
+    {
+      try
+      {
+        auto tf = tf_buffer_.lookupTransform(output_frame_, msg->header.frame_id,
+                                             ros::Time(0), ros::Duration(tf_timeout_));
+        tf2::doTransform(filtered_msg, cloud_out, tf);
+      }
+      catch (tf2::TransformException& e2)
+      {
+        ROS_WARN_THROTTLE(2.0, "obstacle_detector: TF lookup failed: %s", e2.what());
+        return;
       }
     }
 
-    // ---- takip ----
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl::fromROSMsg(cloud_out, *cloud);
+
+    if (input_voxel_leaf_ > 0.0)
+    {
+      pcl::VoxelGrid<pcl::PointXYZ> vg;
+      vg.setInputCloud(cloud);
+      vg.setLeafSize(input_voxel_leaf_, input_voxel_leaf_, input_voxel_leaf_);
+      pcl::PointCloud<pcl::PointXYZ>::Ptr ds(new pcl::PointCloud<pcl::PointXYZ>());
+      vg.filter(*ds);
+      cloud = ds;
+    }
+
+    // 3) KD-tree diff against map
+    pcl::PointCloud<pcl::PointXYZ>::Ptr novel(new pcl::PointCloud<pcl::PointXYZ>());
+    novel->reserve(cloud->size());
+    const double thr_sq = novel_threshold_ * novel_threshold_;
+    std::vector<int> idx(1);
+    std::vector<float> dist_sq(1);
+    {
+      std::lock_guard<std::mutex> lock(map_mutex_);
+      for (const auto& p : cloud->points)
+      {
+        if (map_kdtree_->nearestKSearch(p, 1, idx, dist_sq) > 0)
+        {
+          if (dist_sq[0] > thr_sq) novel->push_back(p);
+        }
+        else
+        {
+          novel->push_back(p);
+        }
+      }
+    }
+
+    sensor_msgs::PointCloud2 diff_msg;
+    pcl::toROSMsg(*novel, diff_msg);
+    diff_msg.header.frame_id = output_frame_;
+    diff_msg.header.stamp = msg->header.stamp;
+    cloud_pub_.publish(diff_msg);
+
+    if (novel->empty()) return;
+
+    // 4) Euclidean clustering on novel cloud
+    pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>());
+    tree->setInputCloud(novel);
+
+    std::vector<pcl::PointIndices> cluster_indices;
+    pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+    ec.setClusterTolerance(cluster_tolerance_);
+    ec.setMinClusterSize(min_cluster_size_);
+    ec.setMaxClusterSize(max_cluster_size_);
+    ec.setSearchMethod(tree);
+    ec.setInputCloud(novel);
+    ec.extract(cluster_indices);
+
     jsk_recognition_msgs::BoundingBoxArray boxes;
     geometry_msgs::PoseArray poses;
+    geometry_msgs::PoseArray extremes;
     visualization_msgs::MarkerArray markers;
-    boxes.header = hdr;
-    poses.header = hdr;
 
-    auto fillOutputs = [&](int id, const Eigen::Vector3f& pos,
-                           const Eigen::Vector3f& dim,
-                           const Eigen::Quaternionf& q, int npts)
+    boxes.header.frame_id = output_frame_;
+    boxes.header.stamp = msg->header.stamp;
+    poses.header   = boxes.header;
+    extremes.header = boxes.header;
+
+    int label = 0;
+    for (const auto& ci : cluster_indices)
     {
+      // gather cluster XYZ
+      const size_t N = ci.indices.size();
+      Eigen::MatrixXd P(N, 3);
+      for (size_t i = 0; i < N; ++i)
+      {
+        const auto& p = novel->points[ci.indices[i]];
+        P(i, 0) = p.x; P(i, 1) = p.y; P(i, 2) = p.z;
+      }
+
+      // hybrid OBB: PCA on XY (yaw-only), Z world-aligned
+      const double cx = P.col(0).mean();
+      const double cy = P.col(1).mean();
+      Eigen::MatrixXd C(N, 2);
+      C.col(0) = P.col(0).array() - cx;
+      C.col(1) = P.col(1).array() - cy;
+
+      Eigen::Matrix2d cov = (C.transpose() * C) / static_cast<double>(N);
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> es(cov);
+      Eigen::Vector2d ev = es.eigenvectors().col(1);          // largest-eigenvalue axis
+      double yaw = std::atan2(ev.y(), ev.x());
+
+      const double c = std::cos(yaw), s = std::sin(yaw);
+      // local x = (dx*c + dy*s); local y = (-dx*s + dy*c)
+      Eigen::VectorXd lx = C.col(0) * c + C.col(1) * s;
+      Eigen::VectorXd ly = -C.col(0) * s + C.col(1) * c;
+
+      double lx_min, lx_max, ly_min, ly_max;
+      Eigen::Index lx_min_i, lx_max_i;
+      lx_min = lx.minCoeff(&lx_min_i);
+      lx_max = lx.maxCoeff(&lx_max_i);
+      ly_min = ly.minCoeff();
+      ly_max = ly.maxCoeff();
+      const double z_min = P.col(2).minCoeff();
+      const double z_max = P.col(2).maxCoeff();
+
+      const double dim_x = lx_max - lx_min;
+      const double dim_y = ly_max - ly_min;
+      const double dim_z = z_max - z_min;
+      if (dim_x > max_extent_xy_ || dim_y > max_extent_xy_) continue;
+
+      // OBB center: midpoint of local extents transformed back to world
+      const double mid_lx = 0.5 * (lx_max + lx_min);
+      const double mid_ly = 0.5 * (ly_max + ly_min);
+      const double box_cx = cx + mid_lx * c - mid_ly * s;
+      const double box_cy = cy + mid_lx * s + mid_ly * c;
+      const double box_cz = 0.5 * (z_min + z_max);
+
+      tf2::Quaternion q;
+      q.setRPY(0, 0, yaw);
+
       jsk_recognition_msgs::BoundingBox box;
-      box.header = hdr;
-      box.pose.position.x = pos.x();
-      box.pose.position.y = pos.y();
-      box.pose.position.z = pos.z();
+      box.header = boxes.header;
+      box.pose.position.x = box_cx;
+      box.pose.position.y = box_cy;
+      box.pose.position.z = box_cz;
       box.pose.orientation.x = q.x();
       box.pose.orientation.y = q.y();
       box.pose.orientation.z = q.z();
       box.pose.orientation.w = q.w();
-      box.dimensions.x = std::max(dim.x(), 0.05f);
-      box.dimensions.y = std::max(dim.y(), 0.05f);
-      box.dimensions.z = std::max(dim.z(), 0.05f);
-      box.label = id;
-      box.value = static_cast<float>(npts);
+      box.dimensions.x = std::max(dim_x, 0.05);
+      box.dimensions.y = std::max(dim_y, 0.05);
+      box.dimensions.z = std::max(dim_z, 0.05);
+      box.label = label;
+      box.value = static_cast<float>(N);
       boxes.boxes.push_back(box);
 
-      poses.poses.push_back(box.pose);
+      geometry_msgs::Pose pose;
+      pose.position = box.pose.position;
+      pose.orientation.w = 1.0;
+      poses.poses.push_back(pose);
 
-      visualization_msgs::Marker mk;
-      mk.header = hdr;
-      mk.ns = "obstacle_ids";
-      mk.id = id;
-      mk.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-      mk.action = visualization_msgs::Marker::ADD;
-      mk.pose = box.pose;
-      mk.pose.position.z += 0.5 * box.dimensions.z + 0.3;
-      mk.scale.z = 0.5;
-      mk.color.r = 1.0; mk.color.g = 1.0; mk.color.b = 0.0; mk.color.a = 1.0;
-      mk.lifetime = ros::Duration(0.3);
-      mk.text = "obs " + std::to_string(id) + " (" + std::to_string(npts) + ")";
-      markers.markers.push_back(mk);
-    };
+      // extreme points along local x (long axis of the OBB), in world frame
+      geometry_msgs::Pose ext_lo, ext_hi;
+      ext_lo.position.x = P(lx_min_i, 0);
+      ext_lo.position.y = P(lx_min_i, 1);
+      ext_lo.position.z = P(lx_min_i, 2);
+      ext_lo.orientation.w = 1.0;
+      ext_hi.position.x = P(lx_max_i, 0);
+      ext_hi.position.y = P(lx_max_i, 1);
+      ext_hi.position.z = P(lx_max_i, 2);
+      ext_hi.orientation.w = 1.0;
+      extremes.poses.push_back(ext_lo);
+      extremes.poses.push_back(ext_hi);
 
-    int published = 0;
-    if (track_enable_)
-    {
-      updateTracks(dets);
-      for (const auto& tr : tracks_)
-      {
-        // Gosterme kurali:
-        //  - bu karede tespit edildiyse (misses==0) DAIMA goster
-        //    -> hicbir gercek engel kaybolmaz (tum kutular gelir)
-        //  - bu karede kaybolduysa yalniz ONAYLI iz gosterilir (grace icinde)
-        //    -> kurulu engelin kisa kopmalari koprulenir, 1 karelik gurultu gosterilmez
-        const bool detected_now = (tr.misses == 0);
-        if (!detected_now && !tr.confirmed) continue;
-        fillOutputs(tr.id, tr.pos, tr.dim, tr.quat, tr.npts);
-        ++published;
-      }
-    }
-    else
-    {
-      int id = 0;
-      for (const auto& d : dets)
-      {
-        fillOutputs(id++, d.pos, d.dim, d.quat, d.npts);
-        ++published;
-      }
+      visualization_msgs::Marker txt;
+      txt.header = boxes.header;
+      txt.ns = "obstacle_ids";
+      txt.id = label;
+      txt.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+      txt.action = visualization_msgs::Marker::ADD;
+      txt.pose = box.pose;
+      txt.pose.position.z += 0.5 * box.dimensions.z + 0.3;
+      txt.scale.z = 0.6;
+      txt.color.r = 1.0; txt.color.g = 1.0; txt.color.b = 0.0; txt.color.a = 1.0;
+      txt.lifetime = ros::Duration(0.3);
+      txt.text = "obs " + std::to_string(label) + " (" + std::to_string(N) + ")";
+      markers.markers.push_back(txt);
+
+      // line marker for the OBB long-axis extremes
+      visualization_msgs::Marker line;
+      line.header = boxes.header;
+      line.ns = "obstacle_extremes";
+      line.id = label;
+      line.type = visualization_msgs::Marker::LINE_LIST;
+      line.action = visualization_msgs::Marker::ADD;
+      line.scale.x = 0.08;
+      line.color.r = 0.0; line.color.g = 1.0; line.color.b = 1.0; line.color.a = 1.0;
+      line.lifetime = ros::Duration(0.3);
+      line.points.push_back(ext_lo.position);
+      line.points.push_back(ext_hi.position);
+      markers.markers.push_back(line);
+
+      ++label;
     }
 
     boxes_pub_.publish(boxes);
     poses_pub_.publish(poses);
+    extremes_pub_.publish(extremes);
     marker_pub_.publish(markers);
-
-    sensor_msgs::PointCloud2 cmsg;
-    pcl::toROSMsg(colored, cmsg);
-    cmsg.header = hdr;
-    cluster_pub_.publish(cmsg);
-
-    ROS_INFO_THROTTLE(2.0,
-        "obstacle_detector: %d nokta -> %zu olcum -> %d kararli engel (iz=%zu)",
-        static_cast<int>(clean->size()), dets.size(), published, tracks_.size());
   }
 
   // params
-  std::string input_topic_;
-  double eps_, max_extent_xy_, max_height_;
-  int    min_pts_, min_cluster_size_, max_cluster_size_;
-  bool   vertical_box_;
+  std::string map_topic_, input_topic_, output_frame_;
+  double novel_threshold_, cluster_tolerance_, max_extent_xy_;
+  double map_voxel_leaf_, input_voxel_leaf_, tf_timeout_, min_range_;
+  int min_cluster_size_, max_cluster_size_;
 
-  // tracker params
-  bool   track_enable_;
-  double assoc_dist_, pos_alpha_, dim_alpha_, yaw_alpha_;
-  int    min_hits_, max_misses_;
-
-  // tracker state
-  std::vector<Track> tracks_;
-  int next_id_ = 0;
+  // state
+  std::mutex map_mutex_;
+  bool map_ready_ = false;
+  std::string map_frame_;
+  pcl::PointCloud<pcl::PointXYZ>::Ptr map_cloud_;
+  std::shared_ptr<pcl::KdTreeFLANN<pcl::PointXYZ>> map_kdtree_;
 
   // ros
-  ros::Subscriber sub_;
-  ros::Publisher  boxes_pub_, poses_pub_, marker_pub_, cluster_pub_;
+  ros::Subscriber map_sub_, input_sub_;
+  ros::Publisher boxes_pub_, poses_pub_, cloud_pub_, marker_pub_, extremes_pub_;
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
 };
 
 int main(int argc, char** argv)

@@ -1,28 +1,14 @@
-# talos_obstacle_detector - DBSCAN + PCA OBB parametreleri
-# Girdi: /cart/points_noground (Patchwork++ zemin ayiklamasi ciktisi)
+map_topic: /map_cloud
+input_topic: /cart/center_laser/scan
+output_frame: map
 
-input_topic: "/cart/points_noground"
-
-# --- DBSCAN ---
-eps: 0.5            # arama yaricapi epsilon (m). Buyutursen ayri engeller birlesir.
-min_pts: 5          # cekirdek nokta esigi (MinPts). Buyutursen gurultu daha cok elenir.
-
-# --- kume kabul filtreleri ---
-min_cluster_size: 10     # bu sayidan az noktali kumeler atilir
+novel_threshold: 0.30
+cluster_tolerance: 0.40
+min_cluster_size: 8
 max_cluster_size: 25000
-max_extent_xy: 15.0      # XY'de bu boyutu asan kutular elenir (duvar/bariyer eler)
-max_height: 6.0          # Z'de bu yuksekligi asan kutular elenir
+max_extent_xy: 5.0
 
-# --- OBB modeli ---
-# true  -> Z dik tutulur, yaw PCA'dan (zemin engelleri icin onerilen, en kararli)
-# false -> tam 3B PCA (dokumandaki ham hali; kutular egilebilir)
-vertical_box: true
-
-# --- tracker (zamansal kararlilik: kutularin "git gel" yapmasini engeller) ---
-track_enable: true     # false -> ham kare-kare tespit (yumusatma yok)
-assoc_dist: 1.5        # ardisik karelerde ayni engel say. icin maks merkez mesafesi (m)
-pos_alpha: 0.5         # pozisyon yumusatma (0=donuk/cok kararli, 1=ham/tepkili)
-dim_alpha: 0.3         # boyut yumusatma
-yaw_alpha: 0.3         # yonelim yumusatma (eksen sicramasi bu sayede sonumlenir)
-min_hits: 2            # bir engel gosterilmeden once gereken toplam kare (yanip sonmeyi keser)
-max_misses: 5          # engel kaybolunca kac kare daha canli tutulsun (kisa kopmalari koprular)
+map_voxel_leaf: 0.10
+input_voxel_leaf: 0.15
+tf_timeout: 0.10
+min_range: 2.5

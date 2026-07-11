@@ -3,10 +3,8 @@
   <name>talos_obstacle_detector</name>
   <version>0.1.0</version>
   <description>
-    DBSCAN tabanli kumeleme ve PCA tabanli OBB (Oriented Bounding Box) cikarimi
-    ile zemin-ayiklanmis LiDAR nokta bulutundan (/cart/points_noground) engel
-    tespiti. jsk_recognition_msgs/BoundingBoxArray, PoseArray ve renkli kume
-    bulutu yayinlar.
+    Obstacle detection by comparing live 3D LiDAR against a pre-built static
+    PCD map. Publishes BoundingBoxArray, PoseArray and a diff PointCloud2.
   </description>
 
   <maintainer email="keremenon@gmail.com">Kerem</maintainer>
@@ -20,5 +18,7 @@
   <depend>visualization_msgs</depend>
   <depend>pcl_ros</depend>
   <depend>pcl_conversions</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2_sensor_msgs</depend>
   <depend>jsk_recognition_msgs</depend>
 </package>
