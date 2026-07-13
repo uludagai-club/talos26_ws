@@ -62,7 +62,9 @@ class RosBridge:
 
         # --- Subscribers (yalnız okuma) ---
         rospy.Subscriber("/trafik_levha", String, self._on_levha, queue_size=10)
-        rospy.Subscriber("/yaya_gecidi",   String, self._on_yaya,   queue_size=10)
+        # Adanmis 2-sinifli yaya gecidi modeli (yaya_gecidi_node). Bare /yaya_gecidi
+        # levha modelinin 26-sinif icindeki zayif yaya tespiti; adanmis model esas alinir.
+        rospy.Subscriber("/yaya_gecidi/model", String, self._on_yaya, queue_size=10)
 
         # YENI engel arayüzü: talos_obstacle_detector → /obstacles/poses (PoseArray)
         if self._obs_source in ("auto", "poses"):
