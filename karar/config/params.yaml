@@ -102,6 +102,27 @@ reroute:
   refresh_s:           1.0    # aktif kenar_blok'u bu periyotla tazele (geç abone yakalasın)
   release_clear_ticks: 5      # cone N tick (~0.5s @10Hz) bloklamıyorsa → kenar_serbest
 
+# ---------------------------------------------------------------------------
+# LEVHA YÖN-KISITI — dönülmez/mecburi/giriş-yok levhaları → /hedef_komut kenar_blok
+# ---------------------------------------------------------------------------
+# "Sola dönülmez" gibi levhalar karar çıkışı değil ROTA kısıtıdır: levha_kisit.py
+# levhayı dünya-frame'de çapalar ve kavşağın YASAK koluna kenar_blok bırakır
+# (hedef'te SOFT toplamsal ceza) → D* öbür kolu seçer. Kavşak geçilince serbest.
+# Tablo (levha_kisit.YASAK_YERLESIM): SOLA_DONULMEZ→sol · SAGA_DONULMEZ→sag ·
+# ILERI_MECBURI_YON→sol+sag · GIRISI_OLMAYAN_YOL→ileri. Levha adları algi/levha
+# passthrough'unun ham YOLO sınıf adlarıdır (SINIF_ESLESTIRME dışı kalanlar).
+levha_kisit:
+  enabled:         true
+  etki_m:          15.0   # levha bu ileri mesafeden yakınsa çapalanır
+  min_hits:        3      # üst üste bu kadar tick görülmeden kısıt açılmaz (misdetect freni)
+  hit_gap_s:       0.5    # hit sayacı bu süreden uzun kesintide sıfırlanır
+  ileri_ofset_m:   4.0    # levha çapası → kavşak merkezi (levha kavşaktan önce dikilir)
+  yan_ofset_m:     5.0    # kavşak merkezi → yasak kol girişi (yanal)
+  block_radius_m:  2.5    # blok yarıçapı; yan_ofset - r düz şeridi sıyırmamalı (2.5m marj)
+  refresh_s:       1.0    # aktif blokları tazeleme periyodu (hedef BLOK_TTL_S=3s beslenir)
+  pass_behind_m:   8.0    # çapa bu kadar geride kalınca kısıt biter (> ileri_ofset_m TUT)
+  max_s:           45.0   # mutlak tavan — kırmızıda beklerken düşmesin diye uzun
+
 # Ackermann araç geometrisi (control.py ile EŞİT TUTULMALI)
 ackermann:
   wheelbase_m:   1.86      # = control.py WHEELBASE

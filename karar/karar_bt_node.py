@@ -25,6 +25,7 @@ from bb import Blackboard
 from ros_bridge import RosBridge
 from trees.main_tree import build_root
 from reroute import RerouteManager, RerouteParams
+from levha_kisit import LevhaKisitManager, LevhaKisitParams
 
 # talos_common bind-mount: /app/talos_common
 try:
@@ -94,6 +95,12 @@ def main():
     rm = RerouteManager(RerouteParams.from_cfg(
         p.get("reroute", {}), p.get("overtake", {})))
 
+    # Levha yön-kısıtı yöneticisi: dönülmez/mecburi/giriş-yok levhalarını
+    # kavşağın yasak koluna kenar_blok bırakarak rota kısıtına çevirir
+    # (yeni hedef komutu yok; cone reroute ile aynı kanal, tick'te tek komut).
+    lkm = LevhaKisitManager(LevhaKisitParams.from_cfg(
+        p.get("levha_kisit", {}), p.get("freshness", {})))
+
     rate = rospy.Rate(tick_hz)
     last_logged_karar = None
     tick_count = 0
@@ -123,6 +130,7 @@ def main():
         o = bb.obs
         now = time.time()
         dkarar = bb.last_decision.get("karar", "normal")
+        hedef_komut_dolu = False   # bu tick /hedef_komut'a komut yayınlandı mı
         try:
             rres = rm.update(
                 reroute_request=bb.state.reroute_request,
@@ -133,6 +141,7 @@ def main():
             bb.state.overtake_active = rres.active        # snapshot/log aynası
             if rres.command:
                 bridge.publish_hedef_komut(rres.command)
+                hedef_komut_dolu = True
             if rres.event is not None:
                 faz, ev = rres.event
                 if klog is not None:
@@ -145,6 +154,31 @@ def main():
             # set etmediği tick'te (cone block bandından çıktı) burada düşer →
             # RerouteManager debounce ile kenar_serbest verir.
             bb.state.reroute_request = False
+
+        # 2.6) Levha yön-kısıtı → /hedef_komut: dönülmez/mecburi/giriş-yok
+        # levhası görülünce kavşağın yasak koluna kenar_blok (soft ceza) bırak;
+        # kavşak geçilince kenar_serbest. Cone komutu yayınlanan tick'te susar.
+        try:
+            px, py, pyaw, podom_t = bb.read_pose()
+            lres = lkm.update(
+                levha_isim=o.levha_isim,
+                levha_ileri_m=o.levha_x,
+                levha_age_s=(now - o.levha_last_seen) if o.levha_last_seen else 1e9,
+                pose=(px, py, pyaw),
+                odom_age_s=(now - podom_t) if podom_t else 1e9,
+                decision_karar=dkarar,
+                channel_busy=hedef_komut_dolu,
+                now=now,
+            )
+            if lres.command:
+                bridge.publish_hedef_komut(lres.command)
+            if lres.event is not None:
+                faz, ev = lres.event
+                if klog is not None:
+                    klog.log_event(f"levha_kisit_{faz}", **ev)
+                rospy.loginfo(f"[karar_bt] levha_kisit_{faz}: {ev}")
+        except Exception as e:
+            rospy.logerr_throttle(2.0, f"[karar_bt] levha_kisit hata: {e}")
 
         # 3) Snapshot (rate-limited)
         if p.get("debug", {}).get("publish_snapshot", True):
