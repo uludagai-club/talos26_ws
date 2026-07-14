@@ -120,3 +120,94 @@ def fuse_obstacles(points: Iterable[Sequence[float]],
         angle_deg=nearest_angle if math.isfinite(nearest_d) else 0.0,
         count=count,
     )
+
+
+# ============================================================
+# Ackermann yay-kapısı (2026-07-15) — acil bandı için
+# ------------------------------------------------------------
+# Canlı bulgu (run 20260713T173335Z): 41° sağ-yanda 1.12 m'deki bordür/koni,
+# araç SOLA dönerken bile düz-koridor d_center eşiğini kırıp acildurus'u
+# 2 dakika kilitledi. Bisiklet modeline göre süpürme bandı o nesneyi
+# temizliyordu. d_center dur/reroute/yavasla bantları için doğru (planlama
+# erken görmeli); ACİL bandı ise "mevcut direksiyonla GERÇEKTEN çarpacak mı"
+# sorusudur → aşağıdaki kapı yalnız acil tetik/release'te kullanılır.
+# Matematik control.py ackermann_path_clears ile bire bir aynıdır
+# (2026-07-04 /incele CONFIRMED); iki taraf senkron tutulmalı.
+# ============================================================
+
+@dataclass
+class ArcGateParams:
+    enabled: bool = True
+    wheelbase_m: float = 1.86       # Bee1/golf.urdf dingil (2026-07-04 hizalaması)
+    half_width_m: float = 0.75      # araç yarı gen. 0.6 + koni payı 0.15 (= control ESTOP_BANT_YARIM_M)
+    sensor_to_ra_m: float = 1.76    # lidar → arka aks (= control LIDAR_ARKA_AKS_M)
+    nose_m: float = 2.34            # arka aks → ön tampon (golf.urdf ölçümü: 1.477+0.862)
+    steer_full_deg: float = 28.95   # steer=1'in bisiklet açısı (urdf max_steer 0.5053 rad)
+    steer_max_age_s: float = 0.5    # direksiyon verisi bundan eskiyse kapı DEVRE DIŞI (fail-safe)
+
+    @classmethod
+    def from_cfg(cls, cfg: dict) -> "ArcGateParams":
+        cfg = cfg or {}
+        return cls(
+            enabled=bool(cfg.get("enabled", True)),
+            wheelbase_m=float(cfg.get("wheelbase_m", 1.86)),
+            half_width_m=float(cfg.get("half_width_m", 0.75)),
+            sensor_to_ra_m=float(cfg.get("sensor_to_ra_m", 1.76)),
+            nose_m=float(cfg.get("nose_m", 2.34)),
+            steer_full_deg=float(cfg.get("steer_full_deg", 28.95)),
+            steer_max_age_s=float(cfg.get("steer_max_age_s", 0.5)),
+        )
+
+
+def ackermann_path_clears(fwd: float, lat: float, steer_deg: float,
+                          gp: ArcGateParams) -> bool:
+    """Araç MEVCUT direksiyonla giderken 2B süpürme bandı (fwd, lat)'ı
+    içine alıyor mu? True = geçer (çarpmaz), False = bant içinde.
+
+    (fwd, lat) SENSÖR (lidar) çerçevesindedir; bisiklet modeli arka aks
+    referanslı → ICR sensörün sensor_to_ra_m arkasında. Düz gidişte yanal
+    ayrım yeterli; dönüşte gövdenin süpürdüğü halka (iç kenar R−w, dış kenar
+    hypot(R+w, burun)) ile engelin ICR uzaklığı karşılaştırılır.
+    Kaynak: control.py ackermann_path_clears (aynı formüller)."""
+    delta = math.radians(steer_deg)
+    if abs(delta) < math.radians(1.0):
+        return abs(lat) >= gp.half_width_m
+    R = gp.wheelbase_m / math.tan(abs(delta))
+    cy = R if delta > 0.0 else -R              # + sol dönüş → ICR +y
+    d_c = math.hypot(fwd + gp.sensor_to_ra_m, lat - cy)
+    r_ic = R - gp.half_width_m
+    r_dis = math.hypot(R + gp.half_width_m, gp.nose_m)
+    return d_c <= r_ic or d_c >= r_dis
+
+
+def arc_blocking_distance(points: Iterable[Sequence[float]],
+                          steer_deg: float,
+                          p: ObstacleFusionParams,
+                          gp: ArcGateParams) -> float:
+    """Mevcut direksiyonun süpürme bandı İÇİNDE kalan en yakın engelin
+    menzili (hypot; d_center ile aynı metrik). Bant hepsini temizliyorsa inf.
+
+    Yalnız önümüzdeki (forward_min < fwd ≤ forward_max) noktalar denetlenir.
+    Geri viteste anlamı yoktur (ileri bant varsayılır) — bugünkü d_center
+    davranışından daha gevşek değildir. Engelin yarı genişliği (hw) banda
+    eklenir: kenarı banda değen engel de bloklayıcı sayılır."""
+    best = _INF
+    for pt in points:
+        fwd = float(pt[0])
+        lat = float(pt[1])
+        hw = float(pt[2]) if len(pt) > 2 else 0.0
+        if fwd <= p.forward_min_m or fwd > p.forward_max_m:
+            continue
+        eff = ArcGateParams(
+            enabled=gp.enabled, wheelbase_m=gp.wheelbase_m,
+            half_width_m=gp.half_width_m + hw,
+            sensor_to_ra_m=gp.sensor_to_ra_m, nose_m=gp.nose_m,
+            steer_full_deg=gp.steer_full_deg,
+            steer_max_age_s=gp.steer_max_age_s,
+        ) if hw > 0.0 else gp
+        if ackermann_path_clears(fwd, lat, steer_deg, eff):
+            continue
+        rng = math.hypot(fwd, lat)
+        if rng < best:
+            best = rng
+    return best

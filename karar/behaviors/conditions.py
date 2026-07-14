@@ -154,15 +154,21 @@ class EngelVar(_Cond):
 
 
 class EngelCokYakin(_Cond):
-    """Merkez sektörde çok yakın engel — acil durus."""
+    """Mevcut direksiyonun süpürme bandı İÇİNDE çok yakın engel — acil durus.
+
+    2026-07-15: d_center yerine engel_d_arc okur (yay-kapısı). Bisiklet
+    modeline göre yayın DIŞINDA kalan yan nesne (örn. 41°'de bordür, canlı
+    173335) artık acildurus tetiklemez; dur/reroute/yavasla bantları
+    d_center ile aynen sürer. Direksiyon verisi yoksa ros_bridge d_arc'a
+    d_center yazar → davranış eskisiyle aynı (fail-safe)."""
     def __init__(self, bb, esik_m):
         super().__init__(f"EngelCokYakin(<{esik_m}m)?", bb)
         self.esik_m = esik_m
 
     def update(self):
-        d = self.bb.obs.engel_d_center
+        d = self.bb.obs.engel_d_arc
         if d is None or not math.isfinite(d):
-            return Status.FAILURE
+            return Status.FAILURE   # inf = bant temiz (veya veri yok) → acil değil
         return Status.SUCCESS if d < self.esik_m else Status.FAILURE
 
 

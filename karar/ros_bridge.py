@@ -17,7 +17,8 @@ from geometry_msgs.msg import PoseArray
 from tf.transformations import euler_from_quaternion
 
 from bb import Blackboard
-from obstacle_fusion import ObstacleFusionParams, fuse_obstacles
+from obstacle_fusion import (ObstacleFusionParams, fuse_obstacles,
+                             ArcGateParams, arc_blocking_distance)
 from obstacle_memory import ObstacleMemory, MemParams
 
 try:
@@ -26,6 +27,13 @@ try:
 except Exception:
     DecisionMsg = None
     _HAS_DECISION = False
+
+try:
+    from cart_sim.msg import cart_control as CartControlMsg
+    _HAS_CART_CONTROL = True
+except Exception:
+    CartControlMsg = None
+    _HAS_CART_CONTROL = False
 
 
 # Pose pozisyonundan eksen seçici (axis_forward/axis_left config'i için)
@@ -48,6 +56,19 @@ class RosBridge:
         self._inv_fwd = -1.0 if bool(oc.get("invert_forward", False)) else 1.0
         self._inv_left = -1.0 if bool(oc.get("invert_left", False)) else 1.0
         self._new_obs_last = 0.0   # /obstacles/poses son geliş zamanı (failover için)
+
+        # --- Yay-kapısı (2026-07-15): acil bandı bisiklet-modeli farkındalı ---
+        # Mevcut direksiyonun süpürme bandı DIŞINDA kalan nesne acildurus
+        # tetiklemez (canlı bulgu 173335: 41° yan bordür 2 dk kilitledi).
+        # Direksiyon kaynağı: /cart (cart_control.steer ∈ [-1,1], + sol) ×
+        # steer_full_deg. Veri yok/bayat → d_arc=d_center (bugünkü davranış).
+        ag = oc.get("arc_gate", {}) or {}
+        self._arc_gp = ArcGateParams.from_cfg(ag)
+        self._arc_steer_topic = str(ag.get("steer_topic", "/cart"))
+        self._arc_enabled = self._arc_gp.enabled and _HAS_CART_CONTROL
+        if self._arc_gp.enabled and not _HAS_CART_CONTROL:
+            rospy.logwarn("[karar_bt] yay-kapısı: cart_sim.msg.cart_control "
+                          "import edilemedi — acil bandı d_center'a düşüyor.")
 
         # --- Duba DÜNYA-konum hafızası (dropout köprüsü) ---
         # Detektör kareyi düşürünce konfirme dubayı gövde-frame'e geri-projekte edip
@@ -79,6 +100,13 @@ class RosBridge:
             rospy.Subscriber("/engel_angle",      Float32, self._on_engel_angle,  queue_size=10)
             rospy.Subscriber("/engel_sol_mesafe", Float32, self._on_engel_sol,    queue_size=10)
             rospy.Subscriber("/engel_sag_mesafe", Float32, self._on_engel_sag,    queue_size=10)
+
+        # Yay-kapısı direksiyon kaynağı: control'ün gönderdiği komut açısı
+        # (can-bridge → /cart). Komut açısı control'ün kendi e-stop'uyla da
+        # aynı referanstır (_prev_cmd_steer) → iki katman tutarlı karar verir.
+        if self._arc_enabled:
+            rospy.Subscriber(self._arc_steer_topic, CartControlMsg,
+                             self._on_cart_steer, queue_size=1)
 
         rospy.Subscriber("/line",        Float32, self._on_line,   queue_size=10)
         rospy.Subscriber("/lane_offset", Float32, self._on_offset, queue_size=10)
@@ -185,9 +213,26 @@ class RosBridge:
                     rospy.logwarn_throttle(2.0, f"[karar_bt] obstacle_memory hata: {e}")
 
         fused = fuse_obstacles(points, self._fusion_p)
+
+        # Yay-kapısı: taze direksiyon varsa acil bandı için bant-içi en yakın
+        # engel; yoksa d_center (fail-safe = eski düz-koridor davranışı).
+        d_arc = fused.d_center
+        if self._arc_enabled:
+            o = self.bb.obs
+            steer_fresh = (o.steer_last_seen > 0.0 and
+                           (now - o.steer_last_seen) <= self._arc_gp.steer_max_age_s)
+            if steer_fresh:
+                try:
+                    d_arc = arc_blocking_distance(points, o.steer_deg,
+                                                  self._fusion_p, self._arc_gp)
+                except Exception as e:
+                    rospy.logwarn_throttle(2.0, f"[karar_bt] yay-kapısı hata: {e}")
+                    d_arc = fused.d_center
+
         self._new_obs_last = now
         self.bb.write(
             engel_present=fused.present,
+            engel_d_arc=d_arc,
             engel_d_center=fused.d_center,
             engel_d_overall=fused.d_overall,
             engel_d_left=fused.d_left,
@@ -217,8 +262,10 @@ class RosBridge:
         if self._legacy_suppressed():
             return
         v = msg.data if math.isfinite(msg.data) else float("inf")
-        self.bb.write(engel_d_overall=v, engel_d_center=v, engel_source="legacy",
-                      engel_last_seen=time.time())
+        # Legacy skaler arayüzde nokta listesi yok → yay-kapısı uygulanamaz;
+        # d_arc = d_center (düz-koridor davranışı korunur).
+        self.bb.write(engel_d_overall=v, engel_d_center=v, engel_d_arc=v,
+                      engel_source="legacy", engel_last_seen=time.time())
 
     def _on_engel_angle(self, msg: Float32):
         if self._legacy_suppressed():
@@ -238,6 +285,18 @@ class RosBridge:
         v = msg.data if math.isfinite(msg.data) else float("inf")
         now = time.time()
         self.bb.write(engel_d_right=v, engel_right_last_seen=now, engel_last_seen=now)
+
+    def _on_cart_steer(self, msg):
+        """cart_control.steer ∈ [-1,1] (+ sol) → bisiklet-modeli derece."""
+        try:
+            s = float(msg.steer)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if not math.isfinite(s):
+            return
+        s = max(-1.0, min(1.0, s))
+        self.bb.write(steer_deg=s * self._arc_gp.steer_full_deg,
+                      steer_last_seen=time.time())
 
     def _on_line(self, msg: Float32):
         self.bb.write(line_angle_deg=float(msg.data), lane_last_seen=time.time())

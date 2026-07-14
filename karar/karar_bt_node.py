@@ -220,6 +220,7 @@ def main():
                 kacis_yon=bb.state.kacis_yon, overtake_active=bb.state.overtake_active,
                 hedef_x=o.hedef_x, hedef_y=o.hedef_y,
                 engel_mem=o.engel_mem_count,
+                d_arc=o.engel_d_arc, steer_deg=o.steer_deg,
             )
 
         # 5) Karar değişiminde event logu

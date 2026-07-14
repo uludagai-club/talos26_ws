@@ -87,9 +87,12 @@ class ReleaseEmergencyIfClear(py_trees.behaviour.Behaviour):
 
         o = self.bb.obs
         yaya_clear = (not o.yaya_present) or (o.yaya_distance < 0) or (o.yaya_distance >= self.yaya_esik)
-        # Engel present ama mesafe inf ise sensör verisi eksik → güvenli tarafta kal
+        # Engel present ama d_center inf ise sensör verisi eksik → güvenli tarafta kal.
+        # Temizlik ölçüsü d_arc (yay-kapısı, 2026-07-15): araç direksiyonu engeli
+        # temizleyen bir yaya çevirdiyse (d_arc=inf ya da ≥ eşik) mühür çözülür;
+        # ölü-merkez engel her direksiyonda bant içinde kalır → mühür durur.
         engel_d_valid = math.isfinite(o.engel_d_center)
-        engel_clear = (not o.engel_present) or (engel_d_valid and o.engel_d_center >= self.engel_esik)
+        engel_clear = (not o.engel_present) or (engel_d_valid and o.engel_d_arc >= self.engel_esik)
 
         if yaya_clear and engel_clear:
             self.bb.state.emergency_clear_streak += 1

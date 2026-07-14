@@ -44,6 +44,15 @@ class Observations:
     engel_source: str = "none"           # "poses" (yeni detektör) | "poses+mem" | "legacy" | "none" — debug
     engel_count: int = 0                 # ileri bakış içindeki engel sayısı — debug
     engel_mem_count: int = 0             # bu tick hafızadan enjekte edilen duba sayısı (dropout köprüsü) — debug
+    # Yay-kapısı (2026-07-15): mevcut direksiyonun süpürme bandı İÇİNDEKİ en
+    # yakın engel menzili. ACİL tetik/release BUNU okur (d_center değil) —
+    # yan nesne bisiklet yayının dışındaysa acildurus atılmaz. Direksiyon
+    # verisi yok/bayatsa ros_bridge buraya d_center yazar (fail-safe: eski davranış).
+    engel_d_arc: float = _INF
+
+    # --- Direksiyon (yay-kapısı girdisi; /cart cart_control.steer × steer_full_deg) ---
+    steer_deg: float = 0.0               # bisiklet-modeli komut açısı; + sol
+    steer_last_seen: float = 0.0
 
     # --- Şerit ---
     lane_offset_px: float = 0.0

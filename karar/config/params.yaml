@@ -11,6 +11,8 @@
 #
 #  ENGEL / CONE bantları (engel rotada, ileri mesafe; yakın→uzak):
 #    acildurus .... 1.2 m   tam fren, son çare        [wp_near-0.3]
+#                   (2026-07-15: YAY-KAPILI — mevcut direksiyonun bisiklet süpürme
+#                    bandı dışındaki nesne acil tetiklemez; bkz. obstacle.arc_gate)
 #    dur .......... 2.0 m   reroute saptıramazsa dur   [wp_near+0.5]  (güvenlik ağı)
 #    reroute ...... 6.0 m   'slow' + kenar_blok talebi [wp_near+4.5]  ← §12.12: 3.5→6.0
 #    yavasla ...... 9.0 m   en dış: yaklaş, yavaşla    [wp_near+7.5]  ← §12.12: 6.0→9.0
@@ -179,6 +181,23 @@ obstacle:
   axis_left: y                  # x | y | z  → "sol" hangi eksen
   invert_forward: false
   invert_left: false
+
+  # Yay-kapısı (2026-07-15) — ACİL bandı bisiklet-modeli farkındalı.
+  # Canlı bulgu (run 20260713T173335Z): 41° sağ-yanda 1.12 m'deki bordür,
+  # araç sola dönerken düz-koridor eşiğini kırıp acildurus'u 2 dk kilitledi.
+  # Artık acil tetik/release, mevcut direksiyonun 2B süpürme bandı (control.py
+  # ackermann_path_clears ile aynı matematik) içindeki en yakın engele (d_arc)
+  # bakar. dur/reroute/yavasla bantları d_center ile DEĞİŞMEDİ (planlama erken
+  # görmeli). Direksiyon verisi yok/bayat → d_arc=d_center (eski davranış).
+  arc_gate:
+    enabled: true
+    steer_topic: "/cart"        # cart_control (steer ∈ [-1,1], + sol). Bee1'de değişecek.
+    steer_full_deg: 28.95       # steer=1 karşılığı bisiklet açısı (urdf max_steer 0.5053 rad)
+    steer_max_age_s: 0.5        # direksiyon bundan bayatsa kapı devre dışı (fail-safe)
+    wheelbase_m: 1.86           # control.py WHEELBASE ile eşit tut
+    half_width_m: 0.75          # control.py ESTOP_BANT_YARIM_M ile eşit tut (0.6+0.15)
+    sensor_to_ra_m: 1.76        # control.py LIDAR_ARKA_AKS_M ile eşit tut
+    nose_m: 2.34                # arka aks → ön tampon (golf.urdf: 1.477+0.862)
 
   # Duba DÜNYA-konum hafızası (dropout köprüsü) — obstacle_memory.py
   # Detektör duba ~3m önümüzdeyken bile kareyi düşürünce engel_d_center boşalıyor
