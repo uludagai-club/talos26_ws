@@ -4,7 +4,7 @@ import can
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.widgets import Button
-from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.patches import Polygon as MplPolygon, Circle
 import numpy as np
 from collections import deque
 import time
@@ -72,6 +72,11 @@ graph_edges = []  # [((x1, y1), (x2, y2)), ...]
 # Statik harita (my_map.pgm, dosyadan yüklenir)
 map_image = None   # numpy array (grayscale)
 map_extent = None  # [xmin, xmax, ymin, ymax]
+
+# Karar hafıza konileri + hedef silme çemberi (dinamik, ROS'tan)
+hafiza_koniler = []   # [(x, y, confirmed_bool), ...] — odom-frame (karar obstacle_memory)
+blok_cemberler = []   # [(cx, cy, r), ...] — hedef engel silme çemberleri
+silinen_wps    = []   # [(x, y), ...] — çember içine düşen (silinen) waypoint'ler
 
 # Karar (hedef-yoneticisi/karar-node'dan)
 current_karar = "normal"       # "normal" | "slow" | "dur" | "acildurus" | "sag" | "sol"
@@ -393,6 +398,50 @@ def karar_callback(msg):
             current_karar = new
             karar_last_change_t = now
 
+def hafiza_koni_callback(msg):
+    """/karar/hafiza_koni — karar'ın obstacle_memory'sindeki dubalar
+    ('x,y,conf|...'; conf=1 konfirme). Odom-frame → doğrudan ax_map'e."""
+    global hafiza_koniler
+    out = []
+    raw = (msg.data or "").strip()
+    if raw:
+        for seg in raw.split('|'):
+            parts = seg.split(',')
+            try:
+                out.append((float(parts[0]), float(parts[1]), parts[2].strip() == '1'))
+            except (ValueError, IndexError):
+                pass
+    with data_lock:
+        hafiza_koniler = out
+
+
+def blok_callback(msg):
+    """/hedef/blok — hedefin silme çemberleri + silinen waypoint'ler
+    ('cx,cy,r|...#wx,wy|...'). '#' ile iki kısım ayrılır."""
+    global blok_cemberler, silinen_wps
+    cember_str, _, wp_str = (msg.data or "").partition('#')
+    cs, ws = [], []
+    for seg in cember_str.split('|'):
+        if not seg.strip():
+            continue
+        parts = seg.split(',')
+        try:
+            cs.append((float(parts[0]), float(parts[1]), float(parts[2])))
+        except (ValueError, IndexError):
+            pass
+    for seg in wp_str.split('|'):
+        if not seg.strip():
+            continue
+        parts = seg.split(',')
+        try:
+            ws.append((float(parts[0]), float(parts[1])))
+        except (ValueError, IndexError):
+            pass
+    with data_lock:
+        blok_cemberler = cs
+        silinen_wps = ws
+
+
 def can_listener():
     """Arka planda CAN dinleyen thread"""
     global current_steer, current_rpm, current_gear, current_speed, current_throttle, current_brake, running
@@ -487,6 +536,8 @@ try:
     rospy.Subscriber('/base_pose_ground_truth', Odometry, odom_callback)
     rospy.Subscriber('/hedef', String, hedef_callback)
     rospy.Subscriber('/karar', String, karar_callback)
+    rospy.Subscriber('/karar/hafiza_koni', String, hafiza_koni_callback)
+    rospy.Subscriber('/hedef/blok', String, blok_callback)
 except rospy.exceptions.ROSInitException:
     print("ROS başlatılamadı!")
 
@@ -555,6 +606,22 @@ vehicle_artists = []
 line_predicted, = ax_map.plot([], [], color='#00E5FF', linewidth=2.5,
                                alpha=0.85, linestyle='-', zorder=9)
 
+# --- Karar hafıza konileri + hedef silme çemberi (dinamik) ---
+# Konfirme koni: dolu turuncu üçgen; konfirme-olmayan aday: içi boş üçgen.
+line_koni_conf, = ax_map.plot([], [], '^', color='#FF7043', markersize=13,
+                              markeredgecolor='#000', markeredgewidth=1.0,
+                              alpha=0.95, label='Hafıza koni', zorder=12)
+line_koni_unconf, = ax_map.plot([], [], '^', markerfacecolor='none',
+                                markeredgecolor='#FFAB91', markeredgewidth=1.4,
+                                markersize=11, alpha=0.7, zorder=12)
+# Silme çemberi içine düşen (silinen) waypoint'ler: kırmızı çarpı
+line_silinen, = ax_map.plot([], [], 'x', color='#EF5350', markersize=9,
+                            markeredgewidth=2.0, alpha=0.9, label='Silinen WP', zorder=8)
+# Silme çemberleri: her frame yeniden oluşturulan Circle patch'leri
+blok_circle_artists = []
+
+ax_map.legend(loc='upper right', fontsize=7, framealpha=0.4)
+
 # 2. Direksiyon (Alt Sol)
 ax_steer = fig.add_subplot(gs[1, 0], projection='polar')
 ax_steer.set_facecolor('#1e1e1e')
@@ -620,7 +687,7 @@ plt.tight_layout()
 plt.subplots_adjust(top=0.9, hspace=0.3)
 
 def update_plot(frame):
-    global vehicle_artists
+    global vehicle_artists, blok_circle_artists
 
     with data_lock:
         c_gear = current_gear
@@ -639,6 +706,9 @@ def update_plot(frame):
         path_y = list(vehicle_path_y)
         wps = list(waypoint_list)
         c_karar = current_karar
+        koniler = list(hafiza_koniler)
+        cemberler = list(blok_cemberler)
+        sil_wps = list(silinen_wps)
 
     # --- Karar bazlı arka plan rengi + overlay ---
     karar_cfg = KARAR_COLORS.get(c_karar, KARAR_COLORS['normal'])
@@ -681,6 +751,25 @@ def update_plot(frame):
     front_ax_y = cy + (WHEELBASE / 2) * np.sin(cyaw)
     pred_x, pred_y = compute_predicted_path(front_ax_x, front_ax_y, cyaw, c_steer, horizon=12.0, steps=80)
     line_predicted.set_data(pred_x, pred_y)
+
+    # --- Karar hafıza konileri + hedef silme çemberi + silinen WP ---
+    line_koni_conf.set_data([k[0] for k in koniler if k[2]],
+                            [k[1] for k in koniler if k[2]])
+    line_koni_unconf.set_data([k[0] for k in koniler if not k[2]],
+                              [k[1] for k in koniler if not k[2]])
+    line_silinen.set_data([w[0] for w in sil_wps], [w[1] for w in sil_wps])
+    # Silme çemberlerini yeniden çiz (sayıları değişken → patch'leri yenile)
+    for c in blok_circle_artists:
+        try:
+            c.remove()
+        except ValueError:
+            pass
+    blok_circle_artists = []
+    for (ccx, ccy, ccr) in cemberler:
+        circ = Circle((ccx, ccy), ccr, fill=False, linestyle='--',
+                      edgecolor='#EF5350', linewidth=1.6, alpha=0.85, zorder=7)
+        ax_map.add_patch(circ)
+        blok_circle_artists.append(circ)
 
     # Güncel graph'ı + waypointleri + aracı sığdır (genel görünüm).
     # Harita arka planda kalır; görünüm yol grafiğine odaklanır.
@@ -727,6 +816,7 @@ def update_plot(frame):
         txt_park.set_bbox(dict(boxstyle='round', facecolor='#333333', edgecolor='gray', pad=0.3))
 
     return (line_path, line_waypoints, line_wp_connector,
+            line_koni_conf, line_koni_unconf, line_silinen,
             line_steer, txt_gear, txt_speed, txt_rpm, val_soc, val_volt,
             val_curr, txt_park, txt_karar)
 
