@@ -223,7 +223,11 @@ SLALOM_YALNIZ_GEREKINCE = True
 # kesip enjeksiyonsuz farklı-sokak yapabilirdi). r≈1m default'ta şerit ayrımı ~2m
 # olduğundan (A y≈-34.27 ↔ B y≈-32.29) kendi şerit (~0m) ile karşı şeridi (~2m) net ayırır.
 CEZA_TERS_CIKIS         = 90    # ters şerite ÇIKMA (crossing) cezası (4.6x) — PAHALI: az geçiş
-CEZA_TERS_KALMA         = 0     # ters şeritte KALMA (karşı-şerit ileri seyir) cezası (1.0x) — UCUZ: solda kal
+CEZA_TERS_KALMA         = 20    # ters şeritte KALMA (karşı-şerit ileri seyir) cezası (1.8x) — engeli
+#                                 geçince sağ şeride ERKEN dön. 2026-07-15: 0(bedava) iken araç engeli
+#                                 geçtikten sonra da solda kalıyordu ("gereğinden fazla sol"); >0 → ilk
+#                                 güvenli çıkış crossing'inde döner (SIYIRMA cezası erken/sıyıran çıkışı eler).
+#                                 Reroute anında okunur → canlı ayarlanabilir (canli_params.yaml 'hedef:').
 BLOK_EK_CEZA            = 50.0  # bloklu kenara TOPLAMSAL ceza (m) — detour'u baskın yap; sonlu (fail-safe)
 SLALOM_ENJEKSIYON_R     = 6.0   # crossing/segment endpoint'i engele bu kadar yakınsa enjekte (m) — 8→6 azalt (lokalize slalom)
 # Giriş crossing'i engeli SIYIRMASIN ("bir waypoint önce dön", kullanıcı 2026-06-24):
@@ -1321,6 +1325,9 @@ class HedefYoneticisi:
 
         # ── ROS bağlantıları ─────────────────────────────────────────
         self.pub_hedef = rospy.Publisher('/hedef', String, queue_size=10)
+        # Görselleştirme: engel silme çemberleri + çember içine düşen (silinen)
+        # waypoint'ler → can_visualizer harita paneli. Salt-görsel.
+        self.pub_blok  = rospy.Publisher('/hedef/blok', String, queue_size=5)
 
         # queue_size: /konum ~20Hz, recalc'lı callback bazen 50ms'yi aşabilir →
         # eski konum değersiz, daima en taze kullanılmalı → 1 (sonsuz iç kuyruk
@@ -2566,6 +2573,30 @@ class HedefYoneticisi:
 
         self.pub_hedef.publish("|".join(msg_parts))
 
+    def publish_bloklar(self) -> None:
+        """Karar'ın engel bloklarını (silme çemberi) + çember içine düşen
+        'silinen' waypoint'leri görselleştiriciye yayınla. Salt-görsel:
+        planlama davranışını etkilemez. Biçim: 'cx,cy,r|...#wx,wy|...'
+        (etkin yarıçap = max(engel_r, BLOK_YARICAP_M), _sert_blok ile aynı).
+        try/except: bir viz-yayın hatası ASLA ana döngüyü/planlayıcıyı düşürmesin."""
+        try:
+            bloklar = self._aktif_bloklar()   # [(x,y,r)] — TTL süzülü
+            cember_parts = [f"{cx:.2f},{cy:.2f},{max(r, BLOK_YARICAP_M):.2f}"
+                            for (cx, cy, r) in bloklar]
+            # Çember içine düşen graf düğümleri = _sert_blok'un kullanılamaz kıldığı
+            # (silinen) waypoint'ler. Düğüm-merkez yaklaşımı (_sert_blok segment-mesafe
+            # kullanır; görsel amaçlı yeterince yakın). Blok yokken düğüm taraması atlanır.
+            silinen = []
+            if bloklar:
+                for (nx, ny) in self.planner.nodes:
+                    for (cx, cy, r) in bloklar:
+                        if math.hypot(nx - cx, ny - cy) <= max(r, BLOK_YARICAP_M):
+                            silinen.append(f"{nx:.2f},{ny:.2f}")
+                            break
+            self.pub_blok.publish("|".join(cember_parts) + "#" + "|".join(silinen))
+        except Exception:
+            pass
+
     # ==========================================
     #   ÇİZİM
     # ==========================================
@@ -2792,6 +2823,7 @@ class HedefYoneticisi:
         while not rospy.is_shutdown():
             if self.is_path_calculated:
                 self.publish_current_waypoint()
+            self.publish_bloklar()   # salt-görsel: silme çemberi + silinen WP
             if ENABLE_GUI and self.new_data_available:
                 self.draw()
                 self.new_data_available = False
