@@ -133,6 +133,11 @@ class RosBridge:
         self.pub_hedef_komut = rospy.Publisher("/hedef_komut", String, queue_size=1)
         self._last_hedef_komut = ""
 
+        # Görselleştirme: hafızadaki dubaların dünya (odom) konumu → can_visualizer
+        # harita panelinde çizer. Salt-görsel; karar davranışını etkilemez.
+        # Biçim: "x,y,conf|x,y,conf|..." (conf=1 konfirme, 0 aday).
+        self.pub_hafiza_koni = rospy.Publisher("/karar/hafiza_koni", String, queue_size=2)
+
     # ============================================================
     # Subscriber callback'leri — yalnız blackboard'a yazar
     # ============================================================
@@ -245,6 +250,17 @@ class RosBridge:
             engel_left_last_seen=now,
             engel_right_last_seen=now,
         )
+
+        # Görselleştirme: hafızadaki dubaların dünya konumu (odom-frame x,y +
+        # konfirme). Salt-görsel; can_visualizer harita panelinde çizer.
+        if self._obs_mem is not None:
+            try:
+                trk = self._obs_mem.world_tracks()
+                payload = "|".join(f"{x:.2f},{y:.2f},{1 if c else 0}"
+                                   for x, y, c in trk)
+                self.pub_hafiza_koni.publish(payload)
+            except Exception:
+                pass
 
     # --- Failover: yeni kaynak tazeyse eski skaler topic'ler yok sayılır ---
     def _legacy_suppressed(self) -> bool:

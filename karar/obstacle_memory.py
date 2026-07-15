@@ -257,3 +257,8 @@ class ObstacleMemory:
         self._tracks.clear()
         self._last_pose = None
         self.last_stats = {"injected": 0, "tracks": 0, "confirmed": 0}
+
+    def world_tracks(self) -> List[Tuple[float, float, bool]]:
+        """Görselleştirme için mevcut izlerin dünya (odom) konumu + konfirme
+        bayrağı. Salt-okuma; karar/enjeksiyon davranışını etkilemez."""
+        return [(t.x, t.y, t.confirmed) for t in self._tracks.values()]
