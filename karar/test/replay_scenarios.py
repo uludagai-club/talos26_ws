@@ -61,11 +61,33 @@ def tick_n(tree, n: int):
         tree.tick()
 
 
+def mirror_bridge_derived(bb: Blackboard):
+    """ros_bridge'in TÜRETTİĞİ alanları harness'ta doldur (her tick'ten önce).
+
+    Senaryolar ros_bridge'i bypass edip blackboard'a doğrudan yazıyor; köprünün
+    kendi hesaplayıp yazdığı alanlar burada taklit edilmezse senaryo varsayılan
+    değerle (inf) çalışır ve SESSİZCE yanlış dalı doğrular — fail-safe testi
+    susturur, kırmızı yanmaz. (2026-07-15 yay-kapısı: engel_d_arc doldurulmadığı
+    için S13/S23 'acildurus' yerine 'dur' aldı; acil dalı hiç açılmıyordu.)
+
+    engel_d_arc: offline harness'ta direksiyon kaynağı (/cart) YOK → ros_bridge'in
+    fail-safe yolu geçerlidir: d_arc = d_center (düz-koridor davranışı). Yay-kapısı
+    geometrisinin kendi testi test_yay_kapisi.py'dedir; burada amaç ağacın acil
+    dalının d_center senaryolarıyla test edilebilir kalması.
+
+    YENİ TÜRETİLMİŞ ALAN EKLERKEN: ros_bridge'e alan eklendiğinde buraya da ekle.
+    """
+    bb.obs.engel_d_arc = bb.obs.engel_d_center
+
+
 def run_scenarios():
     cfg = load_cfg()
     bb = Blackboard()
     root = build_root(bb, cfg)
     tree = py_trees.trees.BehaviourTree(root)
+    # Köprü aynası TEK noktadan: her tick'ten önce çalışır → senaryoların
+    # engel alanını nasıl yazdığından (elle ya da apply_fused) bağımsız.
+    tree.add_pre_tick_handler(lambda _t: mirror_bridge_derived(bb))
 
     deb = cfg["debounce"]
     n_yaya = deb["yaya_min_consecutive"]
