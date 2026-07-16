@@ -26,6 +26,26 @@ anında güncellenir — kod değişikliği için rebuild gerekmez.
 
 ## İlk Kurulum (Bir Kez)
 
+### 0. Sistem paketleri
+
+```bash
+sudo apt update && sudo apt install -y can-utils
+```
+
+> `can-utils` (`cansend` / `candump`) olmadan `baslat.sh` ham CAN yedeğini alamaz
+> (`[!] candump yok` uyarısı) ve GUI'siz başlatma (`cansend`) mümkün olmaz.
+
+GPU servisleri (`engel-node`, `traffic-node`, `lane-follower`, `yaya-gecidi-node`) için
+**NVIDIA Container Toolkit** gerekir. Kurulu değilse `docker compose up` şu hatayı verir
+ve bu dört servis hiç başlamaz:
+
+```
+Error response from daemon: could not select device driver "nvidia" with capabilities: [[gpu]]
+```
+
+Kontrol: `nvidia-container-cli info`. NVIDIA GPU'n yoksa bu dört servis çalışmaz; araç
+waypoint takibiyle yine sürer ama engel algılama, şerit takibi ve levha algısı olmaz.
+
 ### 1. SSH anahtarını GitHub'a ekle
 
 ```bash
@@ -60,9 +80,32 @@ catkin_make
 source devel/setup.bash
 ```
 
-> `~/talos-sim/devel/lib/python3/dist-packages/cart_sim/msg/_Decision.py` oluştuysa
-> mesajlar derlenmiş demektir. Bu dosya yoksa `karar-node`/`engel-node` `/karar_decision`
-> topic'ini yayınlamaz (sadece `/karar` String).
+> **Bu adım atlanırsa araç HİÇ yürümez.** `control/can_to_talos_cart.py` `cart_sim.msg`'i
+> korumasız import eder → `can-bridge` container'ı ImportError ile anında ölür. `can-bridge`
+> ölünce controller'ın CAN frame'leri Gazebo'ya hiç ulaşmaz: her şey yeşil görünür, buton
+> çalışır, log hedef basar, ama araç yerinde durur (`Hız: 0.0`, mesafe sabit).
+> `state-bridge` ve `karar-node` aynı import'u `try/except` ile sardığı için ölmez, sadece
+> uyarı verir — bu yüzden arıza yalnız `can-bridge`'in eksikliğinden anlaşılır.
+
+Derlemenin başarılı olduğunu doğrula:
+
+```bash
+ls ~/talos-sim/devel/lib/python3/dist-packages/cart_sim/msg/_Decision.py
+```
+
+> Bu dosya yoksa mesajlar derlenmemiş demektir (`/karar_decision` da yayınlanmaz,
+> sadece `/karar` String gelir).
+
+Simülasyonun tek başına açıldığını burada doğrula (stack'e geçmeden önce):
+
+```bash
+source ~/talos-sim/devel/setup.bash
+roslaunch cart_sim cart_sim.launch
+```
+
+Gazebo penceresi açılıp araç pistte görünmeli. Görünmüyorsa Python node'ları `+x`
+iznini kaybetmiş olabilir: `cd ~/talos-sim/src/cart_sim/scripts && chmod +x *.py`
+(aynısı `src/cart_sim/nodes/` için).
 
 ### 3. Bu repo'yu klonla (`~/talos-sim/scripts/` altına — ZORUNLU)
 
@@ -104,18 +147,67 @@ docker build -t talos-all:latest -f Dockerfile.all .
 
 ---
 
-## Her Oturumda Sistemi Başlatma
+## Her Oturumda Sistemi Başlatma (3 ADIM — üçü de zorunlu)
+
+İki nokta yeni gelenleri sürekli yanıltıyor, en baştan bilinsin:
+
+1. **`baslat.sh` Gazebo'yu BAŞLATMAZ.** Simülasyonu ayrı bir terminalde sen açarsın;
+   `baslat.sh` yalnız Docker stack'ini (otonom sürüş yazılımını) ayağa kaldırır.
+2. **Son adımdaki butona basmadan araç YÜRÜMEZ.** Her şey yeşil görünse, 13 servis
+   de aksa bile araç `0x500` başlatma frame'i gelene kadar yerinde bekler.
+
+### Adım 1 — Gazebo simülasyonu (Terminal 1)
+
+```bash
+source ~/talos-sim/devel/setup.bash
+roslaunch cart_sim cart_sim.launch
+```
+
+Gazebo penceresi açılmalı ve araç pistte görünmeli. (`roscore`'u `roslaunch` kendisi
+başlatır; zaten çalışıyorsa ona bağlanır.)
+
+### Adım 2 — Docker stack (Terminal 2)
 
 ```bash
 cd ~/talos-sim/scripts/talos26_ws
 
-# Tek komut: vcan0 + X11 + roscore + eksik image build + tüm servisler.
+# Tek komut: vcan0 + X11 + roscore (yoksa) + eksik image build + 13 servis + log akışı.
 ./baslat.sh
 ```
 
 `baslat.sh` kanonik giriş noktasıdır — `setup-vcan.sh`, host `roscore`, image build,
 `docker compose --profile gui up -d` ve log streaming'i kendisi yapar; `Ctrl+C` ile
 her şeyi temizleyerek kapatır. `docker compose up` zincirini elle kurmana gerek yok.
+
+`TUM BILESENLER AKTIF` bannerından sonra log şu satırda **durur ve bekler**.
+Bu bir hata DEĞİLDİR — Adım 3'ü bekliyor:
+
+```
+talos-controller  |   [DURUM] Başlatma komutu bekleniyor (CAN ID 0x500)...
+```
+
+### Adım 3 — `ROTA BAŞLAT` butonuna bas (araç bu olmadan YÜRÜMEZ)
+
+`baslat.sh` ile birlikte **can-visualizer** penceresi açılır. Penceredeki üstte duran
+yeşil **`ROTA BAŞLAT`** butonuna bas. Buton CAN'e `0x500` byte0=1 gönderir; `control.py`
+görevi ancak bu frame'i alınca başlatır (o ana kadar `mission_started=False` ile
+bloklayıcı bir bekleme döngüsünde durur, araca tek bir gaz frame'i bile gitmez).
+
+Bastıktan sonra controller logunda görmen gerekenler:
+
+```
+talos-controller  | >>> CAN Başlatma komutu alındı (0x500) <<<
+talos-controller  | GÖREV BAŞLATILIYOR! /hedef bekleniyor...
+```
+
+Ardından `/hedef` gelince araç hareket eder.
+
+GUI açılmadıysa (X11 yok, uzak makine, `xhost` verilmemiş) aynı frame'i elle gönderebilirsin
+(`can-utils` gerekir — Adım 0):
+
+```bash
+cansend vcan0 500#0100000000000000
+```
 
 ---
 
@@ -235,6 +327,74 @@ Tüm 13 servis tek `talos-all:latest` image'ını kullanır; ayrım `command` il
 ---
 
 ## Sorun Giderme
+
+**Araç hiç yürümüyor — log `[DURUM] Başlatma komutu bekleniyor (CAN ID 0x500)...`da duruyor:**
+
+En sık yaşanan durum ve **bir hata değil**: Adım 3 atlanmış. can-visualizer penceresindeki
+yeşil `ROTA BAŞLAT` butonuna bas. Pencere yoksa:
+```bash
+cansend vcan0 500#0100000000000000
+```
+Doğrulama: controller logunda `>>> CAN Başlatma komutu alındı (0x500) <<<` görünmeli.
+
+**`0x500` alındı, hedef de geliyor, ama araç kımıldamıyor (`Hız: 0.0`, mesafe sabit):**
+
+```
+talos-controller | >>> CAN Başlatma komutu alındı (0x500) <<<
+talos-controller | Hedef (-11.8,-34.3) | Mesafe: 3.2m | Hız: 0.0/5.0 km/h    ← mesafe hiç düşmüyor
+```
+
+Neredeyse her zaman **`can-bridge` çökmüştür** → controller'ın CAN frame'leri Gazebo'ya
+ulaşmıyor. Önce ayakta mı bak (`docker compose ps` yalnız ÇALIŞANLARI listeler; listede
+`talos-can-bridge` yoksa çökmüş demektir):
+
+```bash
+docker compose ps -a | grep can-bridge
+docker compose logs can-bridge | tail -30
+```
+
+Log'da `ModuleNotFoundError: No module named 'cart_sim'` görüyorsan sebep derlenmemiş
+`devel`'dir (Kurulum Adım 2) — bu, `karar-node`'un `cart_sim.msg.Decision import edilemedi`
+uyarısıyla **aynı kök nedendir**:
+
+```bash
+cd ~/talos-sim && catkin_make
+cd ~/talos-sim/scripts/talos26_ws && docker compose restart can-bridge
+```
+
+**`0x500` alındı ama log `GÖREV BAŞLATILIYOR! /hedef bekleniyor...`da duruyor:**
+
+Bu sefer gerçekten `/hedef` gelmiyor demektir — `hedef-teslimi` ayakta mı bak:
+```bash
+rostopic echo -n1 /hedef      # "x,y" gelmeli
+docker compose logs hedef-teslimi | tail -30
+```
+
+**`./setup-vcan.sh: Permission denied` / `sudo: setup-vcan.sh: command not found`:**
+
+`baslat.sh` vcan0'ı zaten kendisi kurar — `[+] vcan0 olusturuldu` gördüysen bu scripti
+elle çalıştırmana gerek YOK. Yine de gerekirse `sudo` PATH'te `.` aramaz, `./` şart:
+```bash
+chmod +x setup-vcan.sh      # "-x" DEĞİL, "+x"
+sudo ./setup-vcan.sh        # "sudo setup-vcan.sh" değil
+# ya da izinle uğraşmadan:
+sudo bash setup-vcan.sh
+```
+
+**Gazebo açık değil / araç sahnede yok:** `baslat.sh` simülasyonu başlatmaz, Adım 1'i
+ayrı terminalde sen çalıştırmalısın:
+```bash
+source ~/talos-sim/devel/setup.bash && roslaunch cart_sim cart_sim.launch
+```
+
+**`karar-node` logunda `cart_sim.msg.Decision import edilemedi` uyarısı:**
+
+`~/talos-sim/devel` derlenmemiş ya da bayat:
+```bash
+cd ~/talos-sim && catkin_make
+```
+Sistem bu uyarıyla da sürer (`/karar` String olarak yayınlanır, control onu dinler) ama
+`/karar_decision` (yapılandırılmış `Decision`) yayınlanmaz. Kontrol: `~/talos-sim/devel/lib/python3/dist-packages/cart_sim/msg/_Decision.py` var mı?
 
 **vcan0 bulunamadı:**
 ```bash
