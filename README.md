@@ -24,6 +24,32 @@ anında güncellenir — kod değişikliği için rebuild gerekmez.
 
 ---
 
+## ⚡ Hızlı Başlangıç
+
+Kurulum bittiyse (bkz. [İlk Kurulum](#i̇lk-kurulum-bir-kez)), her oturumda **3 adım**:
+
+```bash
+# Terminal 1 — simülasyon
+source ~/talos-sim/devel/setup.bash && roslaunch cart_sim cart_sim.launch
+#   >>> sonra Gazebo'da ▶ PLAY'e BAS (duraklatılmış açılır)
+
+# Terminal 2 — otonom sürüş stack'i
+cd ~/talos-sim/scripts/talos26_ws && ./baslat.sh
+#   >>> sonra can-visualizer penceresinde yeşil "ROTA BAŞLAT"a BAS
+```
+
+**Araç yürümüyorsa** neredeyse her zaman şu üçünden biridir:
+
+| Belirti | Sebep | Çözüm |
+|---|---|---|
+| Log `[DURUM] Başlatma komutu bekleniyor (CAN ID 0x500)` da duruyor | `ROTA BAŞLAT`a basılmadı | Butona bas (ya da `cansend vcan0 500#0100000000000000`) |
+| `0x500` alındı ama `Hız: 0.0`, mesafe sabit | Gazebo duraklatılmış | Gazebo'da ▶ Play (ya da `rosservice call /gazebo/unpause_physics`) |
+| Aynı belirti, Play'e de basıldı | `can-bridge` ölü (`devel` derlenmemiş) | `cd ~/talos-sim && catkin_make`, sonra `docker compose restart can-bridge` |
+
+Detaylı teşhis için [Sorun Giderme](#sorun-giderme) bölümüne bak.
+
+---
+
 ## İlk Kurulum (Bir Kez)
 
 ### 0. Sistem paketleri
@@ -65,36 +91,33 @@ ssh -T git@github.com
 # "Hi kullanıcıadı! You've successfully authenticated..." yazmalı
 ```
 
-### 2. `~/talos-sim` simülasyon workspace'ini kur (ZORUNLU ÖN ADIM)
+### 2. Simülasyonu `~/talos-sim`'e kur ve DERLE (ZORUNLU ÖN ADIM)
 
-Bu stack, TALOS Gazebo simülasyonunu süren ayrı bir ROS workspace'ine (`~/talos-sim`)
-bağımlıdır. `cart_sim.msg` (özellikle `Decision` ve `cart_control` mesajları) buradan
-gelir; container'lar `~/talos-sim/devel`'i bind-mount eder. Bu workspace `~/talos-sim`
-yolunda kurulu ve **derlenmiş** olmadan stack çalışmaz.
+Bu stack tek başına çalışmaz — Gazebo simülasyonunu süren ayrı bir ROS workspace'ine
+(`~/talos-sim`) bağımlıdır. `cart_sim` mesajları (`cart_control`, `Decision`) oradan gelir;
+container'lar `~/talos-sim/devel`'i bind-mount eder.
+
+Simülasyon takımın paylaştığı **zip arşivi** olarak dağıtılıyor (ör. `talos-sim v 0.3`).
+Arşivi aç ve **tam olarak `~/talos-sim` yoluna** yerleştir, sonra derle:
 
 ```bash
-# TALOS simülasyon workspace'i ~/talos-sim altında olmalı (takım ana deposundan edinilir).
-# Yerleştirdikten sonra mesajları derle:
+# Arşivi ~/talos-sim'e açtıktan sonra:
 cd ~/talos-sim
 catkin_make
 source devel/setup.bash
 ```
 
-> **Bu adım atlanırsa araç HİÇ yürümez.** `control/can_to_talos_cart.py` `cart_sim.msg`'i
-> korumasız import eder → `can-bridge` container'ı ImportError ile anında ölür. `can-bridge`
-> ölünce controller'ın CAN frame'leri Gazebo'ya hiç ulaşmaz: her şey yeşil görünür, buton
-> çalışır, log hedef basar, ama araç yerinde durur (`Hız: 0.0`, mesafe sabit).
-> `state-bridge` ve `karar-node` aynı import'u `try/except` ile sardığı için ölmez, sadece
-> uyarı verir — bu yüzden arıza yalnız `can-bridge`'in eksikliğinden anlaşılır.
-
-Derlemenin başarılı olduğunu doğrula:
+Derlemenin başarılı olduğunu doğrula — bu dosya oluşmalı:
 
 ```bash
-ls ~/talos-sim/devel/lib/python3/dist-packages/cart_sim/msg/_Decision.py
+ls ~/talos-sim/devel/lib/python3/dist-packages/cart_sim/msg/_cart_control.py
 ```
 
-> Bu dosya yoksa mesajlar derlenmemiş demektir (`/karar_decision` da yayınlanmaz,
-> sadece `/karar` String gelir).
+> **`catkin_make` atlanırsa araç HİÇ yürümez.** Mesajlar derlenmezse `can-bridge`
+> container'ı `cart_sim`'i import edemez ve durur; controller'ın CAN frame'leri Gazebo'ya
+> ulaşmaz. Tablo yanıltıcıdır: diğer 12 servis "Up" görünür, buton çalışır, log hedef
+> basar — ama araç yerinde durur. `can-bridge` bu durumda net bir mesaj basar:
+> `[can_bridge] KRITIK: cart_sim.msg import edilemedi ... cd ~/talos-sim && catkin_make`
 
 Simülasyonun tek başına açıldığını burada doğrula (stack'e geçmeden önce):
 
@@ -106,6 +129,10 @@ roslaunch cart_sim cart_sim.launch
 Gazebo penceresi açılıp araç pistte görünmeli. Görünmüyorsa Python node'ları `+x`
 iznini kaybetmiş olabilir: `cd ~/talos-sim/src/cart_sim/scripts && chmod +x *.py`
 (aynısı `src/cart_sim/nodes/` için).
+
+> **Sürüm notu:** Sim v0.3'ün `cart_control.msg`'inde `handbrake` alanı yoktur. Stack bunu
+> otomatik algılar ve uyum sağlar (`can-bridge` başlangıçta bir uyarı basar, CAN `0x305`
+> park-fren geri-bildirimi kapanır — sürüş etkilenmez). **Sim'i elle yamalaman gerekmez.**
 
 ### 3. Bu repo'yu klonla (`~/talos-sim/scripts/` altına — ZORUNLU)
 
@@ -149,14 +176,15 @@ docker build -t talos-all:latest -f Dockerfile.all .
 
 ## Her Oturumda Sistemi Başlatma (3 ADIM — üçü de zorunlu)
 
-İki nokta yeni gelenleri sürekli yanıltıyor, en baştan bilinsin:
+Üç nokta yeni gelenleri sürekli yanıltıyor, en baştan bilinsin:
 
 1. **`baslat.sh` Gazebo'yu BAŞLATMAZ.** Simülasyonu ayrı bir terminalde sen açarsın;
    `baslat.sh` yalnız Docker stack'ini (otonom sürüş yazılımını) ayağa kaldırır.
-2. **Son adımdaki butona basmadan araç YÜRÜMEZ.** Her şey yeşil görünse, 13 servis
+2. **Gazebo DURAKLATILMIŞ açılır.** Play'e basmazsan fizik hiç ilerlemez.
+3. **`ROTA BAŞLAT` butonuna basmadan araç YÜRÜMEZ.** Her şey yeşil görünse, 13 servis
    de aksa bile araç `0x500` başlatma frame'i gelene kadar yerinde bekler.
 
-### Adım 1 — Gazebo simülasyonu (Terminal 1)
+### Adım 1 — Gazebo simülasyonu + Play (Terminal 1)
 
 ```bash
 source ~/talos-sim/devel/setup.bash
@@ -165,6 +193,18 @@ roslaunch cart_sim cart_sim.launch
 
 Gazebo penceresi açılmalı ve araç pistte görünmeli. (`roscore`'u `roslaunch` kendisi
 başlatır; zaten çalışıyorsa ona bağlanır.)
+
+**Sonra Gazebo'da alttaki ▶ Play düğmesine bas.** `cart_sim.launch` simülasyonu
+`paused=true` ile açar (satır 13) ve hiçbir yerde otomatik unpause yoktur — Play'e
+basılmazsa fizik ilerlemez, `/base_pose_ground_truth` akmaz, `/konum` → `/hedef`
+zinciri hiç dolmaz ve araç kımıldamaz. Terminalden de yapılabilir:
+
+```bash
+rosservice call /gazebo/unpause_physics
+```
+
+> Sim saatinin aktığını `rostopic echo -n1 /clock` ile doğrulayabilirsin — değer
+> artmıyorsa hâlâ duraklatılmış demektir.
 
 ### Adım 2 — Docker stack (Terminal 2)
 
@@ -344,23 +384,36 @@ talos-controller | >>> CAN Başlatma komutu alındı (0x500) <<<
 talos-controller | Hedef (-11.8,-34.3) | Mesafe: 3.2m | Hız: 0.0/5.0 km/h    ← mesafe hiç düşmüyor
 ```
 
-Neredeyse her zaman **`can-bridge` çökmüştür** → controller'ın CAN frame'leri Gazebo'ya
-ulaşmıyor. Önce ayakta mı bak (`docker compose ps` yalnız ÇALIŞANLARI listeler; listede
-`talos-can-bridge` yoksa çökmüş demektir):
+Sırayla iki şeye bak:
+
+**1) Gazebo duraklatılmış mı?** (Adım 1'de Play'e basılmamış)
+```bash
+rostopic echo -n1 /clock        # değer artmıyorsa duraklatılmış
+rosservice call /gazebo/unpause_physics
+```
+
+**2) `can-bridge` ayakta mı?** Bu köprü ölürse controller'ın CAN frame'leri Gazebo'ya
+hiç ulaşmaz. **`docker compose ps` yalnız ÇALIŞANLARI listeler** — listede
+`talos-can-bridge` yoksa çökmüş demektir:
 
 ```bash
 docker compose ps -a | grep can-bridge
 docker compose logs can-bridge | tail -30
 ```
 
-Log'da `ModuleNotFoundError: No module named 'cart_sim'` görüyorsan sebep derlenmemiş
-`devel`'dir (Kurulum Adım 2) — bu, `karar-node`'un `cart_sim.msg.Decision import edilemedi`
-uyarısıyla **aynı kök nedendir**:
+Log'da şu satırı görüyorsan `devel` derlenmemiş (Kurulum Adım 2):
+
+```
+[can_bridge] KRITIK: cart_sim.msg import edilemedi ...
+```
 
 ```bash
 cd ~/talos-sim && catkin_make
 cd ~/talos-sim/scripts/talos26_ws && docker compose restart can-bridge
 ```
+
+> `karar-node`'un `cart_sim.msg.Decision import edilemedi` uyarısı **aynı kök nedenin**
+> habercisidir — onu görüyorsan `can-bridge` de büyük ihtimalle ölmüştür.
 
 **`0x500` alındı ama log `GÖREV BAŞLATILIYOR! /hedef bekleniyor...`da duruyor:**
 
