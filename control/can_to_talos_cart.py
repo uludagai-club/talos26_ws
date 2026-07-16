@@ -9,9 +9,25 @@ import math
 # TALOS workspace'ini ekle
 sys.path.insert(0, os.path.expanduser('~/talos-sim/devel/lib/python3/dist-packages'))
 
-from cart_sim.msg import cart_control
+try:
+    from cart_sim.msg import cart_control
+except ImportError as _e:
+    sys.stderr.write(
+        "\n[can_bridge] KRITIK: cart_sim.msg import edilemedi (%s).\n"
+        "  ~/talos-sim derlenmemis veya bayat. Cozum:\n"
+        "      cd ~/talos-sim && catkin_make\n"
+        "      cd ~/talos-sim/scripts/talos26_ws && docker compose restart can-bridge\n"
+        "  Bu kopru olmadan /cart yayinlanmaz; arac HIC hareket etmez.\n\n" % _e)
+    sys.exit(1)
+
 from std_msgs.msg import Header
 from can_decoder import CANDecoder
+
+# Sim v0.3'un cart_control.msg'inde 'handbrake' alani YOK; sonraki surumlerde var.
+# Alan yoksa ona yazmak AttributeError -> kopru olur -> /cart hic yayinlanmaz ->
+# arac kimildamaz (diger 12 servis "Up" gorundugu icin ariza cok yaniltici).
+# Bir kez yoklayip bayraga aliyoruz; asagidaki handbrake yazimi bunu kontrol eder.
+HANDBRAKE_ALANI_VAR = hasattr(cart_control(), 'handbrake')
 
 class CANtoTalosCart:
     def __init__(self):
@@ -19,7 +35,14 @@ class CANtoTalosCart:
         
         self.bus = can.interface.Bus(channel='vcan0', interface='socketcan')
         self.cart_pub = rospy.Publisher('/cart', cart_control, queue_size=10)
-        
+
+        if not HANDBRAKE_ALANI_VAR:
+            rospy.logwarn(
+                "[can_bridge] sim v0.3 tespit edildi: cart_control.msg'de 'handbrake' alani yok "
+                "-> CAN 0x305 park-fren GERI-BILDIRIMI KAPALI. Surus etkilenmez "
+                "(el freni gaz-kesme kilidi 0x102'den calismaya devam eder). Geri-bildirim "
+                "gerekiyorsa cart_control.msg'ye 'float64 handbrake' ekleyip catkin_make calistirin.")
+
         # Durum Değişkenleri
         self.current_throttle_cmd = 0.0
         self.current_brake_cmd = 0.0 # Yeni: Fren komutu
@@ -120,7 +143,8 @@ class CANtoTalosCart:
             cart_msg.throttle = final_throttle
             cart_msg.brake = final_brake
             cart_msg.steer = self.normalize_steering(self.current_steering)
-            cart_msg.handbrake = self.current_handbrake
+            if HANDBRAKE_ALANI_VAR:
+                cart_msg.handbrake = self.current_handbrake
             cart_msg.shift_gears = self.current_gear
 
             # El freni aktifse gazı kapat
@@ -143,5 +167,10 @@ if __name__ == '__main__':
     try:
         bridge = CANtoTalosCart()
         bridge.run()
+    except rospy.ROSInterruptException:
+        pass          # temiz kapanis (Ctrl+C / docker stop) — restart tetiklenmemeli
     except Exception as e:
-        rospy.logerr(f"Hata: {e}")
+        # sys.exit(1) SART: exit 0 ile bitersek docker'in `restart` politikasi
+        # tetiklenmez, kopru "temiz cikmis" gibi sessizce olur ve arac sebepsiz durur.
+        rospy.logerr(f"[can_bridge] KRITIK ({type(e).__name__}): {e} — kopru duruyor, /cart kesiliyor.")
+        sys.exit(1)

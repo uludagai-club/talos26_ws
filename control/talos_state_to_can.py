@@ -131,8 +131,12 @@ class TalosStateToCAN:
 
     def cart_callback(self, msg):
         """Gazebo'dan araç kontrol durumunu al"""
-        # El freni durumu (0.5'ten büyükse aktif)
-        self.park_brake_active = msg.handbrake > 0.5
+        # El freni durumu (0.5'ten büyükse aktif).
+        # getattr: sim v0.3'un cart_control.msg'inde 'handbrake' alani YOK. Duz erisim
+        # her karede AttributeError atardi — rospy callback istisnasini yutar, yani node
+        # olmez ama 20 Hz log spam'i akar. Alan yoksa "park freni serbest" varsayiyoruz
+        # (can_bridge de o surumde 0x305 geri-bildirimini zaten yaymiyor).
+        self.park_brake_active = getattr(msg, 'handbrake', 0.0) > 0.5
 
     def simulate_battery(self):
         """Batarya durumunu simüle et"""
