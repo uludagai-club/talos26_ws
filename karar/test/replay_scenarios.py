@@ -635,6 +635,79 @@ def run_scenarios():
         failures.append(f"[S33] reason engel_reroute bekleniyordu: {bb.last_decision.get('reason')}")
         print(f"  ✗ S33 reason: {bb.last_decision.get('reason')}")
 
+    # -----------------------------------------------------------------
+    # S34: MÜHÜR STATİK-İNİŞ (P0 №3, inceleme 2026-07-16 E8-R1) — statik
+    #      yakın engelde bırakma eşiği (1.8m) sağlanamaz; mühür ≥15s +
+    #      hareketsiz + d_arc sabit + taban (1.0m) üstü → karar 'dur'a iner
+    #      (reason muhur_statik_dur), mühür AÇIK KALIR (yeniden-mühür yok).
+    #      Taban ALTINDA (0.8m) iniş YOK → acildurus sürer.
+    # -----------------------------------------------------------------
+    print("\nS34: Mühür statik-iniş → dur (mühür açık kalır)")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    sc34 = cfg["emergency"]["statik_cozme"]
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 0.8      # acil eşiği (1.2) altı → mühür kurulur
+    bb.obs.speed_kmh = 0.0
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S34-mühür", "acildurus")
+    # Statik faz: engel 1.15m'de SABİT (release 1.8'in altı, taban 1.0'ın üstü);
+    # mühür yaşı geriye damgalanır (testte min_muhur_s beklememek için).
+    bb.obs.engel_d_center = 1.15
+    bb.state.emergency_latch_start_s = time.time() - (float(sc34["min_muhur_s"]) + 5.0)
+    for _ in range(int(sc34["d_arc_sabit_ticks"]) + 2):
+        fresh_now(bb); tree.tick()
+    assert_karar("S34-iniş", "dur")
+    if bb.last_decision.get("reason") != "muhur_statik_dur":
+        failures.append(f"[S34] reason muhur_statik_dur bekleniyordu: {bb.last_decision.get('reason')}")
+        print(f"  ✗ S34 reason: {bb.last_decision.get('reason')}")
+    if not bb.state.emergency_latched:
+        failures.append("[S34] mühür ÇÖZÜLMEMELİYDİ (iniş ≠ release; anında yeniden-mühür riski)")
+        print("  ✗ S34: mühür çözülmüş")
+    else:
+        print("  ✓ S34: mühür açık kaldı (iniş release değil)")
+    # Taban altı: 0.8m < d_arc_min_m → iniş yok, acildurus sürmeli
+    bb.obs.engel_d_center = 0.8
+    for _ in range(int(sc34["d_arc_sabit_ticks"]) + 2):
+        fresh_now(bb); tree.tick()
+    assert_karar("S34-taban", "acildurus")
+
+    # -----------------------------------------------------------------
+    # S35: STATİK-İNİŞ + ALGI FLICKER'I (canlı doğrulama 2026-07-17):
+    #      detektör her 5. tick'te kareyi düşürüyor (present=0, d=inf) —
+    #      E3'ün 1-2 Hz tek-tick dropout deseni. Dropout sabitlik sayacını
+    #      SIFIRLAMAMALI; iniş yine gerçekleşmeli. (Mühür de çözülmemeli:
+    #      release 8 ARDIŞIK temiz tick ister, flicker 4'te bir kesiyor.)
+    # -----------------------------------------------------------------
+    print("\nS35: Statik-iniş algı flicker'ı altında → yine dur")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 0.8
+    bb.obs.speed_kmh = 0.0
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S35-mühür", "acildurus")
+    bb.state.emergency_latch_start_s = time.time() - (float(sc34["min_muhur_s"]) + 5.0)
+    for i in range(int(sc34["d_arc_sabit_ticks"]) * 2 + 5):
+        if i % 5 == 4:   # her 5. tick dropout
+            bb.obs.engel_present = False
+            bb.obs.engel_d_center = float("inf")
+        else:
+            bb.obs.engel_present = True
+            bb.obs.engel_d_center = 1.15
+        fresh_now(bb); tree.tick()
+    # Son tick'i finite d ile bitir (iniş o tick'te değerlendirilir)
+    bb.obs.engel_present = True; bb.obs.engel_d_center = 1.15
+    fresh_now(bb); tree.tick()
+    assert_karar("S35-iniş", "dur")
+    if not bb.state.emergency_latched:
+        failures.append("[S35] flicker mührü çözmemeliydi (release 8 ardışık temiz tick ister)")
+        print("  ✗ S35: mühür çözülmüş")
+    else:
+        print("  ✓ S35: mühür açık kaldı, dropout'lar inişi engellemedi")
+
     print("\n" + "=" * 50)
     if failures:
         print(f"FAIL: {len(failures)} senaryo başarısız")

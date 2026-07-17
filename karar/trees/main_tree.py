@@ -93,6 +93,10 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         release_clear_ticks=emer["release_clear_ticks"],
         yaya_esik=dist["yaya_acil_durus_m"] * 1.5,   # mührün çözülmesi için biraz daha geniş
         engel_esik=engel_acil_m * 1.5,
+        # P0 №3 (E8-R1): statik engelde mühürden 'dur'a iniş — control'ün
+        # DUR-kaçışıyla (P0 №1) birlikte kilit kırıcı; params.yaml'dan kapılı.
+        statik_cozme=emer.get("statik_cozme", {}),
+        odom_max_age_s=odom_age,
     )
 
     # ============================================================

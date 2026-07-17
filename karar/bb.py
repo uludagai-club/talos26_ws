@@ -87,6 +87,11 @@ class StatePersist:
     # Emergency latch
     emergency_latched: bool = False
     emergency_clear_streak: int = 0
+    # Statik-durum çözme yolu (P0 №3, inceleme 2026-07-16 E8-R1):
+    # LatchEmergency kurar, ReleaseEmergencyIfClear okur/günceller.
+    emergency_latch_start_s: float = 0.0      # mührün kurulduğu an (time.time)
+    emergency_d_arc_ref: float = _INF         # d_arc sabitlik takibi referansı
+    emergency_d_arc_stable_ticks: int = 0     # d_arc referans ± tolerans içinde kalınan ardışık tick
 
     # DUR levhası FSM: "idle" | "holding" | "released"
     stop_sign_phase: str = "idle"

@@ -161,6 +161,24 @@ debounce:
 # Emergency latch
 emergency:
   release_clear_ticks: 8   # 8 tick (~0.8s) net olunca acil mühür çözülür
+  # ---------------------------------------------------------------------
+  # Statik-durum çözme yolu (P0 №3, inceleme 2026-07-16 E8-R1)
+  # ---------------------------------------------------------------------
+  # Bırakma eşiği (d_arc ≥ engel_acil×1.5 = 1.8 m) STATİK yakın engelde
+  # (gözlenen 1.1-1.35 m) araç kımıldayamadığı için sağlanamıyordu → kalıcı
+  # acildurus kilidi (9 koşunun 5'i, sürenin ~%50'si). Koşullar sağlanınca
+  # mühür AÇIK KALIR (anında yeniden-mühür döngüsü yok) ama karar 'dur'a
+  # iner (reason: muhur_statik_dur) → control'ün reason-filtreli DUR-kaçışı
+  # (control.py DUR_KACIS_*) aracı geri çeker. control tarafındaki P0 №1
+  # OLMADAN tek başına anlamsızdır (araç dur'da da kımıldamaz, ama en
+  # azından %100 yerine %80 fren + izlenebilir reason üretir).
+  statik_cozme:
+    enabled:           true
+    min_muhur_s:       15.0   # mühür en az bu süredir kapalı olmalı
+    max_speed_kmh:     0.3    # araç fiilen hareketsiz (odom taze şart)
+    d_arc_sabit_ticks: 30     # d_arc bu kadar ardışık tick (~3 s @10Hz) tolerans içinde
+    d_arc_sabit_tol_m: 0.4    # sabitlik toleransı (duran araçta ölçüm jitter'ı ±0.2-0.4 m)
+    d_arc_min_m:       1.0    # güvenli taban: bunun altında (burun buruna) iniş YOK
 
 # Engel kaynağı — iki arayüz desteklenir, otomatik failover ile:
 #   1) YENI: talos_obstacle_detector → /obstacles/poses (geometry_msgs/PoseArray)

@@ -59,6 +59,12 @@ class LatchEmergency(py_trees.behaviour.Behaviour):
         self.reason = reason
 
     def update(self):
+        # Bu node yalnız mühür KAPALIYKEN tick'lenir (mühür açıkken üstteki
+        # ReleaseEmergencyIfClear SUCCESS döner ve selector keser) → burası
+        # daima "yeni mühür" anıdır: statik-çözme takibi sıfırdan başlar (P0 №3).
+        self.bb.state.emergency_latch_start_s = time.time()
+        self.bb.state.emergency_d_arc_ref = float("inf")
+        self.bb.state.emergency_d_arc_stable_ticks = 0
         self.bb.state.emergency_latched = True
         self.bb.state.emergency_clear_streak = 0
         self.bb.last_decision = {
@@ -72,14 +78,67 @@ class LatchEmergency(py_trees.behaviour.Behaviour):
 
 class ReleaseEmergencyIfClear(py_trees.behaviour.Behaviour):
     """Mühür kapalıyken NoOp. Açıkken: tüm tehlikeler temiz mi diye bakar;
-    N tick üst üste temizse mührü çözer."""
+    N tick üst üste temizse mührü çözer.
 
-    def __init__(self, bb: Blackboard, release_clear_ticks: int, yaya_esik: float, engel_esik: float):
+    Statik-durum çözme yolu (P0 №3, inceleme 2026-07-16 E8-R1, param-kapılı):
+    Bırakma eşiği (d_arc ≥ engel_esik) STATİK yakın engelde yapısal olarak
+    sağlanamaz — acil'de control steer=0 yollar, d_arc /cart steer'inden
+    hesaplandığı için düz-koridor mesafesine donar ve araç kımıldayamadığı
+    için mesafe hiç büyümez (9 koşunun 5'i kalıcı kilit, sürenin ~%50'si).
+    Mühür uzun süredir kapalı + araç hareketsiz + d_arc stabil + güvenli
+    tabanın ÜSTÜNDEyse: mühür AÇIK KALIR (tam çözülme yok → EngelCokYakin+
+    Debounce'un anında yeniden mühürleme döngüsü kurulmaz) ama karar
+    'acildurus' yerine 'dur'a İNER (reason: muhur_statik_dur) → control'ün
+    reason-filtreli DUR-kaçışı (P0 №1) aracı geri çekebilir; kalıcı çözülme
+    araç uzaklaşınca normal d_arc yolundan gelir."""
+
+    def __init__(self, bb: Blackboard, release_clear_ticks: int, yaya_esik: float, engel_esik: float,
+                 statik_cozme: dict = None, odom_max_age_s: float = 0.5):
         super().__init__("ReleaseEmergencyIfClear")
         self.bb = bb
         self.release_clear_ticks = int(release_clear_ticks)
         self.yaya_esik = yaya_esik
         self.engel_esik = engel_esik
+        sc = statik_cozme or {}
+        self.statik_enabled = bool(sc.get("enabled", False))
+        self.statik_min_muhur_s = float(sc.get("min_muhur_s", 15.0))
+        self.statik_max_speed_kmh = float(sc.get("max_speed_kmh", 0.3))
+        self.statik_d_arc_ticks = int(sc.get("d_arc_sabit_ticks", 30))
+        self.statik_d_arc_tol_m = float(sc.get("d_arc_sabit_tol_m", 0.4))
+        self.statik_d_arc_min_m = float(sc.get("d_arc_min_m", 1.0))
+        self.odom_max_age_s = float(odom_max_age_s)
+
+    def _statik_dur_kosullari(self) -> bool:
+        """Statik-durum inişinin tüm kapıları (mühür açıkken her tick çağrılır).
+        d_arc sabitlik sayacını da burada ilerletir/sıfırlar."""
+        o = self.bb.obs
+        s = self.bb.state
+        d = o.engel_d_arc
+        # Sabitlik takibi: referans ± tolerans içinde kal → say; kır → referansı tazele.
+        # Tolerans, duran araçta gözlenen detektör jitter'ına göre geniş (±0.2-0.4 m);
+        # gerçek hareketli nesne (yaya ~1 m/s) 3 s pencerede bandı kesin kırar.
+        # DROPOUT TOLERANSI (canlı doğrulama 2026-07-17, ros 263-357 mühürü):
+        # tek-tick algı dropout'u (d_arc=inf, E3 flicker'ı ~1-2 Hz) sayacı
+        # SIFIRLAMAZ — dropout "sahne değişti" kanıtı değildir; sıfırlasaydı
+        # 30 ardışık tick hiç birikmez, statik yol hiç açılmazdı. Engelin
+        # gerçekten temizlenmesi normal release yolunun işi (8 temiz tick).
+        if math.isfinite(d):
+            if (math.isfinite(s.emergency_d_arc_ref)
+                    and abs(d - s.emergency_d_arc_ref) <= self.statik_d_arc_tol_m):
+                s.emergency_d_arc_stable_ticks += 1
+            else:
+                s.emergency_d_arc_ref = d
+                s.emergency_d_arc_stable_ticks = 0
+        if not self.statik_enabled:
+            return False
+        now = time.time()
+        odom_taze = (now - o.odom_last_seen) <= self.odom_max_age_s
+        return (now - s.emergency_latch_start_s >= self.statik_min_muhur_s
+                and odom_taze
+                and abs(o.speed_kmh) <= self.statik_max_speed_kmh
+                and s.emergency_d_arc_stable_ticks >= self.statik_d_arc_ticks
+                and math.isfinite(d)
+                and d >= self.statik_d_arc_min_m)
 
     def update(self):
         if not self.bb.state.emergency_latched:
@@ -102,8 +161,21 @@ class ReleaseEmergencyIfClear(py_trees.behaviour.Behaviour):
         if self.bb.state.emergency_clear_streak >= self.release_clear_ticks:
             self.bb.state.emergency_latched = False
             self.bb.state.emergency_clear_streak = 0
+            self.bb.state.emergency_d_arc_ref = float("inf")
+            self.bb.state.emergency_d_arc_stable_ticks = 0
             # Mühür çözüldü ama bu tick hâlâ "acildurus" değil — alt dallar konuşsun.
             return Status.FAILURE  # üst selector bir sonraki dalı denesin
+
+        # P0 №3: statik-durum inişi — mühür açık kalır, karar 'dur'a iner.
+        # Yaya temiz DEĞİLSE inilmez (yaya bağlamında tam fren korunur).
+        if yaya_clear and self._statik_dur_kosullari():
+            self.bb.last_decision = {
+                "karar": "dur",
+                "reason": "muhur_statik_dur",
+                "phase": "emergency",
+                "wait_remaining_s": 0.0,
+            }
+            return Status.SUCCESS
 
         # Mühür hâlâ kapalı → acildurus yay
         self.bb.last_decision = {
