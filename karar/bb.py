@@ -86,7 +86,8 @@ class StatePersist:
 
     # Emergency latch
     emergency_latched: bool = False
-    emergency_clear_streak: int = 0
+    emergency_clear_streak: int = 0          # her tür temizlik (yokluk dahil) ardışık tick
+    emergency_clear_streak_olculu: int = 0   # yalnız ÖLÇÜLÜ temizlik (d_arc≥eşik) ardışık tick (P1 №7)
     # Statik-durum çözme yolu (P0 №3, inceleme 2026-07-16 E8-R1):
     # LatchEmergency kurar, ReleaseEmergencyIfClear okur/günceller.
     emergency_latch_start_s: float = 0.0      # mührün kurulduğu an (time.time)

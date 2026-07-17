@@ -277,13 +277,21 @@ def run_scenarios():
     # S14: Emergency latch RELEASE — tehlike geçince mühür çözülür → normal
     # -----------------------------------------------------------------
     print("\nS14: Acil mühür sonra temiz → release")
-    # S13'ün mührü hâlâ kapalı; ortamı temizle ve release_clear_ticks kadar tick'le
+    # S13'ün mührü hâlâ kapalı; ortamı temizle. Temizlik YOKLUK yoluyla
+    # (engel_present=0) geldiğinden P1 №7 gereği uzun eşik geçerli:
+    # release_yokluk_ticks (20) — dropout'un mührü erken çözmesi kapatıldı.
     n_release = cfg["emergency"]["release_clear_ticks"]
+    n_yokluk = int(cfg["emergency"].get("release_yokluk_ticks", n_release))
     bb.obs.engel_present = False
     bb.obs.engel_d_center = float("inf")
     bb.obs.yaya_present = False
     bb.obs.yaya_distance = -1.0
+    # Eski (ölçülü) eşik kadar tick'te HÂLÂ mühürlü olmalı (yokluk ≠ ölçülü kanıt)
     for _ in range(n_release + 2):
+        fresh_now(bb); tree.tick()
+    assert_karar("S14-erken", "acildurus")
+    # Yokluk eşiği dolunca çözülür
+    for _ in range(n_yokluk):
         fresh_now(bb); tree.tick()
     assert_karar("S14", "normal")
 

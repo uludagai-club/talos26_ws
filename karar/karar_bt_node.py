@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+from collections import deque
 
 import rospy
 import yaml
@@ -26,6 +27,7 @@ from ros_bridge import RosBridge
 from trees.main_tree import build_root
 from reroute import RerouteManager, RerouteParams
 from levha_kisit import LevhaKisitManager, LevhaKisitParams
+from cikis_debounce import CikisDebounce
 
 # talos_common bind-mount: /app/talos_common
 try:
@@ -106,6 +108,21 @@ def main():
     tick_count = 0
     ascii_every_n = int(p.get("debug", {}).get("ascii_tree_log_every_n_tick", 0) or 0)
 
+    # P1 №6 (E3-O2): yayın-öncesi asimetrik çıkış-debounce — yükselen karar
+    # ANINDA, alçalan karar K tick istikrar sonrası. Yayından ÖNCE
+    # bb.last_decision'ı mutasyonlar → RerouteManager/CSV/trace debounced görür.
+    cikis_deb = CikisDebounce(int(p.get("debounce", {}).get("cikis_debounce_ticks", 3)))
+
+    # Churn anomali dedektörü (kullanıcı 2026-07-17; rapor Ek A KARAR_CHURN
+    # eşiğiyle aynı): kayan pencerede aşırı YAYINLANAN karar değişimi = anomali
+    # → events.jsonl + tlog WARN + rospy.logwarn. Debounce'tan SONRA ölçülür
+    # (downstream'in gerçekten gördüğü churn); uyarı pencere başına en çok bir kez.
+    an_cfg = p.get("anomali", {}) or {}
+    churn_pencere_s = float(an_cfg.get("churn_pencere_s", 10.0))
+    churn_esik = int(an_cfg.get("churn_esik", 5))
+    churn_zamanlari = deque()
+    churn_son_uyari = 0.0
+
     while not rospy.is_shutdown():
         # 1) Ağacı bir tick ileri sür
         try:
@@ -120,6 +137,9 @@ def main():
                 "phase": "fault",
                 "wait_remaining_s": 0.0,
             }
+
+        # 1.5) Çıkış-debounce (P1 №6) — YAYIN ÖNCESİ mutasyon (E3-O2 nüansı)
+        bb.last_decision = cikis_deb.filtre(bb.last_decision)
 
         # 2) Karar yayını (her tick)
         bridge.publish_decision()
@@ -243,6 +263,28 @@ def main():
                         return_dist_m=round(bb.state.overtake_return_dist_m, 2),
                     )
             last_logged_karar = karar
+
+            # 5b) CHURN ANOMALİSİ: kayan pencerede aşırı karar değişimi.
+            # Değişim anları penceresi (yalnız değişim tick'lerinde güncellenir).
+            churn_zamanlari.append(now)
+            while churn_zamanlari and now - churn_zamanlari[0] > churn_pencere_s:
+                churn_zamanlari.popleft()
+            if (len(churn_zamanlari) >= churn_esik
+                    and now - churn_son_uyari > churn_pencere_s):
+                churn_son_uyari = now
+                churn_msg = (f"ANOMALI karar_churn: {len(churn_zamanlari)} değişim / "
+                             f"{churn_pencere_s:.0f} s (eşik {churn_esik}); son: {karar}"
+                             f" ({d.get('reason', '')})")
+                rospy.logwarn(f"[karar_bt] {churn_msg}")
+                if tlog is not None:
+                    tlog.event("WARN", churn_msg, decision_id=decision_id)
+                if klog is not None:
+                    klog.log_event("anomali_karar_churn",
+                                   adet=len(churn_zamanlari),
+                                   pencere_s=churn_pencere_s,
+                                   esik=churn_esik,
+                                   son_karar=karar,
+                                   son_reason=d.get("reason", ""))
 
         tick_count += 1
         rate.sleep()

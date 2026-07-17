@@ -97,6 +97,8 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         # DUR-kaçışıyla (P0 №1) birlikte kilit kırıcı; params.yaml'dan kapılı.
         statik_cozme=emer.get("statik_cozme", {}),
         odom_max_age_s=odom_age,
+        # P1 №7 (E5-O3): yokluk-temizliği (dropout olabilir) için ayrı uzun eşik
+        release_yokluk_ticks=emer.get("release_yokluk_ticks"),
     )
 
     # ============================================================

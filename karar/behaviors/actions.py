@@ -67,6 +67,7 @@ class LatchEmergency(py_trees.behaviour.Behaviour):
         self.bb.state.emergency_d_arc_stable_ticks = 0
         self.bb.state.emergency_latched = True
         self.bb.state.emergency_clear_streak = 0
+        self.bb.state.emergency_clear_streak_olculu = 0
         self.bb.last_decision = {
             "karar": "acildurus",
             "reason": f"emergency_latch:{self.reason}",
@@ -93,10 +94,16 @@ class ReleaseEmergencyIfClear(py_trees.behaviour.Behaviour):
     araç uzaklaşınca normal d_arc yolundan gelir."""
 
     def __init__(self, bb: Blackboard, release_clear_ticks: int, yaya_esik: float, engel_esik: float,
-                 statik_cozme: dict = None, odom_max_age_s: float = 0.5):
+                 statik_cozme: dict = None, odom_max_age_s: float = 0.5,
+                 release_yokluk_ticks: int = None):
         super().__init__("ReleaseEmergencyIfClear")
         self.bb = bb
         self.release_clear_ticks = int(release_clear_ticks)
+        # P1 №7 (E5-O3): "temiz"in kaynağı ayrık — yokluk-temizliği (engel_present=0;
+        # detektör dropout'u da olabilir) için daha uzun eşik. None → eski davranış.
+        self.release_yokluk_ticks = int(release_yokluk_ticks
+                                        if release_yokluk_ticks is not None
+                                        else release_clear_ticks)
         self.yaya_esik = yaya_esik
         self.engel_esik = engel_esik
         sc = statik_cozme or {}
@@ -151,16 +158,28 @@ class ReleaseEmergencyIfClear(py_trees.behaviour.Behaviour):
         # temizleyen bir yaya çevirdiyse (d_arc=inf ya da ≥ eşik) mühür çözülür;
         # ölü-merkez engel her direksiyonda bant içinde kalır → mühür durur.
         engel_d_valid = math.isfinite(o.engel_d_center)
-        engel_clear = (not o.engel_present) or (engel_d_valid and o.engel_d_arc >= self.engel_esik)
+        # P1 №7 (E5-O3): iki AYRI temizlik kaynağı, iki ayrı sayaç.
+        #   ölçülü  = engel VAR ama d_arc ≥ eşik (gerçek geometrik kanıt) → 8 tick
+        #   yokluk  = engel_present=0 (temiz de olabilir, dropout da!)     → 20 tick
+        # 20260716 vakası: 6.6-7 s'lik detektör dropout'u mührü 8 tick'te YANLIŞ
+        # anda çözdü → araç koniye ilerledi → yeniden mühür (E5 flip döngüsü).
+        engel_olculu_clear = o.engel_present and engel_d_valid and o.engel_d_arc >= self.engel_esik
+        engel_yokluk = not o.engel_present
 
-        if yaya_clear and engel_clear:
+        if yaya_clear and (engel_olculu_clear or engel_yokluk):
             self.bb.state.emergency_clear_streak += 1
         else:
             self.bb.state.emergency_clear_streak = 0
+        if yaya_clear and engel_olculu_clear:
+            self.bb.state.emergency_clear_streak_olculu += 1
+        else:
+            self.bb.state.emergency_clear_streak_olculu = 0
 
-        if self.bb.state.emergency_clear_streak >= self.release_clear_ticks:
+        if (self.bb.state.emergency_clear_streak_olculu >= self.release_clear_ticks
+                or self.bb.state.emergency_clear_streak >= self.release_yokluk_ticks):
             self.bb.state.emergency_latched = False
             self.bb.state.emergency_clear_streak = 0
+            self.bb.state.emergency_clear_streak_olculu = 0
             self.bb.state.emergency_d_arc_ref = float("inf")
             self.bb.state.emergency_d_arc_stable_ticks = 0
             # Mühür çözüldü ama bu tick hâlâ "acildurus" değil — alt dallar konuşsun.

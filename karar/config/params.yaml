@@ -46,7 +46,12 @@ tick_hz: 10.0
 freshness:
   yaya_max_age_s:   0.6
   levha_max_age_s:  0.6
-  engel_max_age_s:  0.4
+  # P1 №5 (inceleme 2026-07-16 E3-O1): 0.4→0.7. /obstacles/poses mesaj periyodu
+  # (~0.4 s) eski eşikle ÇAKIŞIYORDU → her mesaj döngüsünde tam 1 tick "bayat"
+  # → EngelFresh düşer → tek-tick cruise flicker'ı (churn bölütlerinin 2/3'ü).
+  # 0.7 > new_source_max_age_s (0.5) olduğundan 0.4-0.5 s'lik legacy-failover
+  # ölü bölgesi de kendiliğinden kapanır.
+  engel_max_age_s:  0.7
   lane_max_age_s:   0.8
   odom_max_age_s:   0.5
   hedef_max_age_s:  2.0
@@ -157,10 +162,26 @@ debounce:
   yaya_min_consecutive:     2
   engel_min_consecutive:    2
   levha_min_consecutive:    2
+  # P1 №6 (E3-O2): yayın-öncesi ASİMETRİK çıkış-debounce. Yükselen karar
+  # (slow→dur, →acildurus) ANINDA geçer; alçalan karar (dur→normal) ancak bu
+  # kadar tick üst üste istikrarlıysa geçer (0 = kapalı). bkz. cikis_debounce.py
+  cikis_debounce_ticks:     3
+
+# Churn anomali dedektörü (kayan pencere; rapor Ek A KARAR_CHURN eşiğiyle aynı).
+# Debounce SONRASI yayınlanan değişimleri sayar → events.jsonl 'anomali_karar_churn'
+# + talos_common WARN + rospy.logwarn (pencere başına en çok bir uyarı).
+anomali:
+  churn_pencere_s: 10.0
+  churn_esik:      5
 
 # Emergency latch
 emergency:
-  release_clear_ticks: 8   # 8 tick (~0.8s) net olunca acil mühür çözülür
+  release_clear_ticks: 8   # ÖLÇÜLÜ temizlik (engel var ama d_arc ≥ eşik): 8 tick (~0.8s)
+  # P1 №7 (E5-O3): "temiz"in kaynağı ayrıldı. YOKLUK temizliği (engel_present=0,
+  # yani detektör dropout'u da olabilir) için ayrı, daha uzun eşik — 20260716
+  # vakasında 6.6-7 s'lik dropout mührü YANLIŞ anda çözdü, araç koniye ilerledi,
+  # yeniden mühürlendi. Ölçülü temizlik (gerçek d_arc kanıtı) 8 tick'te kalır.
+  release_yokluk_ticks: 20  # yokluk-temizliği: 20 tick (~2s) kesintisiz "engel yok" ister
   # ---------------------------------------------------------------------
   # Statik-durum çözme yolu (P0 №3, inceleme 2026-07-16 E8-R1)
   # ---------------------------------------------------------------------
