@@ -184,10 +184,40 @@ Kurala göre:
 
 ---
 
+## Canlı Parametreler (docker restart GEREKTİRMEZ)
+
+Her servisin ayarlanabilir parametreleri kendi dosyasının **en üstündeki
+"AYARLANABİLİR PARAMETRELER" bloğunda** yaşar (hedef_yoneticisi.py stili).
+Saha testinde bir parametreyi **restart'sız** değiştirmek için:
+
+1. `config/canli_params.yaml` dosyasını aç, ilgili servisin bölümünde
+   satırın yorumunu kaldır, değeri yaz, kaydet.
+2. ~1 sn içinde uygulanır; servis logunda görürsün:
+   `[canli_params][control] MAX_SPEED_KMH: 5.0 → 3.0`
+3. Satırı tekrar yoruma alınca kod içindeki varsayılana geri döner.
+
+Mekanizma: `talos_common/canli_params.py` dosya mtime'ını izler ve yalnız
+override eder — YAML boşken davranış birebir eskisi gibidir; dosya bozuksa
+eski değerler korunur (node asla düşmez). Güvenlik-kritik parametreler
+(hız, güç limiti) kod içinde tanımlı sınırlara kelepçelenir.
+
+**İstisnalar:**
+- `karar-node`: parametreleri `karar/config/params.yaml`'da ve BT kurulumuna
+  gömülü → düzenle + `docker compose restart karar-node` (~2 sn).
+- YAML içinde `(RESTART)` işaretli parametreler (örn. hedef'in graf-kurulum
+  cezaları, topic adları, `LOOP_RATE_HZ`) başlangıçta bir kez okunur →
+  ilgili servisi restart et.
+- `baslat.sh` her koşuda dosyanın başlangıç/bitiş kopyasını
+  `logs/$RUN_ID/system/` altına arşivler (test hangi ayarla koştu, kaybolmaz).
+
+---
+
 ## Hangi Dosyayı Değiştirince Ne Olur
 
 | Değişen Dosya | İlgili Servis | Rebuild Gerekir mi? |
 |---------------|---------------|---------------------|
+| `config/canli_params.yaml` | **tüm servisler** (karar hariç) | Hayır — **restart bile gerekmez** (~1 sn'de canlı uygulanır) |
+| `talos_common/canli_params.py` | tüm servisler | Hayır (restart yeter) |
 | `hedef/hedef_yoneticisi.py` | `hedef-teslimi` | Hayır |
 | `konum/konum.py` | `konum-server` | Hayır |
 | `maps/waypoint_pub.py` | `talos-map-server` | Hayır |

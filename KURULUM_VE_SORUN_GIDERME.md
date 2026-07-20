@@ -234,6 +234,27 @@ docker compose up
 
 > **Not:** `baslat.sh` daha güvenilirdir çünkü sıralı başlatma ve sağlık kontrolleri yapar.
 
+### Canlı parametre değiştirme (restart'sız)
+
+Sistem çalışırken bir servisin parametresini değiştirmek için container'ı
+yeniden başlatmana gerek yok:
+
+```bash
+# 1. Dosyayı aç, ilgili servis bölümünde satırın yorumunu kaldır, değeri yaz:
+nano ~/talos-sim/scripts/talos26_ws/config/canli_params.yaml
+#    ör.  control:
+#           MAX_SPEED_KMH: 3.0
+
+# 2. Kaydet — ~1 sn içinde uygulanır. Doğrulamak için servis loguna bak:
+docker logs -f talos-controller | grep canli_params
+#    [canli_params][control] MAX_SPEED_KMH: 5.0 → 3.0
+```
+
+Satırı tekrar yoruma alınca kod içindeki varsayılana döner. Varsayılanlar her
+servisin dosyasının en üstündeki "AYARLANABİLİR PARAMETRELER" bloğundadır.
+İstisnalar: `karar-node` (params.yaml + restart) ve YAML'da `(RESTART)`
+işaretli parametreler. Detay: `README.md → Canlı Parametreler`.
+
 ---
 
 ## 5. Sık Karşılaşılan Sorunlar

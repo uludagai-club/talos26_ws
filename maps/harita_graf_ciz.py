@@ -4,11 +4,18 @@ Harita yapisini cikaran basit gorsellestirme scripti.
 
 Occupancy haritasi (my_map.pgm + my_map.yaml) ile yol grafini
 (final_graph.yaml) ayni dunya koordinat sisteminde ust uste bindirip
-tek bir PNG olarak kaydeder. ROS gerekmez, standalone calisir.
+tek bir PGM (P5, gri-tonlamali) olarak kaydeder. ROS ve matplotlib
+gerekmez, standalone calisir; grafi occupancy grid'in kendi cozunurlugunde
+piksellere dogrudan "yakar".
+
+Cikti PGM oldugu icin renk yoktur:
+    - kenarlar orta gri (--kenar-gri, varsayilan 128)
+    - dugumler siyah   (--dugum-gri, varsayilan 0)
+arka plan occupancy grid'in orijinal gri tonlaridir (0=dolu, 255=bos).
 
 Kullanim (maps/ klasoru icinden ya da herhangi bir yerden):
     python3 harita_graf_ciz.py
-    python3 harita_graf_ciz.py --cikti /tmp/harita.png --goster
+    python3 harita_graf_ciz.py --cikti /tmp/harita.pgm --goster
 
 Girdi dosyalari ayni klasorde varsayilir; --harita / --graf ile degistirilebilir.
 """
@@ -16,19 +23,16 @@ import argparse
 import os
 
 import yaml
-import numpy as np
-from PIL import Image
-import matplotlib
-import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw
 
 BURASI = os.path.dirname(os.path.abspath(__file__))
 
 
 def harita_yukle(harita_yaml):
-    """my_map.yaml + .pgm dosyasini okuyup (goruntu, extent) doner.
+    """my_map.yaml + .pgm dosyasini okuyup (goruntu, res, ox, oy) doner.
 
-    extent = [x_min, x_max, y_min, y_max] dunya (metre) koordinatinda;
-    matplotlib imshow icin origin='upper' ile kullanilir.
+    goruntu: 'L' modunda PIL Image (0=dolu/siyah .. 255=bos/beyaz).
+    res: metre/piksel; (ox, oy): sol-alt piksele denk gelen dunya origin'i.
     """
     with open(harita_yaml) as f:
         meta = yaml.safe_load(f)
@@ -41,13 +45,8 @@ def harita_yukle(harita_yaml):
     if not os.path.isabs(pgm_yolu):
         pgm_yolu = os.path.join(os.path.dirname(harita_yaml), pgm_yolu)
 
-    img = np.asarray(Image.open(pgm_yolu))          # 0=dolu(siyah) .. 255=bos(beyaz)
-    h, w = img.shape[:2]
-
-    # ROS harita kuralı: sol-alt piksel = origin. origin='upper' ile
-    # goruntu satir 0 (ust) y_max'a denk gelir.
-    extent = [ox, ox + w * res, oy, oy + h * res]
-    return img, extent
+    img = Image.open(pgm_yolu).convert("L")         # gri-tonlama garanti
+    return img, res, ox, oy
 
 
 def graf_yukle(graf_yaml):
@@ -59,55 +58,67 @@ def graf_yukle(graf_yaml):
     return dugum, kenar
 
 
-def ciz(harita_yaml, graf_yaml, cikti, goster):
-    img, extent = harita_yukle(harita_yaml)
+def dunya_to_piksel(x, y, res, ox, oy, h):
+    """Dunya (metre) -> piksel (kolon j, satir i).
+
+    ROS harita kurali: sol-alt piksel = origin (ox, oy) ve goruntu ust
+    satirdan asagi saklanir, yani satir 0 (ust) en buyuk y'ye denk gelir.
+    """
+    j = (x - ox) / res
+    i = h - (y - oy) / res
+    return (j, i)
+
+
+def ciz(harita_yaml, graf_yaml, cikti, goster, kenar_gri, dugum_gri,
+        kenar_kalinlik, dugum_yaricap):
+    img, res, ox, oy = harita_yukle(harita_yaml)
     dugum, kenar = graf_yukle(graf_yaml)
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
 
-    fig, ax = plt.subplots(figsize=(12, 12))
-
-    # 1) Arka plan: occupancy grid (gri)
-    ax.imshow(img, cmap="gray", origin="upper", extent=extent, zorder=0)
-
-    # 2) Kenarlar (mavi cizgiler)
+    # 1) Kenarlar (orta gri cizgiler)
     for u, v in kenar:
         if u in dugum and v in dugum:
             x0, y0 = dugum[u]
             x1, y1 = dugum[v]
-            ax.plot([x0, x1], [y0, y1], "-", color="#1f77b4",
-                    linewidth=0.8, alpha=0.7, zorder=1)
+            p0 = dunya_to_piksel(x0, y0, res, ox, oy, h)
+            p1 = dunya_to_piksel(x1, y1, res, ox, oy, h)
+            draw.line([p0, p1], fill=kenar_gri, width=kenar_kalinlik)
 
-    # 3) Dugumler (kirmizi noktalar)
-    xs = [p[0] for p in dugum.values()]
-    ys = [p[1] for p in dugum.values()]
-    ax.scatter(xs, ys, s=6, c="red", zorder=2)
+    # 2) Dugumler (siyah noktalar)
+    r = dugum_yaricap
+    for (x, y) in dugum.values():
+        j, i = dunya_to_piksel(x, y, res, ox, oy, h)
+        draw.ellipse([j - r, i - r, j + r, i + r], fill=dugum_gri)
 
-    ax.set_title(f"Harita + yol grafi  |  {len(dugum)} dugum, {len(kenar)} kenar")
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
-    ax.set_aspect("equal")
-    ax.grid(True, linestyle=":", alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(cikti, dpi=150)
-    print(f"Kaydedildi: {cikti}  ({len(dugum)} dugum, {len(kenar)} kenar)")
+    img.save(cikti)   # 'L' modu + .pgm uzantisi -> P5 (binary PGM)
+    print(f"Kaydedildi: {cikti}  ({w}x{h} px, {len(dugum)} dugum, "
+          f"{len(kenar)} kenar)")
     if goster:
-        plt.show()
+        img.show()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Harita + graf gorsellestirme")
+    ap = argparse.ArgumentParser(description="Harita + graf -> PGM gorsellestirme")
     ap.add_argument("--harita", default=os.path.join(BURASI, "my_map.yaml"),
                     help="occupancy harita yaml (my_map.yaml)")
     ap.add_argument("--graf", default=os.path.join(BURASI, "final_graph.yaml"),
                     help="yol grafi yaml (final_graph.yaml)")
-    ap.add_argument("--cikti", default=os.path.join(BURASI, "harita_graf.png"),
-                    help="cikti PNG yolu")
+    ap.add_argument("--cikti", default=os.path.join(BURASI, "harita_graf.pgm"),
+                    help="cikti PGM yolu")
     ap.add_argument("--goster", action="store_true", help="pencerede goster")
+    ap.add_argument("--kenar-gri", type=int, default=128,
+                    help="kenar cizgilerinin gri tonu (0-255)")
+    ap.add_argument("--dugum-gri", type=int, default=0,
+                    help="dugum noktalarinin gri tonu (0-255)")
+    ap.add_argument("--kenar-kalinlik", type=int, default=1,
+                    help="kenar cizgi kalinligi (piksel)")
+    ap.add_argument("--dugum-yaricap", type=int, default=2,
+                    help="dugum nokta yaricapi (piksel)")
     args = ap.parse_args()
 
-    if not args.goster:
-        matplotlib.use("Agg")   # basssiz ortamda (Docker/SSH) calissin
-    ciz(args.harita, args.graf, args.cikti, args.goster)
+    ciz(args.harita, args.graf, args.cikti, args.goster,
+        args.kenar_gri, args.dugum_gri, args.kenar_kalinlik, args.dugum_yaricap)
 
 
 if __name__ == "__main__":
