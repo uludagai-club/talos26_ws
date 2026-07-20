@@ -25,10 +25,20 @@ NC='\033[0m'
 # (bkz. docker-compose.beemobs.yml). TEK LAUNCHER kuralı: elle çift -f
 # komutu yalnız hata ayıklama içindir, normal akış bu script üzerindendir.
 # =============================================================
+# TALOS_ARAC=1 → GERÇEK ARAÇ modu: beemobs katmanı otomatik devreye girer ve
+# state-bridge (Bee1 Gazebo EMÜLATÖRÜ) BAŞLATILMAZ — gerçek ECU feedback'iyle aynı
+# topic'lere binip sahte hız/açı/e-stop üretir (bkz. docker-compose.beemobs.yml başlığı).
+if [ "${TALOS_ARAC:-0}" = "1" ]; then
+    TALOS_BEEMOBS=1
+fi
+
 COMPOSE_FILES="-f docker-compose.yml"
 if [ "${TALOS_BEEMOBS:-0}" = "1" ]; then
     COMPOSE_FILES="$COMPOSE_FILES -f docker-compose.beemobs.yml"
     echo -e "${CYAN}[beemobs modu] docker-compose.beemobs.yml katmanı devrede (can-bridge/state-bridge -> beemobs_*).${NC}"
+fi
+if [ "${TALOS_ARAC:-0}" = "1" ]; then
+    echo -e "${RED}[ARAÇ MODU] Gerçek araç: state-bridge (sim emülatörü) BAŞLATILMAYACAK.${NC}"
 fi
 
 # =============================================================
@@ -49,6 +59,9 @@ echo -e "${CYAN}======================================================${NC}"
 # =============================================================
 cleanup() {
     echo -e "\n${BLUE}[*] Sistem kapatiliyor...${NC}"
+
+    # Oto-restart gözcüsü (docker restart olaylarını izleyen arka plan döngüsü)
+    [ -n "${GOZCU_PID:-}" ]   && kill "$GOZCU_PID"   2>/dev/null
 
     # Background python köprüleri (geriye dönük uyumluluk için)
     [ -n "${BRIDGE_PID:-}" ]  && kill "$BRIDGE_PID"  2>/dev/null
@@ -79,6 +92,10 @@ cleanup() {
         END_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
         sed -i "s/\"ended_at\": *null/\"ended_at\": \"$END_AT\"/" "$RUN_DIR/manifest.json" 2>/dev/null
     fi
+
+    # Canlı parametre dosyasının koşu-SONU hali (başlangıç kopyasıyla diff'lenir)
+    [ -f "$SCRIPT_DIR/config/canli_params.yaml" ] && \
+        cp "$SCRIPT_DIR/config/canli_params.yaml" "$RUN_DIR/system/canli_params.bitis.yaml" 2>/dev/null
 
     # B2 fix: konteyner root olusturdugu dosyalari kullaniciya geri ver
     # RUN_DIR + hedef-teslimi'nin tani loglari (hedef/logs) chown'lanir
@@ -120,6 +137,69 @@ write_manifest() {
 EOF
 }
 write_manifest
+
+# =============================================================
+# OTO-RESTART GÖZCÜSÜ (2026-07-15)
+# =============================================================
+# docker-compose.yml'de her servis `restart: "on-failure:5"` → çöken container'ı
+# Docker daemon en fazla 5 kez otomatik yeniden başlatır. Bu döngü RestartCount'ı
+# izleyip her restart'ı ve "5 denemede toparlanamadı" (vazgeçti) durumunu
+# logs/$RUN_ID/system/watchdog.log'a + terminale UYARI olarak yansıtır (restart'lar
+# sessiz kalmasın). Aktüasyon tier'ı (controller/can-bridge/state-bridge) KIRMIZI
+# işaretlenir: sim gaz-watchdog'u olmadığından o restart penceresinde araç son
+# gazla süzülmüş olabilir → operatör durumu doğrulasın.
+# 3 sn aralıkla `docker inspect` polling — çıktı yalnızca DEĞİŞİMDE üretilir (spam yok).
+GOZCU_AKTUASYON_RE='talos-controller|talos-can-bridge|talos-state-bridge'
+restart_gozcusu() {
+    declare -A _rc_seen        # container -> son görülen RestartCount (high-water)
+    declare -A _down_uyarildi  # container -> vazgeçme uyarısı bir kez basıldı mı
+    local wlog="$RUN_DIR/system/watchdog.log"
+    echo "# TALOS oto-restart gözcüsü başladı RUN_ID=$RUN_ID $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$wlog" 2>/dev/null
+    while true; do
+        local ids
+        ids=$(cd "$SCRIPT_DIR" && docker compose $COMPOSE_FILES ps -aq 2>/dev/null)
+        if [ -n "$ids" ]; then
+            while read -r cid; do
+                [ -n "$cid" ] || continue
+                local info name rc status ec ts
+                info=$(docker inspect -f '{{.Name}}|{{.RestartCount}}|{{.State.Status}}|{{.State.ExitCode}}' "$cid" 2>/dev/null) || continue
+                name=${info%%|*}; name=${name#/}
+                rc=$(printf '%s' "$info" | cut -d'|' -f2)
+                status=$(printf '%s' "$info" | cut -d'|' -f3)
+                ec=$(printf '%s' "$info" | cut -d'|' -f4)
+                [ -n "$rc" ] || rc=0
+                local prev=${_rc_seen[$name]:-0}
+                # Yeni bir otomatik restart olduysa
+                if [ "$rc" -gt "$prev" ] 2>/dev/null; then
+                    _rc_seen[$name]=$rc
+                    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                    if printf '%s' "$name" | grep -qE "$GOZCU_AKTUASYON_RE"; then
+                        echo -e "${RED}[GÖZCÜ $ts] ⚠ AKTÜASYON '$name' YENİDEN BAŞLATILDI ($rc/5, exit=$ec) — sim gaz-watchdog'u yok, araç süzülmüş olabilir; DURUMU KONTROL ET.${NC}"
+                    else
+                        echo -e "${YELLOW}[GÖZCÜ $ts] ↻ '$name' yeniden başlatıldı ($rc/5, exit=$ec)${NC}"
+                    fi
+                    echo "$ts RESTART $name count=$rc exit=$ec" >> "$wlog" 2>/dev/null
+                fi
+                # 5 denemede toparlanamadı → vazgeçti (bir kez uyar)
+                if [ "$rc" -ge 5 ] 2>/dev/null && { [ "$status" = "exited" ] || [ "$status" = "dead" ]; } && [ -z "${_down_uyarildi[$name]:-}" ]; then
+                    _down_uyarildi[$name]=1
+                    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+                    echo -e "${RED}[GÖZCÜ $ts] ❌ '$name' 5 denemede TOPARLANAMADI — DURDU (exit=$ec). Elle müdahale gerek.${NC}"
+                    echo "$ts GAVEUP $name exit=$ec" >> "$wlog" 2>/dev/null
+                fi
+                # Tekrar çalışır hale gelirse vazgeçme bayrağını temizle
+                if [ "$status" = "running" ] && [ -n "${_down_uyarildi[$name]:-}" ]; then
+                    unset "_down_uyarildi[$name]"
+                fi
+            done <<< "$ids"
+        fi
+        sleep 3
+    done
+}
+
+# Canlı parametre dosyasının koşu-BAŞI snapshot'ı (provenance — hangi ayarla sürüldü)
+[ -f "$SCRIPT_DIR/config/canli_params.yaml" ] && \
+    cp "$SCRIPT_DIR/config/canli_params.yaml" "$RUN_DIR/system/canli_params.baslangic.yaml" 2>/dev/null
 
 # =============================================================
 # 1) ROS ORTAMI
@@ -254,10 +334,26 @@ docker rm -f konum-server talos-map-server hedef_teslimi engel-node \
 
 # Karar/engel/talos-controller dahil tum servisler ayaga kalkar.
 # can-visualizer 'gui' profile altinda; --profile gui ile dahil ediliyor.
-docker compose $COMPOSE_FILES --profile gui up -d 2>&1 | tail -20
+# ARAÇ MODU (TALOS_ARAC=1): servis listesi compose'dan türetilir, state-bridge çıkarılır —
+# emülatör gerçek araçta ASLA kalkmasın (elle liste tutulmaz, drift olmaz).
+if [ "${TALOS_ARAC:-0}" = "1" ]; then
+    ARAC_SERVISLER=$(docker compose $COMPOSE_FILES --profile gui config --services 2>/dev/null | grep -v '^state-bridge$' | tr '\n' ' ')
+    if [ -z "$ARAC_SERVISLER" ]; then
+        echo -e "${RED}[X] Servis listesi türetilemedi — güvenli tarafta kalınıyor, çıkılıyor.${NC}"
+        exit 1
+    fi
+    docker compose $COMPOSE_FILES --profile gui up -d $ARAC_SERVISLER 2>&1 | tail -20
+else
+    docker compose $COMPOSE_FILES --profile gui up -d 2>&1 | tail -20
+fi
 
 sleep 3
 docker compose $COMPOSE_FILES ps
+
+# Oto-restart gözcüsünü başlat (RestartCount izler, çökme/restart uyarısı basar)
+restart_gozcusu &
+GOZCU_PID=$!
+echo -e "${GREEN}[+] Oto-restart gözcüsü aktif (PID=$GOZCU_PID) — restart:on-failure:5, log: $RUN_DIR/system/watchdog.log${NC}"
 
 # =============================================================
 # 6) DURUM
@@ -281,6 +377,10 @@ echo -e "${CYAN}  talos-controller   => Ana kontrolcu${NC}"
 echo -e "${CYAN}  can-visualizer     => CAN GUI${NC}"
 echo -e "${CYAN}------------------------------------------------------${NC}"
 echo -e "${YELLOW}  Loglar: $RUN_DIR${NC}"
+echo -e "${YELLOW}  CANLI PARAMETRE: config/canli_params.yaml duzenle => RESTART'SIZ uygulanir (~1 sn)${NC}"
+echo -e "${YELLOW}                   (istisna: karar-node + RESTART isaretli parametreler)${NC}"
+echo -e "${YELLOW}  OTO-RESTART: her servis çökerse Docker 5 kez yeniden dener (on-failure:5)${NC}"
+echo -e "${YELLOW}               restart/vazgeçme uyarıları => $RUN_DIR/system/watchdog.log${NC}"
 echo -e "${YELLOW}  Ctrl+C => kapanis + manifest mührü + chown${NC}"
 echo -e "${CYAN}======================================================${NC}"
 

@@ -42,7 +42,7 @@ services:
       - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
@@ -63,7 +63,7 @@ services:
       - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
