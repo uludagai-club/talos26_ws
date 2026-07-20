@@ -45,6 +45,15 @@ DURAK_LOWER = np.array([90, 80, 80])
 DURAK_UPPER = np.array([130, 255, 255])
 DURAK_MIN_AREA = 1000
 
+# Canlı parametreler: config/canli_params.yaml 'park_durak:' — restart'sız uygulanır
+# (HSV eşikleri YAML'da [H, S, V] listesi olarak yazılır; izleyici np.array'e çevirir)
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle("park_durak", globals())
+except Exception as _canli_e:
+    _canli_izleyici = None
+    print(f"[park_durak] canli_params yok, statik parametreler: {_canli_e}", flush=True)
+
 
 def _mesafe_offset(x, y, w, h, img_w, img_h):
     """Bbox'tan kaba (mesafe, isaretli yatay offset) tahmini - karar_node uyumlu."""

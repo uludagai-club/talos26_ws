@@ -37,6 +37,14 @@ LATERAL_SCALE = 3.0
 # Sim renderinda yaya gecidi ~0.40-0.70 guven veriyor; 0.5 cok kati kaliyordu.
 CONF_ESIK = 0.30
 
+# Canlı parametreler: config/canli_params.yaml 'yaya_gecidi:' — restart'sız uygulanır
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle("yaya_gecidi", globals())
+except Exception as _canli_e:
+    _canli_izleyici = None
+    print(f"[yaya_gecidi] canli_params yok, statik parametreler: {_canli_e}", flush=True)
+
 
 class YayaGecidiNode:
     def __init__(self):

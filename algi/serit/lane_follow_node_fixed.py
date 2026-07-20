@@ -34,6 +34,26 @@ from ultralytics import YOLO
 from datetime import datetime
 from collections import deque
 
+# ════════════════════════════════════════════════════════════════════════
+#   AYARLANABİLİR PARAMETRELER — hepsi burada
+#   (canlı: config/canli_params.yaml 'serit:' — restart'sız uygulanır)
+# ════════════════════════════════════════════════════════════════════════
+KP                     = 0.12   # piksel offset → direksiyon açısı kazancı
+MODEL_CONF             = 0.6    # YOLO tespit güven eşiği
+STEER_CLAMP_DEG        = 30.0   # /line çıkış açısı kelepçesi (±derece)
+CONF_VIRAJ_ESIK        = 0.3    # bu güvenin altında viraj analizi yapılmaz
+CONF_CURVE_ESIK        = 0.6    # bu güvenin altı "curve" sayılır
+TURN_COOLDOWN_FRAMES   = 20     # viraj tespiti sonrası bekleme (kare)
+NO_DETECT_CURVE_FRAMES = 10     # bu kadar kare tespitsiz → "curve"
+SLOPE_SPREAD_MIN_PX    = 50     # 90° viraj için çizgi yayılım eşiği (piksel)
+
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle("serit", globals())
+except Exception as _canli_e:
+    _canli_izleyici = None
+    print(f"[lane_follower] canli_params yok, statik parametreler: {_canli_e}", flush=True)
+
 
 class LaneFollower:
     def __init__(self):
@@ -79,8 +99,7 @@ class LaneFollower:
             self.callback
         )
 
-        # ==== PARAMETRELER ====
-        self.Kp = 0.12
+        # ==== PARAMETRELER üst blokta (AYARLANABİLİR PARAMETRELER) ====
         self.frame_to_show = None
         self.log = open("lane_log.txt", "w")
 
@@ -121,10 +140,10 @@ class LaneFollower:
             return "none"
 
         # Düşük güvende viraj algılama yapma
-        if confidence < 0.3:
+        if confidence < CONF_VIRAJ_ESIK:
             self.frames_without_detection += 1
             # Uzun süre algılama yoksa potansiyel keskin viraj
-            if self.frames_without_detection > 10:
+            if self.frames_without_detection > NO_DETECT_CURVE_FRAMES:
                 return "curve"
             return "none"
 
@@ -142,8 +161,8 @@ class LaneFollower:
             left_spread = max(left_points) - min(left_points)
             left_avg = np.mean(left_points)
             # Sol çizgi merkeze çok yaklaşıyorsa sağa dönüş
-            if left_avg > center * 0.7 and left_spread > 50:
-                self.turn_cooldown = 20
+            if left_avg > center * 0.7 and left_spread > SLOPE_SPREAD_MIN_PX:
+                self.turn_cooldown = TURN_COOLDOWN_FRAMES
                 return "right_90"
 
         # Sağ çizgi analizi
@@ -151,12 +170,12 @@ class LaneFollower:
             right_spread = max(right_points) - min(right_points)
             right_avg = np.mean(right_points)
             # Sağ çizgi merkeze çok yaklaşıyorsa sola dönüş
-            if right_avg < center * 1.3 and right_spread > 50:
-                self.turn_cooldown = 20
+            if right_avg < center * 1.3 and right_spread > SLOPE_SPREAD_MIN_PX:
+                self.turn_cooldown = TURN_COOLDOWN_FRAMES
                 return "left_90"
 
         # Genel eğri yol kontrolü
-        if confidence < 0.6:
+        if confidence < CONF_CURVE_ESIK:
             return "curve"
 
         return "none"
@@ -167,7 +186,7 @@ class LaneFollower:
             h, w, _ = frame.shape
             vehicle_center = w // 2
 
-            results = self.model.predict(frame, conf=0.6, verbose=False)
+            results = self.model.predict(frame, conf=MODEL_CONF, verbose=False)
 
             left_points = []
             right_points = []
@@ -236,8 +255,8 @@ class LaneFollower:
 
                 road_center = (left_x + right_x) // 2
                 offset = road_center - vehicle_center
-                angle = offset * self.Kp
-                angle = max(min(angle, 30), -30)
+                angle = offset * KP
+                angle = max(min(angle, STEER_CLAMP_DEG), -STEER_CLAMP_DEG)
 
                 # Publish (mevcut + yeni)
                 self.pub.publish(float(angle))

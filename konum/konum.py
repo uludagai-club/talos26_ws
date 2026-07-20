@@ -9,6 +9,22 @@ from std_msgs.msg import String
 from tf.transformations import euler_from_quaternion
 import math
 
+# ════════════════════════════════════════════════════════════════════════
+#   AYARLANABİLİR PARAMETRELER — hepsi burada
+#   (canlı: config/canli_params.yaml 'konum:' — restart'sız uygulanır)
+# ════════════════════════════════════════════════════════════════════════
+VARIS_TOLERANS_M     = 1.2   # m - WP1'e varış toleransı ("varildi" eşiği; hedef bakış mesafesiyle uyumlu)
+HEDEF_DEGISIM_ESIK_M = 0.01  # m - hedef "gerçekten değişti" sayma eşiği
+TAKIP_RATE_HZ        = 1     # (RESTART) durum yazdırma döngüsü frekansı
+
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle("konum", globals())
+except Exception as _canli_e:
+    _canli_izleyici = None
+    print(f"[konum] canli_params yok, statik parametreler: {_canli_e}", flush=True)
+
+
 class KonumYoneticisi:
     def __init__(self):
         rospy.init_node('konum_yoneticisi')
@@ -82,7 +98,7 @@ class KonumYoneticisi:
             new2_y = float(wp2_data[1].strip())
 
             # Sadece hedef gercekten degistiyse gorevi aktif et
-            if (self.target_x is None) or (abs(new_x - self.target_x) > 0.01) or (abs(new_y - self.target_y) > 0.01):
+            if (self.target_x is None) or (abs(new_x - self.target_x) > HEDEF_DEGISIM_ESIK_M) or (abs(new_y - self.target_y) > HEDEF_DEGISIM_ESIK_M):
                 self.target_x = new_x
                 self.target_y = new_y
                 self.target2_x = new2_x
@@ -104,8 +120,8 @@ class KonumYoneticisi:
 
         dist = math.hypot(self.target_x - self.current_x, self.target_y - self.current_y)
 
-        # TOLERANS: 1.2 metre (Hedef yoneticisindeki bakis mesafesiyle uyumlu)
-        if dist < 1.2:
+        # TOLERANS: VARIS_TOLERANS_M (üst blok; canlı ayarlanabilir)
+        if dist < VARIS_TOLERANS_M:
             rospy.logwarn(f">>> HEDEFE VARILDI: WP1 ({self.target_x}, {self.target_y})")
             
             # KRITIK DUZELTME: Kucuk harfle "varildi" gonderiyoruz
@@ -117,7 +133,7 @@ class KonumYoneticisi:
             self.is_mission_active = False
 
     def start_monitoring(self):
-        rate = rospy.Rate(1) 
+        rate = rospy.Rate(TAKIP_RATE_HZ)
         while not rospy.is_shutdown():
             if self.is_mission_active and self.target_x is not None:
                 dist = math.hypot(self.target_x - self.current_x, self.target_y - self.current_y)
