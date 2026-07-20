@@ -1,0 +1,43 @@
+# TALOS ESKİ-SÜRÜCÜ YEDEK İMAJI — eski NVIDIA sürücülü araç laptopu sigortası
+# ==========================================================================
+# talos-yedek ile AYNI model (kod + devel + missions + maps GÖMÜLÜ, bind-mount
+# GEREKMEZ) tek farkla: torch CUDA 11.8 derlemesidir.
+#
+#   talos-all / talos-yedek : torch 2.4.1+cu121 → NVIDIA sürücüsü >= 525 ister
+#   bu imaj                 : torch 2.4.1+cu118 → NVIDIA sürücüsü >= 450.80 yeter
+#
+# Araç laptopunun sürücüsü eskiyse (ör. Ubuntu 20.04 depo sürücüsü 470) cu121
+# imajları GPU'yu GÖREMEZ ve YOLO node'ları sessizce CPU'ya düşer/ölür (risk F5).
+# Araçta internet olmadığından sürücü de yükseltilemez — bu tar o duruma sigortadır.
+#
+# Kullanım (araçta, sürücü < 525 tespit edilirse):
+#   docker load -i talos-eskisurucu-imaj_<tarih>.tar.gz
+#   docker tag talos-eskisurucu:latest talos-yedek:latest
+#   → 07 rehber §4'teki yedek (mount'suz) akışı AYNEN uygulanır (docker-compose.yedek.yml).
+#
+# Build'i arac_paketi_olustur.sh yapar (staging: talos26_ws kodu + devel/,
+# Dockerfile.yedek ile aynı). Elle build etme; script kullan.
+
+FROM talos-all:latest
+
+LABEL description="TALOS eski-surucu yedek imaji: talos-all + torch cu118 (surucu>=450.80) + kod/devel gomulu; bind-mount gerektirmez"
+
+# torch'u CUDA 11.8 derlemesiyle DEĞİŞTİR. Sürüm sabit (2.4.1 / 0.19.1 =
+# talos-all'daki ile birebir; yalnız CUDA hedefi düşer) — ultralytics 8.4.75
+# torch>=1.8 istediğinden dokunulmaz. cu118 wheel CUDA kütüphanelerini kendi
+# içinde taşır; alttaki nvidia-*-cu12 pip paketleri kullanılmadan kalır.
+RUN pip3 install --no-cache-dir \
+    torch==2.4.1+cu118 torchvision==0.19.1+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118 \
+    --extra-index-url https://pypi.org/simple
+
+# --- buradan sonrası Dockerfile.yedek ile birebir aynı gömme modeli ---
+COPY talos26_ws /talos-kod
+COPY devel /talos-devel
+
+RUN cp -a /talos-kod/missions /missions && \
+    cp -a /talos-kod/maps /maps && \
+    mkdir -p /root/catkin_ws/src/yolov8_ros/scripts && \
+    cp /talos-kod/algi/levha/yolov8_ros/scripts/best.pt /root/catkin_ws/src/yolov8_ros/scripts/best.pt
+
+CMD ["bash"]

@@ -11,6 +11,9 @@ import py_trees
 from py_trees.common import Status
 
 from bb import Blackboard
+from avoidance_geometry import obstacle_world_pos, side_to_avoid
+
+_INF = float("inf")
 
 
 # ============================================================
@@ -151,15 +154,21 @@ class EngelVar(_Cond):
 
 
 class EngelCokYakin(_Cond):
-    """Merkez sektörde çok yakın engel — acil durus."""
+    """Mevcut direksiyonun süpürme bandı İÇİNDE çok yakın engel — acil durus.
+
+    2026-07-15: d_center yerine engel_d_arc okur (yay-kapısı). Bisiklet
+    modeline göre yayın DIŞINDA kalan yan nesne (örn. 41°'de bordür, canlı
+    173335) artık acildurus tetiklemez; dur/reroute/yavasla bantları
+    d_center ile aynen sürer. Direksiyon verisi yoksa ros_bridge d_arc'a
+    d_center yazar → davranış eskisiyle aynı (fail-safe)."""
     def __init__(self, bb, esik_m):
         super().__init__(f"EngelCokYakin(<{esik_m}m)?", bb)
         self.esik_m = esik_m
 
     def update(self):
-        d = self.bb.obs.engel_d_center
+        d = self.bb.obs.engel_d_arc
         if d is None or not math.isfinite(d):
-            return Status.FAILURE
+            return Status.FAILURE   # inf = bant temiz (veya veri yok) → acil değil
         return Status.SUCCESS if d < self.esik_m else Status.FAILURE
 
 
@@ -207,6 +216,129 @@ class YanSektorBos(_Cond):
             return Status.FAILURE
 
         # inf veya eşikten büyük → boş
+        if d is None or not math.isfinite(d):
+            return Status.SUCCESS
+        return Status.SUCCESS if d >= self.esik_m else Status.FAILURE
+
+
+# ============================================================
+# Yol-bilinçli kaçış yönü seçimi (waypoint tabanlı)
+# ============================================================
+class KacisYonuSec(_Cond):
+    """Engelden kaçış yönünü WAYPOINT'lere göre seçer ve bb.state'e yazar.
+
+    Mantık (kullanıcı isteği: "sol/sağ kararını waypointlere göre ver"):
+      1. /hedef taze ve WP'ler varsa → engelin DÜNYA konumunu hesapla, rota
+         doğrusuna göre işaretli yanal konumunu çıkar (çapraz-çarpım). Engel
+         rotanın SOLUNDAysa SAĞA, SAĞINDAysa SOLA kaç → kaynak="rota".
+         Bu seçim aracın kendi şerit ofsetinden BAĞIMSIZDIR (sadece engel↔rota).
+      2. Engel ~rota üzerinde (deadband içinde, tipik koni) veya rota verisi
+         yoksa → en açık yan sektöre düş (engel_d_left vs d_right) → kaynak="yan_sektor";
+         beraberlikte `varsayilan_yon` (ters/karşı şerit = genelde "sol").
+
+    AKTİF SEGMENT SEÇİMİ (control.py WP_NEAR_DISTANCE ± histerezis — Q1):
+      Araç wp1'e (wp_near + hyst) kadar yaklaştıysa onu "geçilmiş" sayıp rota
+      doğrusunu wp1→wp2 alır; aksi halde robot→wp1 alır. Böylece karar, control'ün
+      WP geçiş eşiğiyle aynı "aktif segment" anlayışını paylaşır.
+
+    Her zaman SUCCESS döner (bir yön daima seçilir); o yönün GERÇEKTEN boş olup
+    olmadığını YanSektorBosSecilen denetler.
+    """
+
+    def __init__(self, bb, deadband_m: float, wp_near_m: float, wp_hyst_m: float,
+                 hedef_max_age_s: float, varsayilan_yon: str = "sol"):
+        super().__init__("KacisYonuSec", bb)
+        self.deadband_m = float(deadband_m)
+        self.wp_near_m = float(wp_near_m)
+        self.wp_hyst_m = float(wp_hyst_m)
+        self.hedef_max_age_s = float(hedef_max_age_s)
+        self.varsayilan_yon = varsayilan_yon if varsayilan_yon in ("sol", "sag") else "sol"
+
+    def _yan_sektor_yon(self) -> str:
+        o = self.bb.obs
+        dl = o.engel_d_left if o.engel_d_left is not None else _INF
+        dr = o.engel_d_right if o.engel_d_right is not None else _INF
+        if dl > dr:
+            return "sol"
+        if dr > dl:
+            return "sag"
+        return self.varsayilan_yon
+
+    def update(self):
+        o = self.bb.obs
+        s = self.bb.state
+        taraf = None
+        kaynak = "yan_sektor"
+        lateral = 0.0
+        ox = oy = 0.0
+
+        hedef_taze = _is_fresh(o.hedef_last_seen, self.hedef_max_age_s) \
+            and o.hedef_x is not None and o.hedef_y is not None
+        # Engel menzili: nearest overall, yoksa center
+        rng = o.engel_d_overall
+        if rng is None or not math.isfinite(rng):
+            rng = o.engel_d_center
+
+        route_taze = hedef_taze and rng is not None and math.isfinite(rng)
+        if route_taze:
+            ox, oy = obstacle_world_pos(o.x, o.y, o.yaw, rng, o.engel_angle_deg or 0.0)
+            # Aktif segmenti WP_NEAR ± histerezis ile seç
+            d_wp1 = math.hypot(o.hedef_x - o.x, o.hedef_y - o.y)
+            if (o.next_hedef_x is not None and o.next_hedef_y is not None
+                    and d_wp1 <= (self.wp_near_m + self.wp_hyst_m)):
+                ax, ay = o.hedef_x, o.hedef_y          # wp1 geçildi → wp1→wp2
+                bx, by = o.next_hedef_x, o.next_hedef_y
+            else:
+                ax, ay = o.x, o.y                       # robot→wp1
+                bx, by = o.hedef_x, o.hedef_y
+            taraf, lateral = side_to_avoid(ox, oy, ax, ay, bx, by, self.deadband_m)
+            if taraf is not None:
+                kaynak = "rota"                        # engel rotanın bir yanında → karşı tarafa
+            else:
+                # Engel ~rota ÜZERİNDE (deadband içinde = tipik blok eden koni). Geometri
+                # belirsiz → KARŞI/geçiş şeridine (varsayilan_yon) geç. yan_sektor'e DÜŞME:
+                # araca-göre d_left/d_right gürültülü/simetrik (CANLI BUG 2026-06-24:
+                # merkezi koni → yan_sektor → yanlış "sag" → araç koniye girip acildurus).
+                taraf = self.varsayilan_yon
+                kaynak = "rota_merkez"
+
+        if taraf is None:
+            # Rota HİÇ yok (tazelik/WP eksik) → son çare en açık yan sektör
+            taraf = self._yan_sektor_yon()
+            kaynak = "yan_sektor"
+
+        s.kacis_yon = taraf
+        s.kacis_kaynak = kaynak
+        s.kacis_lateral_m = lateral
+        s.kacis_engel_dunya = (ox, oy)
+        return Status.SUCCESS
+
+
+class YanSektorBosSecilen(_Cond):
+    """KacisYonuSec'in seçtiği yön (bb.state.kacis_yon) gerçekten boş + taze mi?
+
+    YanSektorBos ile aynı güvenlik kapısı; ama tarafı state'ten dinamik okur
+    (sabit "sol"/"sag" değil). Yön seçilmemişse FAILURE.
+    """
+
+    def __init__(self, bb, esik_m: float, max_age_s: float):
+        super().__init__("YanSektorBosSecilen", bb)
+        self.esik_m = float(esik_m)
+        self.max_age_s = float(max_age_s)
+
+    def update(self):
+        taraf = self.bb.state.kacis_yon
+        if taraf == "sol":
+            d = self.bb.obs.engel_d_left
+            last_seen = self.bb.obs.engel_left_last_seen
+        elif taraf == "sag":
+            d = self.bb.obs.engel_d_right
+            last_seen = self.bb.obs.engel_right_last_seen
+        else:
+            return Status.FAILURE
+
+        if not _is_fresh(last_seen, self.max_age_s):
+            return Status.FAILURE
         if d is None or not math.isfinite(d):
             return Status.SUCCESS
         return Status.SUCCESS if d >= self.esik_m else Status.FAILURE

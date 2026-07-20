@@ -17,7 +17,9 @@ from geometry_msgs.msg import PoseArray
 from tf.transformations import euler_from_quaternion
 
 from bb import Blackboard
-from obstacle_fusion import ObstacleFusionParams, fuse_obstacles
+from obstacle_fusion import (ObstacleFusionParams, fuse_obstacles,
+                             ArcGateParams, arc_blocking_distance)
+from obstacle_memory import ObstacleMemory, MemParams
 
 try:
     from cart_sim.msg import Decision as DecisionMsg
@@ -25,6 +27,13 @@ try:
 except Exception:
     DecisionMsg = None
     _HAS_DECISION = False
+
+try:
+    from cart_sim.msg import cart_control as CartControlMsg
+    _HAS_CART_CONTROL = True
+except Exception:
+    CartControlMsg = None
+    _HAS_CART_CONTROL = False
 
 
 # Pose pozisyonundan eksen seçici (axis_forward/axis_left config'i için)
@@ -48,13 +57,41 @@ class RosBridge:
         self._inv_left = -1.0 if bool(oc.get("invert_left", False)) else 1.0
         self._new_obs_last = 0.0   # /obstacles/poses son geliş zamanı (failover için)
 
+        # --- Yay-kapısı (2026-07-15): acil bandı bisiklet-modeli farkındalı ---
+        # Mevcut direksiyonun süpürme bandı DIŞINDA kalan nesne acildurus
+        # tetiklemez (canlı bulgu 173335: 41° yan bordür 2 dk kilitledi).
+        # Direksiyon kaynağı: /cart (cart_control.steer ∈ [-1,1], + sol) ×
+        # steer_full_deg. Veri yok/bayat → d_arc=d_center (bugünkü davranış).
+        ag = oc.get("arc_gate", {}) or {}
+        self._arc_gp = ArcGateParams.from_cfg(ag)
+        self._arc_steer_topic = str(ag.get("steer_topic", "/cart"))
+        self._arc_enabled = self._arc_gp.enabled and _HAS_CART_CONTROL
+        if self._arc_gp.enabled and not _HAS_CART_CONTROL:
+            rospy.logwarn("[karar_bt] yay-kapısı: cart_sim.msg.cart_control "
+                          "import edilemedi — acil bandı d_center'a düşüyor.")
+
+        # --- Duba DÜNYA-konum hafızası (dropout köprüsü) ---
+        # Detektör kareyi düşürünce konfirme dubayı gövde-frame'e geri-projekte edip
+        # füzyon girdisine enjekte eder → "lidar veri vermese bile duba orada".
+        # Pose (x,y,yaw) bu tazelikten eski ise hafıza atlanır (lokalizasyon yoksa
+        # sahte konum üretme). bkz obstacle_memory.py (canlı teşhis 2026-06-26).
+        mc = oc.get("memory", {}) or {}
+        self._obs_mem = (ObstacleMemory(MemParams.from_cfg(mc))
+                         if bool(mc.get("enabled", True)) else None)
+        self._odom_max_age_s = float(
+            (params.get("freshness", {}) or {}).get("odom_max_age_s", 0.5))
+
         # --- Subscribers (yalnız okuma) ---
         rospy.Subscriber("/trafik_levha", String, self._on_levha, queue_size=10)
-        rospy.Subscriber("/yaya_gecidi",   String, self._on_yaya,   queue_size=10)
+        # Adanmis 2-sinifli yaya gecidi modeli (yaya_gecidi_node). Bare /yaya_gecidi
+        # levha modelinin 26-sinif icindeki zayif yaya tespiti; adanmis model esas alinir.
+        rospy.Subscriber("/yaya_gecidi/model", String, self._on_yaya, queue_size=10)
 
         # YENI engel arayüzü: talos_obstacle_detector → /obstacles/poses (PoseArray)
         if self._obs_source in ("auto", "poses"):
-            rospy.Subscriber("/obstacles/poses", PoseArray, self._on_obstacles_poses, queue_size=5)
+            # queue_size=1: hafıza köprüsü dünya konumunu GÜNCEL pozla hesaplıyor →
+            # birikmiş bayat PoseArray güncel pozla işlenirse iz kayar (/incele performans).
+            rospy.Subscriber("/obstacles/poses", PoseArray, self._on_obstacles_poses, queue_size=1)
 
         # ESKI skaler engel arayüzü (auto: yeni kaynak yoksa devreye girer)
         if self._obs_source in ("auto", "legacy"):
@@ -63,6 +100,13 @@ class RosBridge:
             rospy.Subscriber("/engel_angle",      Float32, self._on_engel_angle,  queue_size=10)
             rospy.Subscriber("/engel_sol_mesafe", Float32, self._on_engel_sol,    queue_size=10)
             rospy.Subscriber("/engel_sag_mesafe", Float32, self._on_engel_sag,    queue_size=10)
+
+        # Yay-kapısı direksiyon kaynağı: control'ün gönderdiği komut açısı
+        # (can-bridge → /cart). Komut açısı control'ün kendi e-stop'uyla da
+        # aynı referanstır (_prev_cmd_steer) → iki katman tutarlı karar verir.
+        if self._arc_enabled:
+            rospy.Subscriber(self._arc_steer_topic, CartControlMsg,
+                             self._on_cart_steer, queue_size=1)
 
         rospy.Subscriber("/line",        Float32, self._on_line,   queue_size=10)
         rospy.Subscriber("/lane_offset", Float32, self._on_offset, queue_size=10)
@@ -81,6 +125,18 @@ class RosBridge:
         self.pub_snapshot = rospy.Publisher("/karar_bt/snapshot", String, queue_size=2)
         self._snapshot_period_s = 0.5
         self._snapshot_last = 0.0
+
+        # karar → hedef komut kanalı (gelistirme_plani §3.2). Olay-komutu olduğu
+        # için latch=False + queue_size=1: restart'ta eski "sollama" tekrar
+        # ateşlenmesin. String-prototip ("komut;taraf;x;y;etiket;yaricap"); sözleşme
+        # oturunca cart_sim/HedefKomut.msg'e terfi edilebilir.
+        self.pub_hedef_komut = rospy.Publisher("/hedef_komut", String, queue_size=1)
+        self._last_hedef_komut = ""
+
+        # Görselleştirme: hafızadaki dubaların dünya (odom) konumu → can_visualizer
+        # harita panelinde çizer. Salt-görsel; karar davranışını etkilemez.
+        # Biçim: "x,y,conf|x,y,conf|..." (conf=1 konfirme, 0 aday).
+        self.pub_hafiza_koni = rospy.Publisher("/karar/hafiza_koni", String, queue_size=2)
 
     # ============================================================
     # Subscriber callback'leri — yalnız blackboard'a yazar
@@ -147,21 +203,64 @@ class RosBridge:
                 continue
             points.append((fwd, lat, 0.0))  # PoseArray boyut taşımaz → half_width=0
 
+        # Hafıza köprüsü: pose taze ise konfirme dubaları dropout'ta yeniden enjekte et.
+        # Pose lock altında tutarlı okunur; update() try/except'le sarılı → odom NaN/
+        # math hatası callback'i çökertip engel körlüğü yapmasın (/incele güvenlik Yüksek).
+        n_mem = 0
+        if self._obs_mem is not None:
+            rx, ry, ryaw, odom_ts = self.bb.read_pose()
+            pose_fresh = (odom_ts > 0.0 and (now - odom_ts) <= self._odom_max_age_s)
+            if pose_fresh:
+                try:
+                    points, stats = self._obs_mem.update(points, rx, ry, ryaw, now)
+                    n_mem = stats["injected"]
+                except Exception as e:
+                    rospy.logwarn_throttle(2.0, f"[karar_bt] obstacle_memory hata: {e}")
+
         fused = fuse_obstacles(points, self._fusion_p)
+
+        # Yay-kapısı: taze direksiyon varsa acil bandı için bant-içi en yakın
+        # engel; yoksa d_center (fail-safe = eski düz-koridor davranışı).
+        d_arc = fused.d_center
+        if self._arc_enabled:
+            o = self.bb.obs
+            steer_fresh = (o.steer_last_seen > 0.0 and
+                           (now - o.steer_last_seen) <= self._arc_gp.steer_max_age_s)
+            if steer_fresh:
+                try:
+                    d_arc = arc_blocking_distance(points, o.steer_deg,
+                                                  self._fusion_p, self._arc_gp)
+                except Exception as e:
+                    rospy.logwarn_throttle(2.0, f"[karar_bt] yay-kapısı hata: {e}")
+                    d_arc = fused.d_center
+
         self._new_obs_last = now
         self.bb.write(
             engel_present=fused.present,
+            engel_d_arc=d_arc,
             engel_d_center=fused.d_center,
             engel_d_overall=fused.d_overall,
             engel_d_left=fused.d_left,
             engel_d_right=fused.d_right,
             engel_angle_deg=fused.angle_deg,
             engel_count=fused.count,
-            engel_source="poses",
+            engel_mem_count=n_mem,
+            engel_source="poses+mem" if n_mem > 0 else "poses",
             engel_last_seen=now,
             engel_left_last_seen=now,
             engel_right_last_seen=now,
         )
+
+        # Görselleştirme: hafızadaki dubaların dünya konumu (odom-frame x,y +
+        # konfirme). Salt-görsel; can_visualizer harita panelinde çizer.
+        if self._obs_mem is not None:
+            try:
+                trk = self._obs_mem.world_tracks()
+                payload = "|".join(f"{x:.2f},{y:.2f},{1 if c else 0}"
+                                   for x, y, c in trk)
+                self.pub_hafiza_koni.publish(payload)
+            except Exception:
+                pass
 
     # --- Failover: yeni kaynak tazeyse eski skaler topic'ler yok sayılır ---
     def _legacy_suppressed(self) -> bool:
@@ -179,8 +278,10 @@ class RosBridge:
         if self._legacy_suppressed():
             return
         v = msg.data if math.isfinite(msg.data) else float("inf")
-        self.bb.write(engel_d_overall=v, engel_d_center=v, engel_source="legacy",
-                      engel_last_seen=time.time())
+        # Legacy skaler arayüzde nokta listesi yok → yay-kapısı uygulanamaz;
+        # d_arc = d_center (düz-koridor davranışı korunur).
+        self.bb.write(engel_d_overall=v, engel_d_center=v, engel_d_arc=v,
+                      engel_source="legacy", engel_last_seen=time.time())
 
     def _on_engel_angle(self, msg: Float32):
         if self._legacy_suppressed():
@@ -200,6 +301,18 @@ class RosBridge:
         v = msg.data if math.isfinite(msg.data) else float("inf")
         now = time.time()
         self.bb.write(engel_d_right=v, engel_right_last_seen=now, engel_last_seen=now)
+
+    def _on_cart_steer(self, msg):
+        """cart_control.steer ∈ [-1,1] (+ sol) → bisiklet-modeli derece."""
+        try:
+            s = float(msg.steer)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if not math.isfinite(s):
+            return
+        s = max(-1.0, min(1.0, s))
+        self.bb.write(steer_deg=s * self._arc_gp.steer_full_deg,
+                      steer_last_seen=time.time())
 
     def _on_line(self, msg: Float32):
         self.bb.write(line_angle_deg=float(msg.data), lane_last_seen=time.time())
@@ -270,6 +383,20 @@ class RosBridge:
             m.phase = phase
             m.wait_remaining_s = wait_remaining
             self.pub_decision.publish(m)
+
+    def publish_hedef_komut(self, cmd: str):
+        """OvertakeManager'ın ürettiği komutu /hedef_komut'a yayınla.
+
+        Boş/None komut yok sayılır. Aynı komut art arda gelirse de yayınlanır
+        (queue=1, latch=False → hedef tarafı son komutu görür; sollama tazeleme
+        kasıtlı tekrar). hedef abone tarafı Samed'in işi (bkz plan §3.2)."""
+        if not cmd:
+            return
+        try:
+            self.pub_hedef_komut.publish(cmd)
+            self._last_hedef_komut = cmd
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[karar_bt] /hedef_komut yayını başarısız: {e}")
 
     def publish_snapshot(self, tree_ascii: str = ""):
         if (time.time() - self._snapshot_last) < self._snapshot_period_s:

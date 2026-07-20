@@ -30,15 +30,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Python (pip) bagimliliklari
 #  - ultralytics : YOLO (traffic + safe-zone). torch + opencv-python'u beraberinde ceker.
 #                  Linux'ta varsayilan torch wheel'i CUDA destekli gelir → GPU calisir.
+#  - Pinler (2026-07-20, calisan imajdaki surumlerle birebir — rebuild drift'ini onler):
+#    numpy/matplotlib/networkx zaten py3.8 tavaniyla bu surumlerde kilitli;
+#    ultralytics ve python-can'in dogal tavani YOK, bu yuzden acikca sabitlendi.
+#    torch==2.4.1 varsayilan PyPI wheel'i = cu121 (surucu >= 525); eski surucu
+#    icin Dockerfile.eskisurucu (cu118) kullanilir.
 # -------------------------------------------------------------------
 RUN pip3 install --no-cache-dir \
-    "python-can>=4.0.0" \
+    "python-can==4.5.0" \
     "numpy>=1.20.0" \
     "matplotlib>=3.4.0" \
     "pyyaml>=5.3" \
     "py_trees==2.2.3" \
     "networkx>=2.5" \
-    ultralytics
+    "torch==2.4.1" "torchvision==0.19.1" \
+    "ultralytics==8.4.75"
 
 WORKDIR /app
 

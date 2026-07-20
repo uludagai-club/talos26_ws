@@ -31,18 +31,30 @@ except Exception:
     DecisionMsg = None
     _HAS_DECISION = False
 
+# ════════════════════════════════════════════════════════════════════════
+#   AYARLANABİLİR PARAMETRELER — hepsi burada
+#   (canlı: config/canli_params.yaml 'engel:' — restart'sız uygulanır)
+# ════════════════════════════════════════════════════════════════════════
+ENGEL_MESAFE_LIMITI_M = 3.0   # m - merkez sektörde engel var/yok eşiği (BT kendi eşiklerini uygular; geniş tut)
+SCAN_HALF_FOV_DEG     = 15.0  # derece - toplam tarama yarı-açısı (+/-)
+MERKEZ_HALF_FOV_DEG   = 5.0   # derece - fren kararı merkez sektörü (+/-)
+MIN_RANGE_M           = 0.3   # m - bundan yakın okumalar yok sayılır (öz-yansıma)
+STEER_SCALE           = 0.5   # direksiyon açısı → tarama merkezi kaydırma oranı
+
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle("engel", globals())
+except Exception as _canli_e:
+    _canli_izleyici = None
+    print(f"[engel_node] canli_params yok, statik parametreler: {_canli_e}", flush=True)
+
 
 class EngelTespitiNode:
     def __init__(self):
         rospy.init_node('engel_tespiti', anonymous=True)
 
-        # --- Parametreler ---
-        self.engel_mesafesi_limiti = 3.0  # BT kendi eşiklerini uygular; burada geniş tut
-        self.scan_half_fov = 15.0
-        self.merkez_half_fov = 5.0
-        self.min_range = 0.3
+        # --- Parametreler üst blokta (AYARLANABİLİR PARAMETRELER) ---
         self.steer_angle_deg = 0.0
-        self.steer_scale = 0.5
 
         # --- Publishers ---
         self.engel_pub = rospy.Publisher('/engel', Int32, queue_size=10)
@@ -78,9 +90,9 @@ class EngelTespitiNode:
             self.tlog = None
 
         rospy.loginfo("Engel Tespiti Node v3 Baslatildi (dinamik tarama)")
-        rospy.loginfo(f"Mesafe Limiti: {self.engel_mesafesi_limiti}m, "
-                      f"Tarama: +/- {self.scan_half_fov} derece, "
-                      f"Merkez: +/- {self.merkez_half_fov} derece")
+        rospy.loginfo(f"Mesafe Limiti: {ENGEL_MESAFE_LIMITI_M}m, "
+                      f"Tarama: +/- {SCAN_HALF_FOV_DEG} derece, "
+                      f"Merkez: +/- {MERKEZ_HALF_FOV_DEG} derece")
 
     def _decision_callback(self, msg):
         self._last_decision_id = msg.decision_id or ""
@@ -92,10 +104,10 @@ class EngelTespitiNode:
     def scan_callback(self, data):
         # Direksiyon acisina gore tarama merkezini kaydir
         # Negatif steer = sola donus -> tarama merkezi sola kayar
-        center_offset_rad = math.radians(self.steer_angle_deg * self.steer_scale)
+        center_offset_rad = math.radians(self.steer_angle_deg * STEER_SCALE)
 
-        half_fov_rad = math.radians(self.scan_half_fov)
-        merkez_half_rad = math.radians(self.merkez_half_fov)
+        half_fov_rad = math.radians(SCAN_HALF_FOV_DEG)
+        merkez_half_rad = math.radians(MERKEZ_HALF_FOV_DEG)
 
         angle_min = data.angle_min
         angle_increment = data.angle_increment
@@ -110,7 +122,7 @@ class EngelTespitiNode:
         for i, range_val in enumerate(data.ranges):
             if math.isinf(range_val) or math.isnan(range_val):
                 continue
-            if range_val < self.min_range:
+            if range_val < MIN_RANGE_M:
                 continue
 
             # Bu noktanin acisi (radyan)
@@ -146,7 +158,7 @@ class EngelTespitiNode:
 
         # Engel var/yok (merkez sektordeki engele gore karar ver)
         engel_durumu = 0
-        if min_merkez < self.engel_mesafesi_limiti:
+        if min_merkez < ENGEL_MESAFE_LIMITI_M:
             engel_durumu = 1
 
         # Yakin engel varsa loglama (her engel icin degil, sadece merkezdeki)

@@ -9,6 +9,16 @@
 #
 # L1 Loglama (KTR §9.14.2): json-file 10 MB × 5 = 50 MB/servis varsayılan.
 # Yeni servisler `<<: *log-defaults` ile devralır.
+#
+# OTO-RESTART (2026-07-15): Her servis `restart: "on-failure:5"` — container
+# HATA ile (non-zero exit / çökme) kapanırsa Docker daemon onu en fazla 5 kez
+# otomatik yeniden başlatır, sonra vazgeçip `exited` bırakır (crash-loop
+# thrashing'i önler). Temiz çıkış (exit 0) veya `docker compose down` restart
+# TETİKLEMEZ. Restart olayları baslat.sh'taki gözcü tarafından
+# logs/$RUN_ID/system/watchdog.log'a yazılır + terminale uyarı basılır.
+# GÜVENLİK NOTU: Sim (CartPlugin) gaz-watchdog'u YOK → talos-controller /
+# can-bridge / state-bridge çökerse yeniden ayağa kalkana dek araç son gazla
+# süzülebilir. Gözcü bu tier'ın restartını ayrıca KIRMIZI uyarıyla işaretler.
 
 x-log-defaults: &log-defaults
   driver: json-file
@@ -17,8 +27,10 @@ x-log-defaults: &log-defaults
     max-file: "5"
 
 # Tüm servisler için ortak env (yarı uygulamayı kaldırır — M2)
+# ROS_MASTER_URI/ROS_IP host env'inden override edilebilir (gerçek araçta master
+# araç PC'sindeyse: ROS_MASTER_URI=http://<arac_ip>:11311 ROS_IP=<laptop_ip> ./baslat.sh)
 x-talos-env: &talos-env
-  ROS_MASTER_URI: http://localhost:11311
+  ROS_MASTER_URI: ${ROS_MASTER_URI:-http://localhost:11311}
   RUN_ID: ${RUN_ID:-dev}
   TALOS_LOG_ROOT: /app/logs
 
@@ -37,17 +49,18 @@ services:
     container_name: konum-server
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
     volumes:
       - ./konum/konum.py:/app/konum.py:ro
       - ./talos_common:/app/talos_common:ro
+      - ./config:/app/config:ro
       - ./logs:/app/logs
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && export PYTHONPATH=/app:$$PYTHONPATH && python3 -u /app/konum.py"
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # HARITA + WAYPOINT SERVISI (tek imaj: talos-all)
@@ -63,7 +76,7 @@ services:
     container_name: talos-map-server
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./maps/my_map.yaml:/app/my_map.yaml:ro
@@ -73,7 +86,7 @@ services:
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && (rosrun map_server map_server /app/my_map.yaml &) && sleep 2 && python3 -u /app/waypoint_pub.py"
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # HEDEF TESLIMI (matplotlib GUI)
@@ -83,17 +96,27 @@ services:
     container_name: hedef_teslimi
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
+      # Kalıcı tanı logu kökü → ./logs/$RUN_ID/hedef/ (diğer servislerle aynı ağaç).
+      - TALOS_LOG_ROOT=/app/logs
     volumes:
       - ./hedef/hedef_yoneticisi.py:/app/hedef_yoneticisi.py:ro
+      - ./hedef/hedef_logger.py:/app/hedef_logger.py:ro
+      # Canlı parametre altyapısı: config/canli_params.yaml host'ta düzenlenir,
+      # restart'sız uygulanır (talos_common/canli_params.py izler).
+      - ./talos_common:/app/talos_common:ro
+      - ./config:/app/config:ro
+      # Diğer servislerle AYNI log ağacı → ./logs/$RUN_ID/hedef/ (engel/karar/
+      # system ile yan yana). Logger zaten $RUN_ID/hedef alt dizini açar.
+      - ./logs:/app/logs
       - ./missions:/missions:ro
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/hedef_yoneticisi.py"
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # ENGEL ALGILAMA (GPU)
@@ -103,7 +126,7 @@ services:
     container_name: engel-node
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - RUN_ID=${RUN_ID:-dev}
@@ -112,6 +135,7 @@ services:
       - ./lidar/engel_node_fixed.py:/app/engel_node_fixed.py:ro
       - ./lidar/pointcloud_obstacle_publisher.py:/app/pointcloud_obstacle_publisher.py:ro
       - ./talos_common:/app/talos_common:ro
+      - ./config:/app/config:ro
       - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
     # talos-all imajinda pointcloud_to_laserscan apt ile /opt/ros/noetic altinda gelir
@@ -146,7 +170,7 @@ services:
               count: all
               capabilities: [gpu]
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # TRAFIK ISARETI ALGILAMA (GPU)
@@ -156,15 +180,21 @@ services:
     container_name: traffic-node
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      # Araç internetsiz: ultralytics'in her import'taki DNS yoklamasını kapat
+      # (deterministik hızlı başlangıç; DNS kara-delik senaryosunda saniyeler kazandırır)
+      - YOLO_OFFLINE=true
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./algi/levha/yolov8_ros_node_fixed.py:/app/yolov8_ros_node_fixed.py:ro
       # Levha modeli: İndirilenler'deki yolov10n best.pt (26 sınıf) image içindeki modeli ezer
       - ./algi/levha/yolov8_ros/scripts/best.pt:/root/catkin_ws/src/yolov8_ros/scripts/best.pt:ro
+      # Canlı parametreler (restart'sız ayar)
+      - ./talos_common:/app/talos_common:ro
+      - ./config:/app/config:ro
       # 'Levha Tespit' cv2 penceresi icin X11 (lane-follower ile ayni kalip)
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
@@ -177,7 +207,7 @@ services:
               count: all
               capabilities: [gpu]
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # PARK + DURAK ALANI TESPITI (HSV mavi-renk, GPU gerekmez)
@@ -189,17 +219,20 @@ services:
     container_name: park-durak-node
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./algi/park_durak/park_durak_node.py:/app/park_durak_node.py:ro
+      # Canlı parametreler (restart'sız ayar)
+      - ./talos_common:/app/talos_common:ro
+      - ./config:/app/config:ro
       # 'Park/Durak Tespit' cv2 penceresi icin X11 (traffic-node ile ayni kalip)
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/park_durak_node.py"
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # SERIT TAKIP / LANE FOLLOWER (YOLOv8, GPU)
@@ -212,9 +245,12 @@ services:
     container_name: lane-follower
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      # Araç internetsiz: ultralytics'in her import'taki DNS yoklamasını kapat
+      # (deterministik hızlı başlangıç; DNS kara-delik senaryosunda saniyeler kazandırır)
+      - YOLO_OFFLINE=true
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
     volumes:
@@ -222,6 +258,9 @@ services:
       # fixes/ override: /lane/image_annotated publisher + DISPLAY guard eklenmis surum
       - ./algi/serit/lane_follow_node_fixed.py:/app/lane_follow_node.py:ro
       - ./algi/serit/models/best.pt:/app/models/best.pt:ro
+      # Canlı parametreler (restart'sız ayar)
+      - ./talos_common:/app/talos_common:ro
+      - ./config:/app/config:ro
       # 'Lane Follow' cv2 penceresi icin X11 (traffic-node ile ayni kalip)
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
@@ -234,7 +273,7 @@ services:
               count: all
               capabilities: [gpu]
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # YAYA GECIDI / CROSSWALK (YOLOv8 ADANMIS MODEL, GPU)
@@ -247,14 +286,20 @@ services:
     container_name: yaya-gecidi-node
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      # Araç internetsiz: ultralytics'in her import'taki DNS yoklamasını kapat
+      # (deterministik hızlı başlangıç; DNS kara-delik senaryosunda saniyeler kazandırır)
+      - YOLO_OFFLINE=true
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
     volumes:
       - ./algi/yaya_gecidi/yaya_gecidi_node.py:/app/yaya_gecidi_node.py:ro
       - ./algi/yaya_gecidi/best.pt:/app/models/best.pt:ro
+      # Canlı parametreler (restart'sız ayar)
+      - ./talos_common:/app/talos_common:ro
+      - ./config:/app/config:ro
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/yaya_gecidi_node.py"
@@ -266,7 +311,7 @@ services:
               count: all
               capabilities: [gpu]
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # KARAR DUGUMU (Behavior Tree — karar_bt/)
@@ -278,7 +323,7 @@ services:
     container_name: karar-node
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
     volumes:
@@ -294,7 +339,7 @@ services:
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && export PYTHONPATH=/talos-devel/lib/python3/dist-packages:/app:$$PYTHONPATH && python3 -u /app/karar_bt_node.py"
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # CAN -> GAZEBO KOPRUSU
@@ -307,20 +352,28 @@ services:
     network_mode: host
     privileged: true
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
+      # Gaz gücü/rampa — host env'inden geçer. Default 1.0 (urdf motor torku
+      # artık gerçekçi, yapay 0.1 tavanı kalktı; env ile hâlâ kısılabilir).
+      - TALOS_POWER_LIMIT=${TALOS_POWER_LIMIT:-1.0}
+      # Otonom devralınca (0x500=1) kullanılacak güç limiti.
+      - TALOS_POWER_LIMIT_AUTO=${TALOS_POWER_LIMIT_AUTO:-1.0}
+      - TALOS_RAMP_UP=${TALOS_RAMP_UP:-0.02}
+      - TALOS_RAMP_DOWN=${TALOS_RAMP_DOWN:-0.05}
     volumes:
       - ./control/can_to_talos_cart.py:/app/can_to_talos_cart.py:ro
       - ./control/can_decoder.py:/app/can_decoder.py:ro
       - ./talos_common:/app/talos_common:ro
+      - ./config:/app/config:ro
       - ./logs:/app/logs
       - ~/talos-sim/devel:/talos-devel:ro
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/can_to_talos_cart.py"
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # GAZEBO -> CAN KOPRUSU
@@ -331,7 +384,7 @@ services:
     network_mode: host
     privileged: true
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
@@ -344,7 +397,7 @@ services:
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/talos_state_to_can.py"
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # TALOS KONTROLCU (ana kontrol, build edilebilir)
@@ -357,19 +410,27 @@ services:
     cap_add:
       - NET_ADMIN
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
-      - ROS_IP=127.0.0.1
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
+      - ROS_IP=${ROS_IP:-127.0.0.1}
       - RUN_ID=${RUN_ID:-dev}
       - TALOS_LOG_ROOT=/app/logs
+      # manuel_baslat.sh=1: idle başla (bus serbest), buton 1 ile devral. baslat.sh: 0.
+      - TALOS_BUS_RELEASE_ON_START=${TALOS_BUS_RELEASE_ON_START:-0}
     volumes:
       - ./control/control.py:/app/control.py:ro
+      - ./control/ackermann.py:/app/ackermann.py:ro
       - ./control/logs:/app/logs
       - ./talos_common:/app/talos_common:ro
+      - ./config:/app/config:ro
       - ./missions:/missions:ro   # FIX 2 — GOREV_NOKTALARI GeoJSON yükleme
+      # cart_sim.msg (Decision): /karar_decision reason alanı — engel-DUR
+      # kaçış filtresi (P0 №1, inceleme 2026-07-16). Mount yoksa control
+      # fallback'e düşer (kaçış kapalı), ama normal sürüş etkilenmez.
+      - ~/talos-sim/devel:/talos-devel:ro
     entrypoint: bash
-    command: -c "source /opt/ros/noetic/setup.bash && cd /app && python3 -u control.py"
+    command: -c "source /opt/ros/noetic/setup.bash && export PYTHONPATH=/talos-devel/lib/python3/dist-packages:$$PYTHONPATH && cd /app && python3 -u control.py"
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"
 
   # =========================================================
   # CAN GORSELLESTIRICI (opsiyonel, --profile gui ile)
@@ -380,7 +441,7 @@ services:
     container_name: talos-can-visualizer
     network_mode: host
     environment:
-      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - DISPLAY=${DISPLAY}
       - RUN_ID=${RUN_ID:-dev}
       - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages
@@ -394,4 +455,4 @@ services:
     entrypoint: bash
     command: -c "source /opt/ros/noetic/setup.bash && python3 -u /app/can_visualizer.py"
     logging: *log-defaults
-    restart: "no"
+    restart: "on-failure:5"

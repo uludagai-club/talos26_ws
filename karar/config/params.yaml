@@ -1,5 +1,44 @@
 # TALOS karar_bt parametreleri.
 # Eşikler ve zamanlamalar tek noktada tutulur — sahada hızlı tune için.
+#
+# ===========================================================================
+#  KARAR PARAMETRE ÖZETİ — TÜM KARAR EŞİKLERİ TEK BAKIŞTA
+#  (efektif değerler; gerçek anahtarlar aşağıdaki bölümlerde — burası ÖZET)
+# ===========================================================================
+#  Karar çıktıları: normal | slow | sol | sag | dur | acildurus  → /karar
+#  (sol/sag artık YALNIZ levha yön komutu içindir — cone kaçınması §16/E-B ile
+#   sol/sag DEĞİL; reroute = 'slow' + /hedef_komut kenar_blok.)
+#
+#  ENGEL / CONE bantları (engel rotada, ileri mesafe; yakın→uzak):
+#    acildurus .... 1.2 m   tam fren, son çare        [wp_near-0.3]
+#                   (2026-07-15: YAY-KAPILI — mevcut direksiyonun bisiklet süpürme
+#                    bandı dışındaki nesne acil tetiklemez; bkz. obstacle.arc_gate)
+#    dur .......... 2.0 m   reroute saptıramazsa dur   [wp_near+0.5]  (güvenlik ağı)
+#    reroute ...... 6.0 m   'slow' + kenar_blok talebi [wp_near+4.5]  ← §12.12: 3.5→6.0
+#    yavasla ...... 9.0 m   en dış: yaklaş, yavaşla    [wp_near+7.5]  ← §12.12: 6.0→9.0
+#    (wp_near = 1.5 m = control.py WP_NEAR_DISTANCE — senkron tut)
+#    (hıza-duyarlı: yavasla bandı hız×0.4 sn, +6 m'ye kadar büyür)
+#
+#  CONE = REROUTE (§16/§12.13 mimari): cone control offset'iyle DEĞİL, planlayıcının
+#    (hedef) rotayı dubanın etrafından çizmesiyle geçilir. Karar 6 m'de 'slow' verir
+#    + cone'u DÜNYA frame'de kenar_blok ile hedef'e bildirir (control düz takip eder).
+#    6 m neden? hedef replan + control tepki payı; golf-cart 1.79 m yanalı güvenle
+#    açmak ~5-6 m ister (run 165604, doc §12.12). 3.5 m'de araç engele tıkanıyordu.
+#
+#  YAYA bantları:        acil 2.0 m · dur 4.0 m · yavas 12.0 m
+#  LEVHA:                dur-levhası 3.5 m · okuma 10.0 m · yön-levha 5.0 m
+#  CONE REROUTE (/hedef_komut kenar_blok): blok yarıçapı 1.0 m · zaman aşımı 15 s
+#                          · tazeleme 1.0 s · serbest-bırakma 5 tick (~0.5 s)
+#  DUBA HAFIZASI (dropout köprüsü): konfirme 3 hit + ≤7 m yaklaşma · tut 3 s ·
+#                          mutlak tavan 12 s · geçince düş (gövde ileri < -1.5 m)
+#                          → detektör kareyi düşürse de duba "orada" sayılır (anti flip-flop)
+#  ŞERİT DEĞİŞİMİ (levha):cooldown 4.0 s · manevra-tut 2.0 s (=control LANE_CHANGE_DURATION)
+#  ARAÇ GEOMETRİSİ:      wheelbase 1.86 m · max direksiyon 28.95°  (control.py ile eşit)
+#  DÖNGÜ:                10 Hz · DUR levhası bekleme 3.0 s · acil mühür çözme 8 tick
+#
+#  Sahiplik: karar/ = Enes (bu dosya). control_wp_near_m / wheelbase / max_steer
+#  control.py ile ELLE aynalı (programatik bağ yok → biri değişirse diğerini güncelle).
+# ===========================================================================
 
 tick_hz: 10.0
 
@@ -7,7 +46,12 @@ tick_hz: 10.0
 freshness:
   yaya_max_age_s:   0.6
   levha_max_age_s:  0.6
-  engel_max_age_s:  0.4
+  # P1 №5 (inceleme 2026-07-16 E3-O1): 0.4→0.7. /obstacles/poses mesaj periyodu
+  # (~0.4 s) eski eşikle ÇAKIŞIYORDU → her mesaj döngüsünde tam 1 tick "bayat"
+  # → EngelFresh düşer → tek-tick cruise flicker'ı (churn bölütlerinin 2/3'ü).
+  # 0.7 > new_source_max_age_s (0.5) olduğundan 0.4-0.5 s'lik legacy-failover
+  # ölü bölgesi de kendiliğinden kapanır.
+  engel_max_age_s:  0.7
   lane_max_age_s:   0.8
   odom_max_age_s:   0.5
   hedef_max_age_s:  2.0
@@ -18,12 +62,78 @@ distances:
   yaya_acil_durus_m: 2.0   # eski MESAFE_ACIL_DURUS
   yaya_dur_m:        4.0
   yaya_yavas_m:     12.0
-  engel_acil_m:      1.2   # bumper koruması — araç boyuna göre
-  engel_block_m:     2.0   # blokaj ama acil değil → kaçınma/dur dene
+  engel_acil_m:      0.7   # (ARTIK wp_planlama'dan türetiliyor — geri uyum için duruyor)
+  engel_block_m:     2.0   # (ARTIK wp_planlama'dan türetiliyor — geri uyum için duruyor)
   engel_yan_clear_m: 3.0   # yan sektörde bu kadar boşluk varsa lane change makul
   levha_dur_m:       3.5
   levha_oku_m:      10.0
   yon_levha_max_m:   5.0
+
+# ---------------------------------------------------------------------------
+# WP-tabanlı planlama — control.py WP_NEAR_DISTANCE ± delta (kullanıcı isteği)
+# ---------------------------------------------------------------------------
+# control.py "varildi/okey" verip bir sonraki WP'ye geçtiği mesafe = WP_NEAR_DISTANCE.
+# Karar tüm engel tepki bantlarını bu TEK referansın üzerine ± delta ile türetir;
+# böylece karar ile control aynı "aktif waypoint" eşiğini paylaşır.
+#   acil    = wp_near + (-0.3) = 1.2 m   (acil durus)
+#   dur     = wp_near + ( 0.5) = 2.0 m   (reroute saptıramazsa dur — güvenlik ağı)
+#   block   = wp_near + ( 4.5) = 6.0 m   (cone REROUTE commit: slow+kenar_blok — §12.12: 3.5→6.0)
+#   yavasla = wp_near + ( 7.5) = 9.0 m   (en dış: yaklaş→yavaşla; commit'in üstünde ~3m slow-zone)
+# DİKKAT: control_wp_near_m, control.py WP_NEAR_DISTANCE ile EŞİT TUTULMALI.
+wp_planlama:
+  control_wp_near_m:     1.5    # = control.py WP_NEAR_DISTANCE (senkron tut!)
+  engel_acil_delta_m:   -0.3
+  engel_dur_delta_m:     0.5
+  engel_block_delta_m:   4.5    # cone REROUTE commit = wp_near+4.5 = 6.0 m (§12.12: golf-cart 1.79m yanal için ~6m gerek)
+  engel_yavasla_delta_m: 7.5    # en dış tepki = wp_near+7.5 = 9.0 m (commit'in 3m üstünde slow-zone)
+  aktif_wp_histerezis_m: 0.5    # robot wp1'e (wp_near + bu) kadar yaklaştıysa wp1→wp2 segmentine geç
+  # NOT: kacis_deadband_m / varsayilan_kacis_yon artık KULLANILMIYOR — sol/sag yön
+  #      seçimi (KacisYonuSec) §16/E-B ile kaldırıldı; cone reroute yön istemez.
+  #      Geri uyum için bırakıldı (zararsız), bir sonraki temizlikte silinebilir.
+  kacis_deadband_m:      0.7    # (DEPRECATED — kullanılmıyor)
+  varsayilan_kacis_yon:  sol    # (DEPRECATED — kullanılmıyor)
+
+# ---------------------------------------------------------------------------
+# CONE REROUTE — /hedef_komut kenar_blok (§16/§12.13 yeni mimari, E-A/E-B)
+# ---------------------------------------------------------------------------
+# Karar commit bandında bloklu cone gördüğünde cone'un DÜNYA konumunu sabitler ve
+# hedef'e "kenar_blok;-;cx;cy;cone;r" yollar (E-A). hedef o kenarı bloklayıp
+# karşı-şeritten rota çizer (Samed: S-A/S-B/S-C). Cone temizlenince "kenar_serbest"
+# → hedef restore. Bu blok reroute.py (RerouteManager) tarafından okunur.
+# (Eski overtake.py/sollama + Ackermann geri-dönüş KALDIRILDI — cone artık
+#  direksiyonla değil rotayla geçiliyor, §12.13 H-A.)
+reroute:
+  enabled:             true
+  block_radius_m:      1.0    # hedef'e bildirilen cone blok yarıçapı (m)
+  max_s:              15.0    # reroute zaman aşımı → fallback kenar_serbest (susmasın)
+  refresh_s:           1.0    # aktif kenar_blok'u bu periyotla tazele (geç abone yakalasın)
+  release_clear_ticks: 5      # cone N tick (~0.5s @10Hz) bloklamıyorsa → kenar_serbest
+
+# ---------------------------------------------------------------------------
+# LEVHA YÖN-KISITI — dönülmez/mecburi/giriş-yok levhaları → /hedef_komut kenar_blok
+# ---------------------------------------------------------------------------
+# "Sola dönülmez" gibi levhalar karar çıkışı değil ROTA kısıtıdır: levha_kisit.py
+# levhayı dünya-frame'de çapalar ve kavşağın YASAK koluna kenar_blok bırakır
+# (hedef'te SOFT toplamsal ceza) → D* öbür kolu seçer. Kavşak geçilince serbest.
+# Tablo (levha_kisit.YASAK_YERLESIM): SOLA_DONULMEZ→sol · SAGA_DONULMEZ→sag ·
+# ILERI_MECBURI_YON→sol+sag · GIRISI_OLMAYAN_YOL→ileri. Levha adları algi/levha
+# passthrough'unun ham YOLO sınıf adlarıdır (SINIF_ESLESTIRME dışı kalanlar).
+levha_kisit:
+  enabled:         true
+  etki_m:          15.0   # levha bu ileri mesafeden yakınsa çapalanır
+  min_hits:        3      # üst üste bu kadar tick görülmeden kısıt açılmaz (misdetect freni)
+  hit_gap_s:       0.5    # hit sayacı bu süreden uzun kesintide sıfırlanır
+  ileri_ofset_m:   4.0    # levha çapası → kavşak merkezi (levha kavşaktan önce dikilir)
+  yan_ofset_m:     5.0    # kavşak merkezi → yasak kol girişi (yanal)
+  block_radius_m:  2.5    # blok yarıçapı; yan_ofset - r düz şeridi sıyırmamalı (2.5m marj)
+  refresh_s:       1.0    # aktif blokları tazeleme periyodu (hedef BLOK_TTL_S=3s beslenir)
+  pass_behind_m:   8.0    # çapa bu kadar geride kalınca kısıt biter (> ileri_ofset_m TUT)
+  max_s:           45.0   # mutlak tavan — kırmızıda beklerken düşmesin diye uzun
+
+# Ackermann araç geometrisi (control.py ile EŞİT TUTULMALI)
+ackermann:
+  wheelbase_m:   1.86      # = control.py WHEELBASE
+  max_steer_deg: 28.95     # = control.py MAX_STEER_ANGLE (ackermann.py max_bicycle_angle())
 
 # Hıza-duyarlı tepki mesafesi.
 # efektif_esik = taban_esik + gain_s * hiz_mps  (max_extra_m ile sınırlı)
@@ -52,10 +162,44 @@ debounce:
   yaya_min_consecutive:     2
   engel_min_consecutive:    2
   levha_min_consecutive:    2
+  # P1 №6 (E3-O2): yayın-öncesi ASİMETRİK çıkış-debounce. Yükselen karar
+  # (slow→dur, →acildurus) ANINDA geçer; alçalan karar (dur→normal) ancak bu
+  # kadar tick üst üste istikrarlıysa geçer (0 = kapalı). bkz. cikis_debounce.py
+  cikis_debounce_ticks:     3
+
+# Churn anomali dedektörü (kayan pencere; rapor Ek A KARAR_CHURN eşiğiyle aynı).
+# Debounce SONRASI yayınlanan değişimleri sayar → events.jsonl 'anomali_karar_churn'
+# + talos_common WARN + rospy.logwarn (pencere başına en çok bir uyarı).
+anomali:
+  churn_pencere_s: 10.0
+  churn_esik:      5
 
 # Emergency latch
 emergency:
-  release_clear_ticks: 8   # 8 tick (~0.8s) net olunca acil mühür çözülür
+  release_clear_ticks: 8   # ÖLÇÜLÜ temizlik (engel var ama d_arc ≥ eşik): 8 tick (~0.8s)
+  # P1 №7 (E5-O3): "temiz"in kaynağı ayrıldı. YOKLUK temizliği (engel_present=0,
+  # yani detektör dropout'u da olabilir) için ayrı, daha uzun eşik — 20260716
+  # vakasında 6.6-7 s'lik dropout mührü YANLIŞ anda çözdü, araç koniye ilerledi,
+  # yeniden mühürlendi. Ölçülü temizlik (gerçek d_arc kanıtı) 8 tick'te kalır.
+  release_yokluk_ticks: 20  # yokluk-temizliği: 20 tick (~2s) kesintisiz "engel yok" ister
+  # ---------------------------------------------------------------------
+  # Statik-durum çözme yolu (P0 №3, inceleme 2026-07-16 E8-R1)
+  # ---------------------------------------------------------------------
+  # Bırakma eşiği (d_arc ≥ engel_acil×1.5 = 1.8 m) STATİK yakın engelde
+  # (gözlenen 1.1-1.35 m) araç kımıldayamadığı için sağlanamıyordu → kalıcı
+  # acildurus kilidi (9 koşunun 5'i, sürenin ~%50'si). Koşullar sağlanınca
+  # mühür AÇIK KALIR (anında yeniden-mühür döngüsü yok) ama karar 'dur'a
+  # iner (reason: muhur_statik_dur) → control'ün reason-filtreli DUR-kaçışı
+  # (control.py DUR_KACIS_*) aracı geri çeker. control tarafındaki P0 №1
+  # OLMADAN tek başına anlamsızdır (araç dur'da da kımıldamaz, ama en
+  # azından %100 yerine %80 fren + izlenebilir reason üretir).
+  statik_cozme:
+    enabled:           true
+    min_muhur_s:       15.0   # mühür en az bu süredir kapalı olmalı
+    max_speed_kmh:     0.3    # araç fiilen hareketsiz (odom taze şart)
+    d_arc_sabit_ticks: 30     # d_arc bu kadar ardışık tick (~3 s @10Hz) tolerans içinde
+    d_arc_sabit_tol_m: 0.4    # sabitlik toleransı (duran araçta ölçüm jitter'ı ±0.2-0.4 m)
+    d_arc_min_m:       1.0    # güvenli taban: bunun altında (burun buruna) iniş YOK
 
 # Engel kaynağı — iki arayüz desteklenir, otomatik failover ile:
 #   1) YENI: talos_obstacle_detector → /obstacles/poses (geometry_msgs/PoseArray)
@@ -76,6 +220,45 @@ obstacle:
   axis_left: y                  # x | y | z  → "sol" hangi eksen
   invert_forward: false
   invert_left: false
+
+  # Yay-kapısı (2026-07-15) — ACİL bandı bisiklet-modeli farkındalı.
+  # Canlı bulgu (run 20260713T173335Z): 41° sağ-yanda 1.12 m'deki bordür,
+  # araç sola dönerken düz-koridor eşiğini kırıp acildurus'u 2 dk kilitledi.
+  # Artık acil tetik/release, mevcut direksiyonun 2B süpürme bandı (control.py
+  # ackermann_path_clears ile aynı matematik) içindeki en yakın engele (d_arc)
+  # bakar. dur/reroute/yavasla bantları d_center ile DEĞİŞMEDİ (planlama erken
+  # görmeli). Direksiyon verisi yok/bayat → d_arc=d_center (eski davranış).
+  arc_gate:
+    enabled: true
+    steer_topic: "/cart"        # cart_control (steer ∈ [-1,1], + sol). Bee1'de değişecek.
+    steer_full_deg: 28.95       # steer=1 karşılığı bisiklet açısı (urdf max_steer 0.5053 rad)
+    steer_max_age_s: 0.5        # direksiyon bundan bayatsa kapı devre dışı (fail-safe)
+    wheelbase_m: 1.86           # control.py WHEELBASE ile eşit tut
+    half_width_m: 0.75          # control.py ESTOP_BANT_YARIM_M ile eşit tut (0.6+0.15)
+    sensor_to_ra_m: 1.76        # control.py LIDAR_ARKA_AKS_M ile eşit tut
+    nose_m: 2.34                # arka aks → ön tampon (golf.urdf: 1.477+0.862)
+
+  # Duba DÜNYA-konum hafızası (dropout köprüsü) — obstacle_memory.py
+  # Detektör duba ~3m önümüzdeyken bile kareyi düşürünce engel_d_center boşalıyor
+  # → reroute flip-flop ("cone_temiz" her ~1s, karar bir kez cruise'a düştü; canlı
+  # teşhis manuel_103648Z, 2026-06-26). Hafıza: konfirme dubayı (yeterli hit +
+  # yaklaşıldı) gövde-frame'e geri-projekte edip füzyona enjekte eder → "lidar veri
+  # vermese bile o duba orada". Geçilince/timeout'ta düşer (doğal serbest bırakma).
+  memory:
+    enabled: true
+    assoc_radius_m:        1.5   # canlı nokta bu kadar yakınsa aynı duba (iz)
+    confirm_hits:          3     # bu kadar tick eşleşince (+yaklaşma) konfirme (~0.3s @10Hz)
+    confirm_approach_m:    9.0   # iz en az bir kez bu menzile girmiş olmalı ("yaklaştı"); =yavasla
+                                 #   bandı → reroute(6m)'den ÖNCE konfirme (ani-beliren dubada marj)
+    memory_ttl_s:          3.0   # konfirme iz canlı algı olmadan bu kadar tutulur
+    unconfirmed_ttl_s:     0.8   # konfirme olmamış iz bu süre algılanmazsa düşer (FP temizliği)
+    max_memory_s:         12.0   # mutlak tavan — YALNIZ hafızayla tutulan ize (canlı izi düşürmez)
+    inject_forward_min_m:  0.3   # yalnız bu kadar ÖNDE iz enjekte edilir
+    hold_forward_max_m:   14.0   # bu menzilden uzak iz enjekte edilmez
+    pass_behind_m:         1.5   # gövde ileri < -bu → araç geçti → iz düşer (Bee1 ~2.5m boy)
+    pos_alpha:             0.4   # dünya konumu EMA katsayısı (yeni gözleme doğru)
+    max_tracks:           12     # iz sayısı tavanı (önce konfirme-olmayanı at)
+    max_pose_jump_m:       2.0   # araç pozu bir tick'te bundan fazla atlarsa (odom reset) → hafıza sıfırla
 
 # Lane change guard'ları (sadece BT içinde; control.py kendi guard'ını ayrı uygular)
 lane_change:

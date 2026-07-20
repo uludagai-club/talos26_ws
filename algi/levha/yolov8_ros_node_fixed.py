@@ -39,6 +39,19 @@ SINIF_ESLESTIRME = {
 # Bbox yuksekliginden mesafe tahmini icin kalibrasyon (piksel * metre ~ sabit)
 # Yaklasik deger: 640px yukseklikte 2m mesafe -> K = 1280
 MESAFE_K = 1280.0
+# Yatay offset metre olcegi (goruntu yari-genisligi ~ +-3 m varsayimi)
+LATERAL_SCALE = 3.0
+# YOLO levha tespiti guven esigi
+CONF_ESIK = 0.5
+
+# Canlı parametreler: config/canli_params.yaml 'levha:' — restart'sız uygulanır
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle("levha", globals())
+except Exception as _canli_e:
+    _canli_izleyici = None
+    print(f"[levha] canli_params yok, statik parametreler: {_canli_e}", flush=True)
+
 
 class YOLOv8Node:
     def __init__(self):
@@ -92,6 +105,8 @@ class YOLOv8Node:
             en_yakin_levha_mesafe = 99.0
             en_yakin_yaya = None
             en_yakin_yaya_mesafe = 99.0
+            en_yakin_bilinmeyen = None
+            en_yakin_bilinmeyen_mesafe = 99.0
 
             if results[0].boxes is not None:
                 for box in results[0].boxes:
@@ -100,12 +115,12 @@ class YOLOv8Node:
                     cls_name = self.model.names.get(cls_id, "unknown")
                     conf = float(box.conf[0])
 
-                    if conf < 0.5:
+                    if conf < CONF_ESIK:
                         continue
 
                     # Merkez x (goruntude yatay konum, metre cinsinden kaba tahmin)
                     cx = float(x1 + x2) / 2
-                    x_offset = (cx - w / 2) / (w / 2) * 3.0  # yaklasik -3m ile +3m
+                    x_offset = (cx - w / 2) / (w / 2) * LATERAL_SCALE  # yaklasik -3m ile +3m
 
                     # Mesafe tahmini
                     mesafe = self.bbox_mesafe_tahmin(y1, y2, h)
@@ -119,10 +134,18 @@ class YOLOv8Node:
                             en_yakin_levha_mesafe = mesafe
                             levha_isim = SINIF_ESLESTIRME[cls_name]
                             en_yakin_levha = f"{levha_isim},{mesafe:.1f},{abs(x_offset):.1f}"
+                    else:
+                        # Tabloda olmayan sinif: dusurme, ham adiyla yayinla ki
+                        # karar/Decision'da gorunsun (BT bilinmeyen isimleri es gecer).
+                        if mesafe < en_yakin_bilinmeyen_mesafe:
+                            en_yakin_bilinmeyen_mesafe = mesafe
+                            en_yakin_bilinmeyen = f"{cls_name.upper()},{mesafe:.1f},{abs(x_offset):.1f}"
 
-            # karar_node'a yayinla
+            # karar_node'a yayinla — tablodaki sinif her zaman oncelikli
             if en_yakin_levha:
                 self.levha_pub.publish(en_yakin_levha)
+            elif en_yakin_bilinmeyen:
+                self.levha_pub.publish(en_yakin_bilinmeyen)
             else:
                 self.levha_pub.publish("none")
 

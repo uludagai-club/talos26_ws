@@ -8,23 +8,46 @@ from sensor_msgs.msg import PointCloud2
 from geometry_msgs.msg import PoseArray, Pose
 from visualization_msgs.msg import Marker, MarkerArray
 
+# ════════════════════════════════════════════════════════════════════════
+#   AYARLANABİLİR PARAMETRELER — hepsi burada
+#   (canlı: config/canli_params.yaml 'pointcloud:' — restart'sız uygulanır;
+#    rosparam ~ override'ları başlangıçta hâlâ geçerlidir)
+# ════════════════════════════════════════════════════════════════════════
+CLOUD_TOPIC              = "/cart/center_laser/scan"  # (RESTART) abonelik başlangıçta kurulur
+CLUSTER_DIST_THRESHOLD_M = 1.0    # m - kümeleme komşuluk eşiği
+MIN_CLUSTER_SIZE         = 10     # nokta - küme alt sınırı
+MAX_DISTANCE_M           = 12.0   # m - bu menzilin ötesi atılır
+MIN_DISTANCE_M           = 0.3    # m - bundan yakını atılır (öz-yansıma)
+MIN_HEIGHT_M             = -1.0   # m - z alt eşiği
+MAX_HEIGHT_M             = 2.0    # m - z üst eşiği
+
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle("pointcloud", globals())
+except Exception as _canli_e:
+    _canli_izleyici = None
+    print(f"[pointcloud_obstacle] canli_params yok, statik parametreler: {_canli_e}", flush=True)
+
 
 class PointCloudObstaclePublisher:
     def __init__(self):
         rospy.init_node("pointcloud_obstacle_publisher")
 
-        self.cloud_topic = rospy.get_param("~cloud_topic", "/cart/center_laser/scan")
-        self.cluster_dist_threshold = rospy.get_param("~cluster_dist_threshold", 1.0)
-        self.min_cluster_size = rospy.get_param("~min_cluster_size", 10)
-        self.max_distance = rospy.get_param("~max_distance", 12.0)
-        self.min_distance = rospy.get_param("~min_distance", 0.3)
-        self.min_height = rospy.get_param("~min_height", -1.0)
-        self.max_height = rospy.get_param("~max_height", 2.0)
+        # rosparam (~) verilmişse başlangıçta üst bloğu ezer; verilmemişse
+        # üst blok (veya canli_params.yaml override'ı) geçerli kalır.
+        for _ad, _param in [("CLOUD_TOPIC", "~cloud_topic"),
+                            ("CLUSTER_DIST_THRESHOLD_M", "~cluster_dist_threshold"),
+                            ("MIN_CLUSTER_SIZE", "~min_cluster_size"),
+                            ("MAX_DISTANCE_M", "~max_distance"),
+                            ("MIN_DISTANCE_M", "~min_distance"),
+                            ("MIN_HEIGHT_M", "~min_height"),
+                            ("MAX_HEIGHT_M", "~max_height")]:
+            globals()[_ad] = rospy.get_param(_param, globals()[_ad])
 
         self.pose_pub = rospy.Publisher("/obstacle_positions", PoseArray, queue_size=10)
         self.marker_pub = rospy.Publisher("/obstacle_markers", MarkerArray, queue_size=10)
 
-        rospy.Subscriber(self.cloud_topic, PointCloud2, self.cloud_callback)
+        rospy.Subscriber(CLOUD_TOPIC, PointCloud2, self.cloud_callback)
 
     def cloud_callback(self, msg):
         points = []
@@ -56,9 +79,9 @@ class PointCloudObstaclePublisher:
             if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
                 continue
             dist = math.hypot(x, y)
-            if dist < self.min_distance or dist > self.max_distance:
+            if dist < MIN_DISTANCE_M or dist > MAX_DISTANCE_M:
                 continue
-            if z < self.min_height or z > self.max_height:
+            if z < MIN_HEIGHT_M or z > MAX_HEIGHT_M:
                 continue
             points.append((x, y))
 
@@ -120,14 +143,14 @@ class PointCloudObstaclePublisher:
             curr = points[i]
             dist = math.hypot(curr[0] - prev[0], curr[1] - prev[1])
 
-            if dist < self.cluster_dist_threshold:
+            if dist < CLUSTER_DIST_THRESHOLD_M:
                 current_cluster.append(curr)
             else:
-                if len(current_cluster) >= self.min_cluster_size:
+                if len(current_cluster) >= MIN_CLUSTER_SIZE:
                     clusters.append(current_cluster)
                 current_cluster = [curr]
 
-        if len(current_cluster) >= self.min_cluster_size:
+        if len(current_cluster) >= MIN_CLUSTER_SIZE:
             clusters.append(current_cluster)
 
         return clusters

@@ -6,7 +6,6 @@ import struct
 import math
 import sys
 import os
-import time
 
 # ROS Mesaj Tipleri
 from nav_msgs.msg import Odometry
@@ -51,12 +50,14 @@ class TalosStateToCAN:
         self.accel_y = 0.0
         self.accel_z = 0.0
 
-        # Batarya Simülasyonu (Gerçek sensör yoksa simüle et)
-        self.battery_soc = 100.0  # %
-        self.battery_voltage = 48.0  # V
-        self.battery_current = 0.0  # A
-        self.battery_temperature = 25  # °C
-        self.battery_sim_enabled = True
+        # Batarya (A13 — ekip kararı: zamana bağlı uydurma deşarj modeli
+        # kaldırıldı). /battery_state'ten gerçek veri gelirse battery_callback
+        # bunları günceller; hiç gelmezse SABİT nominal Bee1 değerlerinde kalır
+        # (FB_OMUX_to_AUTONOMOUS.FB_BatteryVoltage/FB_BatterySOC semantiği).
+        self.battery_soc = 95.0        # % - nominal (gerçek veri yoksa)
+        self.battery_voltage = 72.0    # V - nominal Bee1 (gerçek veri yoksa)
+        self.battery_current = 0.0     # A - nominal (gerçek veri yoksa)
+        self.battery_temperature = 25  # °C - nominal (gerçek veri yoksa)
 
         # Park Freni
         self.park_brake_active = False
@@ -68,20 +69,18 @@ class TalosStateToCAN:
         self.sub_error_code = 0
         self.system_status = 0x01  # Bit 0: Sistem çalışıyor
 
-        # Simülasyon başlangıç zamanı
-        self.start_time = time.time()
-
         # Subscriber'lar
         rospy.Subscriber('/base_pose_ground_truth', Odometry, self.odom_callback)
         rospy.Subscriber('/imu', Imu, self.imu_callback)
 
-        # Opsiyonel subscriber'lar (varsa)
-        try:
-            rospy.Subscriber('/battery_state', BatteryState, self.battery_callback)
-            self.battery_sim_enabled = False
-            rospy.loginfo("  Gerçek batarya verisi kullanılıyor")
-        except:
-            rospy.loginfo("  Batarya simülasyonu aktif")
+        # /battery_state abone ol — geldiyse battery_callback gerçek değerleri
+        # günceller; hiç mesaj gelmezse __init__'te set edilen SABİT nominal
+        # değerler (72V/%95) kalır. (A13: eski try/except gizli bug'ıydı —
+        # rospy.Subscriber() bir yayıncı olmasa bile ASLA istisna atmaz, yani
+        # self.battery_sim_enabled = False HER ZAMAN set ediliyordu; o değişken
+        # ve zamana bağlı uydurma deşarj modeliyle birlikte kaldırıldı.)
+        rospy.Subscriber('/battery_state', BatteryState, self.battery_callback)
+        rospy.loginfo("  Batarya: gerçek /battery_state verisi veya sabit nominal (72V/%95)")
 
         # El freni durumunu /cart topic'inden al
         if CART_MSG_AVAILABLE:
@@ -108,12 +107,9 @@ class TalosStateToCAN:
         v_ms = math.sqrt(vx**2 + vy**2)
 
         self.actual_speed_kmh = v_ms * 3.6
-
-        # Batarya simülasyonu: Hız arttıkça akım çeker
-        if self.battery_sim_enabled:
-            # Basit enerji modeli: I = P/V, P ~ v^2
-            power_draw = 50 + (v_ms ** 2) * 20  # Watt
-            self.battery_current = -power_draw / self.battery_voltage  # Negatif = deşarj
+        # (A13: hıza bağlı uydurma akım-çekme modeli kaldırıldı — battery_current
+        # artık ya gerçek /battery_state'ten (battery_callback) ya da SABİT
+        # nominal 0.0 A'de kalır.)
 
     def imu_callback(self, msg):
         self.accel_x = msg.linear_acceleration.x
@@ -134,41 +130,23 @@ class TalosStateToCAN:
         # El freni durumu (0.5'ten büyükse aktif).
         # getattr: sim v0.3'un cart_control.msg'inde 'handbrake' alani YOK. Duz erisim
         # her karede AttributeError atardi — rospy callback istisnasini yutar, yani node
-        # olmez ama 20 Hz log spam'i akar. Alan yoksa "park freni serbest" varsayiyoruz
-        # (can_bridge de o surumde 0x305 geri-bildirimini zaten yaymiyor).
+        # olmez ama 20 Hz log spam'i akar ve 0x305 zaten yayinlanamaz. Alan yoksa
+        # "park freni serbest" varsayiyoruz (can_bridge de o surumde 0x305'i yaymiyor).
         self.park_brake_active = getattr(msg, 'handbrake', 0.0) > 0.5
 
-    def simulate_battery(self):
-        """Batarya durumunu simüle et"""
-        if not self.battery_sim_enabled:
-            return
-
-        elapsed = time.time() - self.start_time
-
-        # SoC azalması (çok yavaş - demo için)
-        discharge_rate = 0.001  # %/saniye (yaklaşık 28 saatlik kullanım)
-        self.battery_soc = max(0, 100.0 - elapsed * discharge_rate)
-
-        # Voltaj SoC'ye bağlı (48V nominal, 42V boş, 54V dolu)
-        self.battery_voltage = 42.0 + (self.battery_soc / 100.0) * 12.0
-
-        # Sıcaklık simülasyonu (akıma bağlı ısınma)
-        base_temp = 25
-        heat_from_current = abs(self.battery_current) * 0.5
-        self.battery_temperature = int(min(60, base_temp + heat_from_current))
-
     def send_can_messages(self, event):
-        # Batarya simülasyonunu güncelle
-        self.simulate_battery()
-
         # --- MESAJ 1: Araç Durumu (ID: 0x301) ---
-        # Byte 0-1: Gerçek Hız (km/h * 100)
-        # Byte 2-3: Motor Devri (Hıza bağlı uydurma RPM)
+        # Byte 0-1: Gerçek Hız (km/h * 100) — decode_real_speed (can_decoder.py,
+        #           ×0.01) ile eşleşir (B4)
+        # Byte 2-3: Motor Devri — Bee1 VehicleRPM TEKER devridir (A13, dokümana
+        #           göre düzeltme; teker yarıçapı 0.2575 m, golf.urdf)
 
-        speed_raw = int(abs(self.actual_speed_kmh) * 100)
+        speed_raw = max(0, min(65535, int(abs(self.actual_speed_kmh) * 100)))
 
-        # Basit RPM simülasyonu: Rolanti 800 + Hız * 100
-        rpm = 800 + int(abs(self.actual_speed_kmh) * 150)
+        # Teker devri: rpm = v_ms / (2*pi*teker_yaricapi) * 60
+        v_ms = abs(self.actual_speed_kmh) / 3.6
+        WHEEL_RADIUS_M = 0.2575  # m - golf.urdf
+        rpm = int(v_ms / (2 * math.pi * WHEEL_RADIUS_M) * 60)
         if rpm > 6000:
             rpm = 6000
 
@@ -179,6 +157,7 @@ class TalosStateToCAN:
         msg1 = can.Message(arbitration_id=CANMessageID.SPEED_RPM, data=data_301, is_extended_id=False)
 
         # --- MESAJ 2: IMU / İvme (ID: 0x302) ---
+        # Bee1: IMU Xsens ROS sürücüsünden gelir; sim /imu buna denk (A13)
         # Byte 0-1: X İvmesi (m/s^2 * 100) + Offset
         # Byte 2-3: Y İvmesi
         # Byte 4-5: Z İvmesi

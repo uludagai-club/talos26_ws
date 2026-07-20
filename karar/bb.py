@@ -41,8 +41,18 @@ class Observations:
     engel_last_seen: float = 0.0
     engel_left_last_seen:  float = 0.0   # yan sektör ayrı tazelik (lane-change güvenliği)
     engel_right_last_seen: float = 0.0
-    engel_source: str = "none"           # "poses" (yeni detektör) | "legacy" | "none" — debug
+    engel_source: str = "none"           # "poses" (yeni detektör) | "poses+mem" | "legacy" | "none" — debug
     engel_count: int = 0                 # ileri bakış içindeki engel sayısı — debug
+    engel_mem_count: int = 0             # bu tick hafızadan enjekte edilen duba sayısı (dropout köprüsü) — debug
+    # Yay-kapısı (2026-07-15): mevcut direksiyonun süpürme bandı İÇİNDEKİ en
+    # yakın engel menzili. ACİL tetik/release BUNU okur (d_center değil) —
+    # yan nesne bisiklet yayının dışındaysa acildurus atılmaz. Direksiyon
+    # verisi yok/bayatsa ros_bridge buraya d_center yazar (fail-safe: eski davranış).
+    engel_d_arc: float = _INF
+
+    # --- Direksiyon (yay-kapısı girdisi; /cart cart_control.steer × steer_full_deg) ---
+    steer_deg: float = 0.0               # bisiklet-modeli komut açısı; + sol
+    steer_last_seen: float = 0.0
 
     # --- Şerit ---
     lane_offset_px: float = 0.0
@@ -76,7 +86,13 @@ class StatePersist:
 
     # Emergency latch
     emergency_latched: bool = False
-    emergency_clear_streak: int = 0
+    emergency_clear_streak: int = 0          # her tür temizlik (yokluk dahil) ardışık tick
+    emergency_clear_streak_olculu: int = 0   # yalnız ÖLÇÜLÜ temizlik (d_arc≥eşik) ardışık tick (P1 №7)
+    # Statik-durum çözme yolu (P0 №3, inceleme 2026-07-16 E8-R1):
+    # LatchEmergency kurar, ReleaseEmergencyIfClear okur/günceller.
+    emergency_latch_start_s: float = 0.0      # mührün kurulduğu an (time.time)
+    emergency_d_arc_ref: float = _INF         # d_arc sabitlik takibi referansı
+    emergency_d_arc_stable_ticks: int = 0     # d_arc referans ± tolerans içinde kalınan ardışık tick
 
     # DUR levhası FSM: "idle" | "holding" | "released"
     stop_sign_phase: str = "idle"
@@ -88,6 +104,20 @@ class StatePersist:
     # tutmalı; aksi halde "dur"/"normal" manevrayı keser).
     last_lane_change_s: float = 0.0
     lane_change_dir: str = ""          # "sol" | "sag" | "" — devam eden manevranın yönü
+
+    # Yol-bilinçli kaçış (KacisYonuSec yazar; KacisKarar + logger okur)
+    kacis_yon: str = ""               # "sol" | "sag" | "" — bu tick seçilen kaçış yönü
+    kacis_kaynak: str = ""            # "rota" (çapraz-çarpım) | "yan_sektor" (en açık) | ""
+    kacis_lateral_m: float = 0.0      # engelin rotaya işaretli yanal uzaklığı (sol+)
+    kacis_engel_dunya: tuple = (0.0, 0.0)  # son hesaplanan engel dünya konumu (debug)
+
+    # Cone reroute (RerouteKarar yazar; node RerouteManager ile kenar_blok yönetir) — §16/E-A,E-B
+    reroute_request: bool = False           # bu tick bloklu cone var mı (reroute talebi); node tüketince sıfırlar
+    reroute_cone_world: tuple = (0.0, 0.0)  # bloklu cone'un dünya konumu (/hedef_komut kenar_blok için)
+
+    # Sollama/reroute aynası (yalnız snapshot/log için)
+    overtake_active: bool = False
+    overtake_return_dist_m: float = 0.0
 
     # Debounce sayaçları (key -> ardışık true tick sayısı)
     debounce: dict = field(default_factory=dict)
@@ -116,6 +146,17 @@ class Blackboard:
             for k, v in kw.items():
                 setattr(self.obs, k, v)
 
+    def read_pose(self) -> tuple:
+        """(x, y, yaw, odom_last_seen) — lock altında TUTARLI okuma.
+
+        _on_odom (arka iplik) bu dört alanı birlikte write() ile yazar; başka bir
+        callback (ör. ros_bridge memory köprüsü) lock'suz üç ayrı okursa yarı-yazılmış
+        poz (x_eski, yaw_yeni) yakalayabilir → yanlış dünya konumu (/incele ROS+güvenlik).
+        """
+        with self._lock:
+            o = self.obs
+            return (o.x, o.y, o.yaw, o.odom_last_seen)
+
     def snapshot(self) -> dict:
         """Debug/logging için anlık özet (JSON'a çevrilebilir)."""
         o = self.obs
@@ -132,6 +173,7 @@ class Blackboard:
                 "age_s": _age(o.engel_last_seen),
                 "source": o.engel_source,
                 "count": o.engel_count,
+                "mem": o.engel_mem_count,
             },
             "speed_kmh": o.speed_kmh,
             "state": {

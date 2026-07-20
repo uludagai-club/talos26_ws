@@ -23,25 +23,57 @@ from bb import Blackboard
 from behaviors.conditions import (
     YayaFresh, LevhaFresh, EngelFresh,
     YayaVarMi, YayaCokYakin, YayaYakin, YayaOrtaMesafe,
-    EngelCokYakin, EngelMerkezBlokaj, YanSektorBos,
+    EngelCokYakin, EngelMerkezBlokaj,
     LevhaIs, LevhaIcindeMesafe,
     LaneChangeCooldownOk, LaneChangeInProgress,
 )
 from behaviors.actions import (
     SetKarar, LatchEmergency, ReleaseEmergencyIfClear,
-    DurLevhasiFSM, LaneChangeStamp, HoldLaneChange,
+    DurLevhasiFSM, LaneChangeStamp, RerouteKarar, HoldLaneChange,
 )
 from behaviors.decorators import Debounce
 
 
 def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     """Ağacı kur. `p` config/params.yaml içeriğidir."""
-    fresh = p["freshness"]
+    # ===================================================================
+    # AYAR BLOĞU — ENGEL / ŞERİT MESAFELERİ  (sahada hızlı tune için TEK YER)
+    # -------------------------------------------------------------------
+    # Tüm engel tepki bantları control.py WP_NEAR_DISTANCE referansından
+    # ± delta ile türetilir. Bir mesafeyi değiştirmek için: config/params.yaml
+    # içindeki ilgili anahtarı düzenle (yoksa buradaki default geçerli).
+    # Bant sırası (yakın → uzak):  acil < dur < block(reroute) < yavasla
+    #   acil    ≈ 1.2 m  → acil durus (emniyetli son çare; e-stop control'de de var)
+    #   dur     ≈ 2.0 m  → reroute saptıramadı/cone çok yakın → tam dur (güvenlik ağı)
+    #   block   ≈ 6.0 m  → cone REROUTE tetiği: 'slow' + hedef'e kenar_blok (§16 E-A/E-B)
+    #   yavasla ≈ 9.0 m  → en dış: tepki başlar, yavaşla (reroute talebi yok, sadece yaklaş)
+    # MİMARİ (§16/§12.13): cone artık sol/sag direksiyon manevrasıyla DEĞİL,
+    #   planlayıcının (hedef) rotayı dubanın etrafından çizmesiyle geçilir. Karar
+    #   commit bandında 'slow' verir + cone'u kenar_blok ile hedef'e bildirir;
+    #   control offset YAPMAZ (H-A kaldırıldı), yalnız rerouted rotayı takip eder.
+    #   block menzili = hedef'in replan + control'ün tepki payı (6m kalibre, §12.12).
+    # ===================================================================
+    wp   = p.get("wp_planlama", {}) or {}
+    lc   = p["lane_change"]
     dist = p["distances"]
+
+    wp_near        = float(wp.get("control_wp_near_m",     1.5))   # = control.py WP_NEAR_DISTANCE (senkron tut!)
+
+    engel_acil_m      = max(0.3, wp_near + float(wp.get("engel_acil_delta_m",    -0.3)))  # acil durus
+    engel_dur_m       =          wp_near + float(wp.get("engel_dur_delta_m",      0.5))   # reroute saptıramazsa dur (güvenlik ağı)
+    engel_block_m     =          wp_near + float(wp.get("engel_block_delta_m",    4.5))   # cone REROUTE commit (§12.12: →6.0m)
+    engel_yavasla_m   =          wp_near + float(wp.get("engel_yavasla_delta_m",  7.5))   # en dış: yavasla (→9.0m)
+    # NOT: kacis_deadband/varsayilan_yon/wp_hyst/engel_yan_clear_m artık kullanılmıyor
+    #      (sol/sag yön seçimi §16/E-B ile kaldırıldı; cone reroute yön istemez).
+
+    lc_cooldown_s = float(lc.get("cooldown_s",      4.0))   # ardışık şerit değişimi arası bekleme (levha SAG/SOL için)
+    lc_hold_s     = float(lc.get("maneuver_hold_s", 2.0))   # = control.py LANE_CHANGE_DURATION (manevra tut süresi)
+    # ===================================================================
+
+    fresh = p["freshness"]
     timer = p["timers"]
     deb = p["debounce"]
     emer = p["emergency"]
-    lc = p["lane_change"]
     sa = p.get("speed_adaptive", {})
     # Hız-uyumu kapalıysa gain'leri 0'la → eşikler tabanda kalır
     sa_on = bool(sa.get("enabled", False))
@@ -60,7 +92,13 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         bb,
         release_clear_ticks=emer["release_clear_ticks"],
         yaya_esik=dist["yaya_acil_durus_m"] * 1.5,   # mührün çözülmesi için biraz daha geniş
-        engel_esik=dist["engel_acil_m"] * 1.5,
+        engel_esik=engel_acil_m * 1.5,
+        # P0 №3 (E8-R1): statik engelde mühürden 'dur'a iniş — control'ün
+        # DUR-kaçışıyla (P0 №1) birlikte kilit kırıcı; params.yaml'dan kapılı.
+        statik_cozme=emer.get("statik_cozme", {}),
+        odom_max_age_s=odom_age,
+        # P1 №7 (E5-O3): yokluk-temizliği (dropout olabilir) için ayrı uzun eşik
+        release_yokluk_ticks=emer.get("release_yokluk_ticks"),
     )
 
     # ============================================================
@@ -73,7 +111,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
                 EngelFresh(bb, fresh["engel_max_age_s"]),
                 Debounce(
                     "EngelCokYakinDeb",
-                    EngelCokYakin(bb, dist["engel_acil_m"]),
+                    EngelCokYakin(bb, engel_acil_m),
                     bb, key="engel_emergency",
                     min_consecutive=deb["engel_min_consecutive"],
                 ),
@@ -154,32 +192,34 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     ])
 
     # ============================================================
-    # 5. Engelden kaçınma
+    # 5. Engelden kaçınma — CONE REROUTE (§16/§12.13 yeni mimari)
+    #    Dış kapı: engel yavasla bandında (en geniş) → en az "yavasla".
+    #    İçeride öncelik:
+    #      a) commit (block) bandında → REROUTE: 'slow' + hedef'e kenar_blok
+    #         (cone çok yakınsa/dur bandında RerouteKarar 'dur' güvenlik-ağına düşer)
+    #      b) aksi halde (block↔yavasla arası) → yavasla (yaklaşıyor, henüz blok yok)
+    #    sol/sag KALDIRILDI (E-B): cone artık control offset'iyle değil planlayıcı
+    #    rerouteu ile geçiliyor → karar yalnız 'slow'/'dur'; control rerouted rotayı
+    #    düz takip eder (H-A). acildurus/dur safety-net üstte+RerouteKarar içinde.
     # ============================================================
-    avoid_left = Sequence("AvoidLeft", memory=False, children=[
-        YanSektorBos(bb, "sol", dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
-        LaneChangeCooldownOk(bb, lc["cooldown_s"]),
-        LaneChangeStamp(bb, "sol"),
-        SetKarar("Karar=SOL(engel)", bb, karar="sol", reason="engel_sol_kacis"),
+    road_reroute = Sequence("RoadReroute", memory=False, children=[
+        EngelMerkezBlokaj(bb, engel_block_m),                 # commit (reroute) bandında mı?
+        RerouteKarar(bb, dur_esik_m=engel_dur_m),             # slow + kenar_blok talebi (≤dur → dur)
     ])
-    avoid_right = Sequence("AvoidRight", memory=False, children=[
-        YanSektorBos(bb, "sag", dist["engel_yan_clear_m"], fresh["engel_max_age_s"]),
-        LaneChangeCooldownOk(bb, lc["cooldown_s"]),
-        LaneChangeStamp(bb, "sag"),
-        SetKarar("Karar=SAG(engel)", bb, karar="sag", reason="engel_sag_kacis"),
-    ])
+    engel_yavasla = SetKarar("Karar=SLOW(engel)", bb, karar="slow",
+                             reason="engel_yavasla", phase="approach")
+
     obstacle_avoidance = Sequence("ObstacleAvoidance", memory=False, children=[
         EngelFresh(bb, fresh["engel_max_age_s"]),
-        Debounce("EngelMerkezDeb",
-                 EngelMerkezBlokaj(bb, dist["engel_block_m"],
+        Debounce("EngelTepkiDeb",
+                 EngelMerkezBlokaj(bb, engel_yavasla_m,        # en dış: yavasla bandı
                                    gain_s=_gain("engel_block_gain_s"),
                                    max_extra_m=sa_max_extra, odom_max_age_s=odom_age),
                  bb, key="engel_blokaj",
                  min_consecutive=deb["engel_min_consecutive"]),
-        Selector("AvoidOrStop", memory=False, children=(
-            [avoid_left, avoid_right] if lc["enabled"] else []
-        ) + [
-            SetKarar("Karar=DUR(engel)", bb, karar="dur", reason="engel_blokaj"),
+        Selector("EngelTepki", memory=False, children=[
+            road_reroute,       # commit bandı → slow + kenar_blok reroute (≤dur → dur)
+            engel_yavasla,      # block↔yavasla arası → slow
         ]),
     ])
 
@@ -191,7 +231,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     #     Emergency/yaya/dur-levhası/kırmızı bu dalın ÜZERİNDE → her zaman önceliklidir.
     # ============================================================
     lane_change_hold = Sequence("LaneChangeHold", memory=False, children=[
-        LaneChangeInProgress(bb, lc.get("maneuver_hold_s", 2.0)),
+        LaneChangeInProgress(bb, lc_hold_s),
         HoldLaneChange(bb),
     ])
 
@@ -201,14 +241,14 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     direction_right = Sequence("DirectionRight", memory=False, children=[
         LevhaFresh(bb, fresh["levha_max_age_s"]),
         LevhaIcindeMesafe(bb, "SAG", dist["yon_levha_max_m"]),
-        LaneChangeCooldownOk(bb, lc["cooldown_s"]),
+        LaneChangeCooldownOk(bb, lc_cooldown_s),
         LaneChangeStamp(bb, "sag"),
         SetKarar("Karar=SAG(levha)", bb, karar="sag", reason="yon_levhasi_sag"),
     ])
     direction_left = Sequence("DirectionLeft", memory=False, children=[
         LevhaFresh(bb, fresh["levha_max_age_s"]),
         LevhaIcindeMesafe(bb, "SOL", dist["yon_levha_max_m"]),
-        LaneChangeCooldownOk(bb, lc["cooldown_s"]),
+        LaneChangeCooldownOk(bb, lc_cooldown_s),
         LaneChangeStamp(bb, "sol"),
         SetKarar("Karar=SOL(levha)", bb, karar="sol", reason="yon_levhasi_sol"),
     ])

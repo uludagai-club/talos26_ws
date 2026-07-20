@@ -15,6 +15,7 @@ import py_trees
 from py_trees.common import Status
 
 from bb import Blackboard
+from avoidance_geometry import obstacle_world_pos
 
 
 # ============================================================
@@ -58,8 +59,15 @@ class LatchEmergency(py_trees.behaviour.Behaviour):
         self.reason = reason
 
     def update(self):
+        # Bu node yalnız mühür KAPALIYKEN tick'lenir (mühür açıkken üstteki
+        # ReleaseEmergencyIfClear SUCCESS döner ve selector keser) → burası
+        # daima "yeni mühür" anıdır: statik-çözme takibi sıfırdan başlar (P0 №3).
+        self.bb.state.emergency_latch_start_s = time.time()
+        self.bb.state.emergency_d_arc_ref = float("inf")
+        self.bb.state.emergency_d_arc_stable_ticks = 0
         self.bb.state.emergency_latched = True
         self.bb.state.emergency_clear_streak = 0
+        self.bb.state.emergency_clear_streak_olculu = 0
         self.bb.last_decision = {
             "karar": "acildurus",
             "reason": f"emergency_latch:{self.reason}",
@@ -71,14 +79,73 @@ class LatchEmergency(py_trees.behaviour.Behaviour):
 
 class ReleaseEmergencyIfClear(py_trees.behaviour.Behaviour):
     """Mühür kapalıyken NoOp. Açıkken: tüm tehlikeler temiz mi diye bakar;
-    N tick üst üste temizse mührü çözer."""
+    N tick üst üste temizse mührü çözer.
 
-    def __init__(self, bb: Blackboard, release_clear_ticks: int, yaya_esik: float, engel_esik: float):
+    Statik-durum çözme yolu (P0 №3, inceleme 2026-07-16 E8-R1, param-kapılı):
+    Bırakma eşiği (d_arc ≥ engel_esik) STATİK yakın engelde yapısal olarak
+    sağlanamaz — acil'de control steer=0 yollar, d_arc /cart steer'inden
+    hesaplandığı için düz-koridor mesafesine donar ve araç kımıldayamadığı
+    için mesafe hiç büyümez (9 koşunun 5'i kalıcı kilit, sürenin ~%50'si).
+    Mühür uzun süredir kapalı + araç hareketsiz + d_arc stabil + güvenli
+    tabanın ÜSTÜNDEyse: mühür AÇIK KALIR (tam çözülme yok → EngelCokYakin+
+    Debounce'un anında yeniden mühürleme döngüsü kurulmaz) ama karar
+    'acildurus' yerine 'dur'a İNER (reason: muhur_statik_dur) → control'ün
+    reason-filtreli DUR-kaçışı (P0 №1) aracı geri çekebilir; kalıcı çözülme
+    araç uzaklaşınca normal d_arc yolundan gelir."""
+
+    def __init__(self, bb: Blackboard, release_clear_ticks: int, yaya_esik: float, engel_esik: float,
+                 statik_cozme: dict = None, odom_max_age_s: float = 0.5,
+                 release_yokluk_ticks: int = None):
         super().__init__("ReleaseEmergencyIfClear")
         self.bb = bb
         self.release_clear_ticks = int(release_clear_ticks)
+        # P1 №7 (E5-O3): "temiz"in kaynağı ayrık — yokluk-temizliği (engel_present=0;
+        # detektör dropout'u da olabilir) için daha uzun eşik. None → eski davranış.
+        self.release_yokluk_ticks = int(release_yokluk_ticks
+                                        if release_yokluk_ticks is not None
+                                        else release_clear_ticks)
         self.yaya_esik = yaya_esik
         self.engel_esik = engel_esik
+        sc = statik_cozme or {}
+        self.statik_enabled = bool(sc.get("enabled", False))
+        self.statik_min_muhur_s = float(sc.get("min_muhur_s", 15.0))
+        self.statik_max_speed_kmh = float(sc.get("max_speed_kmh", 0.3))
+        self.statik_d_arc_ticks = int(sc.get("d_arc_sabit_ticks", 30))
+        self.statik_d_arc_tol_m = float(sc.get("d_arc_sabit_tol_m", 0.4))
+        self.statik_d_arc_min_m = float(sc.get("d_arc_min_m", 1.0))
+        self.odom_max_age_s = float(odom_max_age_s)
+
+    def _statik_dur_kosullari(self) -> bool:
+        """Statik-durum inişinin tüm kapıları (mühür açıkken her tick çağrılır).
+        d_arc sabitlik sayacını da burada ilerletir/sıfırlar."""
+        o = self.bb.obs
+        s = self.bb.state
+        d = o.engel_d_arc
+        # Sabitlik takibi: referans ± tolerans içinde kal → say; kır → referansı tazele.
+        # Tolerans, duran araçta gözlenen detektör jitter'ına göre geniş (±0.2-0.4 m);
+        # gerçek hareketli nesne (yaya ~1 m/s) 3 s pencerede bandı kesin kırar.
+        # DROPOUT TOLERANSI (canlı doğrulama 2026-07-17, ros 263-357 mühürü):
+        # tek-tick algı dropout'u (d_arc=inf, E3 flicker'ı ~1-2 Hz) sayacı
+        # SIFIRLAMAZ — dropout "sahne değişti" kanıtı değildir; sıfırlasaydı
+        # 30 ardışık tick hiç birikmez, statik yol hiç açılmazdı. Engelin
+        # gerçekten temizlenmesi normal release yolunun işi (8 temiz tick).
+        if math.isfinite(d):
+            if (math.isfinite(s.emergency_d_arc_ref)
+                    and abs(d - s.emergency_d_arc_ref) <= self.statik_d_arc_tol_m):
+                s.emergency_d_arc_stable_ticks += 1
+            else:
+                s.emergency_d_arc_ref = d
+                s.emergency_d_arc_stable_ticks = 0
+        if not self.statik_enabled:
+            return False
+        now = time.time()
+        odom_taze = (now - o.odom_last_seen) <= self.odom_max_age_s
+        return (now - s.emergency_latch_start_s >= self.statik_min_muhur_s
+                and odom_taze
+                and abs(o.speed_kmh) <= self.statik_max_speed_kmh
+                and s.emergency_d_arc_stable_ticks >= self.statik_d_arc_ticks
+                and math.isfinite(d)
+                and d >= self.statik_d_arc_min_m)
 
     def update(self):
         if not self.bb.state.emergency_latched:
@@ -86,20 +153,48 @@ class ReleaseEmergencyIfClear(py_trees.behaviour.Behaviour):
 
         o = self.bb.obs
         yaya_clear = (not o.yaya_present) or (o.yaya_distance < 0) or (o.yaya_distance >= self.yaya_esik)
-        # Engel present ama mesafe inf ise sensör verisi eksik → güvenli tarafta kal
+        # Engel present ama d_center inf ise sensör verisi eksik → güvenli tarafta kal.
+        # Temizlik ölçüsü d_arc (yay-kapısı, 2026-07-15): araç direksiyonu engeli
+        # temizleyen bir yaya çevirdiyse (d_arc=inf ya da ≥ eşik) mühür çözülür;
+        # ölü-merkez engel her direksiyonda bant içinde kalır → mühür durur.
         engel_d_valid = math.isfinite(o.engel_d_center)
-        engel_clear = (not o.engel_present) or (engel_d_valid and o.engel_d_center >= self.engel_esik)
+        # P1 №7 (E5-O3): iki AYRI temizlik kaynağı, iki ayrı sayaç.
+        #   ölçülü  = engel VAR ama d_arc ≥ eşik (gerçek geometrik kanıt) → 8 tick
+        #   yokluk  = engel_present=0 (temiz de olabilir, dropout da!)     → 20 tick
+        # 20260716 vakası: 6.6-7 s'lik detektör dropout'u mührü 8 tick'te YANLIŞ
+        # anda çözdü → araç koniye ilerledi → yeniden mühür (E5 flip döngüsü).
+        engel_olculu_clear = o.engel_present and engel_d_valid and o.engel_d_arc >= self.engel_esik
+        engel_yokluk = not o.engel_present
 
-        if yaya_clear and engel_clear:
+        if yaya_clear and (engel_olculu_clear or engel_yokluk):
             self.bb.state.emergency_clear_streak += 1
         else:
             self.bb.state.emergency_clear_streak = 0
+        if yaya_clear and engel_olculu_clear:
+            self.bb.state.emergency_clear_streak_olculu += 1
+        else:
+            self.bb.state.emergency_clear_streak_olculu = 0
 
-        if self.bb.state.emergency_clear_streak >= self.release_clear_ticks:
+        if (self.bb.state.emergency_clear_streak_olculu >= self.release_clear_ticks
+                or self.bb.state.emergency_clear_streak >= self.release_yokluk_ticks):
             self.bb.state.emergency_latched = False
             self.bb.state.emergency_clear_streak = 0
+            self.bb.state.emergency_clear_streak_olculu = 0
+            self.bb.state.emergency_d_arc_ref = float("inf")
+            self.bb.state.emergency_d_arc_stable_ticks = 0
             # Mühür çözüldü ama bu tick hâlâ "acildurus" değil — alt dallar konuşsun.
             return Status.FAILURE  # üst selector bir sonraki dalı denesin
+
+        # P0 №3: statik-durum inişi — mühür açık kalır, karar 'dur'a iner.
+        # Yaya temiz DEĞİLSE inilmez (yaya bağlamında tam fren korunur).
+        if yaya_clear and self._statik_dur_kosullari():
+            self.bb.last_decision = {
+                "karar": "dur",
+                "reason": "muhur_statik_dur",
+                "phase": "emergency",
+                "wait_remaining_s": 0.0,
+            }
+            return Status.SUCCESS
 
         # Mühür hâlâ kapalı → acildurus yay
         self.bb.last_decision = {
@@ -214,6 +309,91 @@ class LaneChangeStamp(py_trees.behaviour.Behaviour):
     def update(self):
         self.bb.state.last_lane_change_s = time.time()
         self.bb.state.lane_change_dir = self.direction
+        return Status.SUCCESS
+
+
+class KacisKarar(py_trees.behaviour.Behaviour):
+    """Yol-bilinçli kaçış kararı: bb.state.kacis_yon yönünde "sol"/"sag" üretir
+    ve cooldown/yön kilidini damgalar (LaneChangeStamp işini de yapar).
+
+    Statik [avoid_left, avoid_right] (sol-öncelikli) sırasının yerine geçer:
+    yön artık KacisYonuSec tarafından waypoint'lere göre seçilmiştir. Reason'a
+    seçim kaynağı (rota/yan_sektor) gömülür → karar logundan izlenebilir.
+    """
+
+    def __init__(self, bb: Blackboard):
+        super().__init__("KacisKarar")
+        self.bb = bb
+
+    def update(self):
+        d = self.bb.state.kacis_yon
+        if d not in ("sol", "sag"):
+            return Status.FAILURE
+        self.bb.state.last_lane_change_s = time.time()
+        self.bb.state.lane_change_dir = d
+        kaynak = self.bb.state.kacis_kaynak or "?"
+        self.bb.last_decision = {
+            "karar": d,
+            "reason": f"engel_kacis_{d}({kaynak})",
+            "phase": "driving",
+            "wait_remaining_s": 0.0,
+        }
+        return Status.SUCCESS
+
+
+class RerouteKarar(py_trees.behaviour.Behaviour):
+    """Cone-case kararı: sol/sag YERİNE 'slow' + hedef'e kenar_blok reroute talebi.
+
+    Yeni mimari (gelistirme_plani §16, E-A/E-B): cone control'ün açık-döngü
+    offset'iyle (kaldırıldı, §12.13 H-A) DEĞİL, planlayıcının rotayı dubanın
+    etrafından çizmesiyle geçilir. Bu action:
+      - cone'un DÜNYA konumunu hesaplar (robot pozu + engel menzili/açısı; hedef
+        tazeliğine bağlı DEĞİL) ve bb.state'e yazar → node RerouteManager ile
+        /hedef_komut: kenar_blok yollar (E-A).
+      - /karar'a 'slow' basar (sol/sag YOK → control offset tetiklenmez, E-B).
+      - Cone dur eşiğinden yakınsa (reroute saptıramadı / çok yakın) güvenlik-ağı
+        'dur' (blok talebi KORUNUR — cone hâlâ orada). acildurus üst dalda zaten.
+    Her zaman SUCCESS (commit bandındaki cone'a bir tepki daima üretilir).
+    """
+
+    def __init__(self, bb: Blackboard, dur_esik_m: float):
+        super().__init__("RerouteKarar")
+        self.bb = bb
+        self.dur_esik_m = float(dur_esik_m)
+
+    def update(self):
+        o = self.bb.obs
+        s = self.bb.state
+        # Cone menzili: nearest overall, yoksa center
+        rng = o.engel_d_overall
+        if rng is None or not math.isfinite(rng):
+            rng = o.engel_d_center
+        if rng is None or not math.isfinite(rng):
+            # Konum yok → reroute talebi AÇMA (yanlış (0,0) blok riski); güvenli slow.
+            s.reroute_request = False
+            self.bb.last_decision = {
+                "karar": "slow", "reason": "engel_reroute_nopos",
+                "phase": "approach", "wait_remaining_s": 0.0,
+            }
+            return Status.SUCCESS
+
+        ox, oy = obstacle_world_pos(o.x, o.y, o.yaw, rng, o.engel_angle_deg or 0.0)
+        s.reroute_request = True
+        s.reroute_cone_world = (ox, oy)
+        s.kacis_engel_dunya = (ox, oy)   # trace log sürekliliği (eski alan)
+
+        d = o.engel_d_center
+        if d is not None and math.isfinite(d) and d < self.dur_esik_m:
+            # Güvenlik ağı: reroute saptıramadı veya cone çok yakın → tam dur (blok korunur)
+            self.bb.last_decision = {
+                "karar": "dur", "reason": "engel_blokaj_reroute",
+                "phase": "driving", "wait_remaining_s": 0.0,
+            }
+        else:
+            self.bb.last_decision = {
+                "karar": "slow", "reason": "engel_reroute",
+                "phase": "approach", "wait_remaining_s": 0.0,
+            }
         return Status.SUCCESS
 
 

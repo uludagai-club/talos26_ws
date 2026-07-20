@@ -14,6 +14,13 @@ import numpy as np
 import heapq
 import networkx as nx
 
+# Kalıcı tanı logu (opsiyonel) — import edilemezse node yine çalışır.
+try:
+    from hedef_logger import HedefLogger
+except Exception as _e:  # noqa: BLE001
+    HedefLogger = None
+    sys.stderr.write(f"[hedef_yoneticisi] hedef_logger yok, loglama kapalı: {_e}\n")
+
 YESIL  = "\033[92m"
 KIRMIZI = "\033[91m"
 SARI   = "\033[93m"
@@ -25,30 +32,320 @@ GOREV_GEOJSON = {
     {"type": "Feature", "properties": {"name": "durak_1", "description": "1. Durak (Eski Park Cebi - Sağ)"},
      "geometry": {"type": "Point", "coordinates": [37.0, -4.5]}},
     {"type": "Feature", "properties": {"name": "durak_2", "description": "2. Durak (Yeni Park Yolu - Sol)"},
-     "geometry": {"type": "Point", "coordinates": [7.35, -13.9]}}
+     "geometry": {"type": "Point", "coordinates": [7.35, -13.9]}},
+    {"type": "Feature", "properties": {"name": "durak_1_donus", "description": "Ara durak_1 (park dönüşü için tekrar)"},
+     "geometry": {"type": "Point", "coordinates": [37.0, -4.5]}},
+    {"type": "Feature", "properties": {"name": "park", "description": "Park (Spot lane, demo node 7)"},
+     "geometry": {"type": "Point", "coordinates": [-21.78, -13.92]}}
   ]
 }
 
-# Sapma kontrolü için eşik değerleri
-SAPMA_ESIK_METRE   = 3.0   # bu kadar uzaklaşırsa rota yeniden hesaplanır
-GOREV_YAKINLIK_M   = 2.0   # bu mesafede görevi tamamlandı sayar (5.0'dan düşürüldü)
-WP_GECIS_MESAFE_M  = 1.8   # bu mesafede WP geçildi sayılır (3.2'den düşürüldü)
-YON_FILTRE_ACIISI  = math.pi - 0.3   # geri yön filtresi açısı (162 derece)
+# ════════════════════════════════════════════════════════════════════════
+#   AYARLANABİLİR PARAMETRELER  —  hepsi burada, kolay düzenleme için
+# ════════════════════════════════════════════════════════════════════════
 
-# Görselleştirme Arayüzü (GUI) Ayarı
-ENABLE_GUI         = True  # Matplotlib penceresini açmak/kapatmak için (False = Headless/Penceresiz)
+# ── GUI ──────────────────────────────────────────────────────────────────
+ENABLE_GUI          = True   # Matplotlib penceresi (False = headless/penceresiz)
 
-# Ağırlık ve Ceza Katsayıları (Yol ve Şerit Tercihleri)
-AGIRLIK_LANE_DUZ         = 1.0   # Düz şeritte normal sürüş çarpanı
-AGIRLIK_LANE_TERS_MULT   = 150.0 # Ters şeritte sürüş çarpanı (geriye doğru yol planlamasını önlemek için çok yüksek)
-AGIRLIK_LANE_TERS_P      = 0.0   # Ters şeritte sürüş sabit cezası (iptal)
+# ── Start seçimi & sapma / reroute (Faz 1-5) ─────────────────────────────
+ILERI_MESAFE_M      = 2.0    # start + sapma "burun" noktası: aracın yaw yönünde bu kadar ileri (m)
+# BLOK (sollama/kenar_blok) aktifken start ileri-projeksiyonu: 0 → path aracın
+# GERÇEK konumundan başlar. Aksi halde 2m ileri-projeksiyon, aracın o anki
+# konumundaki karşı-şerit GİRİŞ crossing'ini atlayıp girişi engele ~2m yaklaştırır
+# → yanal manevra cone'da tamamlanmaz, açıklık engelin İLERİSİNDE oluşur
+# (engel geç algılanırsa açıklık ~0 → çarpma). Blokta lead-in kritik → 0.
+ILERI_MESAFE_BLOK_M = 0.0    # blok aktifken start ileri-projeksiyonu (m); lead-in için 0
+SAPMA_ESIK_METRE    = 2.5    # burun en yakın WP'den bu kadar uzaksa → reroute (debounce sonrası) (m)
+SAPMA_TEMIZ_METRE   = 1.5    # histerezis: burun bu kadarın ALTINA inince sayaç sıfırlanır (band 1.5..2.5) (m)
+SAPMA_DEBOUNCE_SURE = 1.5    # sapma reroute için bu kadar saniye KESİNTİSİZ süregelmeli (s)
+GOREV_YAKINLIK_M    = 2.0    # bu mesafede durak/görev tamamlandı sayılır (m)
+YON_FILTRE_ACIISI   = math.pi - 0.3   # start'tan geri-yön kenar filtre açısı (~162°)
 
-AGIRLIK_SLALOM_MULT      = 6.0   # Şerit değiştirme (slalom) kat sayısı
-AGIRLIK_SLALOM_P         = 0.0   # Şerit değiştirme (slalom) sabit cezası (iptal)
+# ── Map-matching (Faz 3) ─────────────────────────────────────────────────
+MATCH_PENCERE       = 6      # current_wp_index ileri snap penceresi (kaç WP)
+MATCH_KORIDOR_M     = 4.5    # snap koridoru — graf max kenar 6.13m → yarı 3.06m'den BÜYÜK olmalı (m)
 
-AGIRLIK_CONN_DUZ         = 1.0   # Bağlantı yollarında normal geçiş çarpanı
-AGIRLIK_CONN_TERS_MULT   = 150.0 # Bağlantı yollarında ters yön çarpanı (geriye doğru yol planlamasını önlemek için çok yüksek)
-AGIRLIK_CONN_TERS_P      = 0.0   # Bağlantı yollarında ters yön sabit cezası (iptal)
+# ── CEZA PUANLARI (0-100)  —  rota / şerit tercihleri ────────────────────
+# Eşleme:  kenar_agirligi = mesafe * (1 + CEZA/100 * CEZA_ETKI)
+#   CEZA_ETKI=4 ile:  0p→1.0x · 8p→1.32x · 15p→1.6x · 25p→2.0x · 50p→3.0x · 90p→4.6x · 100p→5.0x
+#   (eski 6x slalom ≈ 125p idi — çok abartı; 0-100 aralığına çekildi)
+CEZA_ETKI             = 4.0  # global ölçek: ceza puanının çarpana etkisi
+
+# Aktif (D* grafında kullanılıyor):
+CEZA_DUZ_SERIT        = 0    # düz şeritte sürüş (1.0x) — referans, en tercih edilen
+CEZA_BAGLANTI         = 8    # bağlantı/dönüş yolu (1.32x) — düz şeridi hafif tercih et
+# Placeholder — DİNAMİK akış için, henüz hiçbir canlı kod yoluna BAĞLI DEĞİL
+# (karar↔hedef / control arayüzü gelince kullanılacak; şimdi değiştirmek bir şeyi etkilemez):
+CEZA_SERIT_DEGISTIRME = 15   # şerit değiştirme/sollama (1.6x) — karar-güdümlü
+# CEZA_TERS_YON: YALNIZ eski ağırlık-şişirme bloğunda (_agirlik_blok, BLOK_SERT_AKTIF=False)
+# aktif → o modda engel kenarını çarpımsal şişirir. Varsayılan SERT blokta kullanılmaz.
+CEZA_TERS_YON         = 90   # ters yön / geri sürüş (4.6x) — _agirlik_blok fallback'ı
+
+# ── İki-yönlü durak erişimi ──────────────────────────────────────────────
+# Tek-yönlü graf, durağa kuş uçuşu yakınken aracı onca yolu dolaştırabiliyordu
+# (ör. (21,10)→durak_1: düz 19.8m ama tek-yön rota 61.5m loop; (33,-1)→durak_1
+# 86m). Çözüm: her durağın R_DURAK_M yarıçapındaki TÜM kenarlar (cep içi lane +
+# giriş/çıkış connection'ları) iki yönlü yapılır → durağa her iki uçtan girilebilir.
+# Ana tek-yön loop (A,B,C,...) bundan uzakta olduğu için DOKUNULMAZ; cep çıkmaz
+# yapı olduğundan iki yönlü olması ana trafiğe yeni geçiş rotası açmaz.
+# Ölçüm: (21,10) 61.5→31.3m, (33,-1) 86→6m. (Kullanıcı: "durağa illaki o
+# girişinden girmek gerekmez, iki yönlü de girilebilir".)
+IKI_YONLU_DURAK_AKTIF  = True
+R_DURAK_M              = 7.0    # durak goal'ünün bu yarıçapındaki kenarlar iki yönlü (m)
+
+# ── Bisiklet-modeli dönüş cezası (kolay-dönülebilir rota tercihi) ─────────
+# Keskin dönüşler açı + mesafe ile cezalanır (60°/3m ≫ 60°/10m). Yönlü-kenar
+# durumları üzerinde turn-aware arama (find_path_turn_aware): her köşede
+# Δθ (baş açısı değişimi) yerel mesafeye bölünür → eğrilik κ=Δθ/d → gereken
+# direksiyon δ=atan(L·κ). Yumuşak dönüş ucuz, keskin dönüş pahalı, U-dönüşü
+# (cusp) neredeyse yasak. Böylece iki-yönlü durakta DÖNÜLEBİLİR girişi seçer.
+TURN_AWARE_AKTIF       = True
+ARAC_DINGIL_M          = 1.86   # Bee1 dingil mesafesi (wheelbase, m)
+# Bisiklet-modeli maks direksiyon: 28.95° = iç teker 32.5°/dış 30.0° limitlerinin
+# bisiklet eşdeğeri (ackermann.py max_bicycle_angle, doc/saha_hazirlik/05). Eski
+# 32.5° İÇ TEKER açısıydı → min yarıçapı 2.92m sanıyordu; gerçek araç (ve 2026-07-04
+# hizalamasından beri sim/control clamp'i) 28.95° → min dönüş yarıçapı ≈3.36 m.
+ARAC_MAX_DIREKSIYON    = math.radians(28.95)
+DONUS_CEZA_AGIRLIK     = 1.5    # (δ/δ_max)² → dönüş cezası (m-eşdeğeri); yumuşak tercih
+DONUS_CEZA_MAX         = 4.0    # tek dönüş cezası üst sınırı (m) — büyük mesafe kazancını ezmesin
+DONUS_CUSP_ESIK        = math.radians(150)   # bu açının üstü U-dönüşü → ağır ceza (pratikte yasak)
+DONUS_CUSP_CEZA        = 1000.0 # cusp eşiği üstü dönüş için ek ceza (m)
+# B2 (risk kaydı / doc 05, R≥3.4 kısıtı) NOTU — 2026-07-04 denendi ve GERİ ALINDI:
+# δ>δ_max köşeye toplamsal +50 ceza, kaba grafta (düğüm ~2m) şerit-değiştirme
+# köşeleri de δ>δ_max göründüğünden §16 "karşı şeritte KAL" maliyet dengesini bozdu
+# (test_hedef_slalom_reroute 91→90; 103605Z naif-eşik dersinin arama-tarafı tekrarı).
+# R≥3.4 kısıtı hâlâ AÇIK İŞ: köşe açısından değil, YUMUŞATILMIŞ rota eğriliğinden
+# hesaplanmalı. Bu dosyadaki mevcut koruma: (δ/δ_max)² cezası (28.95° ile dürüst
+# ölçek) + DONUS_CUSP_ESIK≥150° çıkış kapısı.
+
+# ── Karar → hedef komutu (/hedef_komut) — sollama / kenar bloğu ───────────
+# karar (BT) sollamaya çıkınca engelin DÜNYA konumunu /hedef_komut ile yollar
+# (String: "komut;taraf;x;y;etiket;yaricap"). Komutlar: sollama / kenar_blok
+# (engeli blokla) · kenar_serbest (bloku kaldır) · replan (yalnız yeniden hesapla).
+# Hedef tarafı (plan §3.2): engeli SERT SİLMEZ — ağırlığını ŞİŞİRİR
+# (ceza_carpani(CEZA_TERS_YON), recalc'ta find_path öncesi uygula, finally'de
+# geri al) → alternatif varsa planlayıcı kenardan dolanır; yoksa düşük-bozulmayla
+# yine geçer (fail-safe). Sert silme Faz1-5 debounce'la çakışıp restore anında
+# aracı yanlış şeride sokabilirdi. Yanal manevranın kendisini control yapar;
+# hedef kapalı-döngüyü (engeli rota-körü tekrar üretmeme + dönüş zamanı) kapatır.
+HEDEF_KOMUT_AKTIF      = True
+BLOK_TTL_S             = 3.0    # sollama bloğu bu kadar sn tazelenmezse düşer (karar ~1s'de tazeler)
+BLOK_MARJIN_M          = 1.5    # blok yarıçapına eklenen pay (m): araç ön çıkıntısı + kenar uzunluğu
+# Duba KONUM güncellemesi (kullanıcı 2026-06-27 "duba konumu tetiklesin güncellemeyi"):
+# Aynı duba (≤2m) tekrar gelince blok konumu HER ZAMAN en tazeye güncellenir; konum bu
+# kadar TAŞINDIYSA reroute de tetiklenir. Yoksa ilk (gürültülü, ör. track-dışı) konum
+# bloğun TTL'i (15s) boyunca donuyor, düzelmiş on-lane konum gelse de sollama gecikiyordu
+# (canlı 211236Z: duba (21.23,-35.95)→(20.53,-34.26) 1.83m taşındı ama 15s güncellenmedi).
+KONUM_DEGISIM_ESIK_M   = 0.5    # duba konumu bu kadar taşınınca güncelle + reroute (m)
+
+# ── SERT BLOK (engel çemberi) — kullanıcı kararı 2026-06-26 ───────────────
+# Kullanıcı: "karardan gelen engelin konumundan bir çember çiz ve 1m yarıçapındaki
+# bütün waypointleri kullanılamaz yap → ceza puan sisteminde mecbur ters şeritten
+# gidecek rota bulacağız." Eski ağırlık-şişirme (BLOK_SERT_AKTIF=False, aşağıda)
+# SONLU ceza verdiğinden iki sorun çıkardı: (a) cone'a TOPLAMSAL BLOK_EK_CEZA=50
+# eklenince yakındaki yol ~50m pahalanıyor → planlayıcı kısa bir alternatif yerine
+# FARKLI BİR SOKAĞA sapabiliyordu ("slalom yerine başka yola döndün"); (b) ters
+# şeritte KALMA bedava (CEZA_TERS_KALMA=0) olduğundan araç karşı şeritte gereğinden
+# UZUN kalabiliyordu ("çok fazla ters şeride geçiyoruz"). SERT blok bunu kapatır:
+# engelin yarıçapındaki kenarları grafdan GEÇİCİ SİLER → ileri şerit engelde
+# KESİLİR; planlayıcı yalnız engelin ÇEVRESİNDEKİ karşı-şerit crossing'leriyle
+# (ceza puanı altında) dolanabilir → tek giriş + tek çıkış, dar/yerel slalom.
+# Farklı sokak cazip değil (toplamsal ceza yok); karşı şeritte kalma da yalnız
+# engel boyunca (ÇIKMA pahalı → erken döner). Geri-alınabilir (recalc finally).
+BLOK_SERT_AKTIF        = True   # True → engel çemberini SERT sil (varsayılan); False → eski ağırlık-şişirme
+BLOK_YARICAP_M         = 1.0    # engel çemberi yarıçapı (m); etkin = max(engel_r, bu). Kullanıcı: 1m.
+
+# ── HESAPLAMA KİLİDİ — sollama-kararı + sağ-şerit (kullanıcı kararı 2026-06-26/27) ──
+# Kullanıcı: "sollama yapmaya KARAR verdiği AN kilitlesin; SAĞ şeride döndüğü AN
+# kilitlemesi bitsin." (Eski "yol ayrımı geçince kilitle" ÇOK GEÇ tetikliyordu —
+# A-şeridi ilk ayrımı x=10, dubalardan sonra.)
+# Mekanizma: recalc bir SOLLAMA rotası commit ettiğinde (rota KARŞI/sol şeride
+# giriyorsa → sollama kararı verildi) rota HESABI KİLİTLENİR (_hesap_kilitli=True).
+# Kilitliyken planlayıcı YENİDEN HESAPLAMAZ → araç sol şeride çıkmışken (mid-manevra)
+# cusp/U-dönüşü re-plan'ı biter. Kilit, araç SOL şeride girip SAĞ (forward) şeride
+# DÖNÜNCE açılır + o stabil konumdan tek temiz recalc (sonraki dubayı sağ şeritten
+# planlar). Fail-safe: sol şeritte takılırsa DURMA_BEKLEME_SN durunca açılır.
+HESAP_KILIDI_AKTIF   = True   # False → kilit yok (her tetikte recalc — eski davranış)
+DURMA_BEKLEME_SN     = 15.0   # fail-safe: sol şeritte takılırsa durup bu kadar bekleyince aç (s)
+# Durma tespiti GÜRÜLTÜ-DAYANIKLI çapa ile (canlı 100603Z/103605Z deadlock kök-neden):
+# eski anlık per-callback hız (ardışık poz / dt) konum gürültüsüne (±cm jitter) duyarlıydı;
+# yüksek konum-callback hızında araç FİZİKSEL DONMUŞKEN bile tek gürültülü örnek hiz'i
+# eşiğin üstüne çıkarıp `_durma_baslangic`'i HER örnekte sıfırlıyordu → 15s fail-safe HİÇ
+# ateşlenmedi → 222s kalıcı kilit. Çözüm: ÇAPA — araç bu yarıçaptan çıkınca çapa+sayaç
+# yenilenir; o yarıçapta DURMA_BEKLEME_SN kalırsa "durdu". Tek gürültülü örnek (jitter <
+# yarıçap) sayacı SIFIRLAMAZ → gürültü-dayanıklı.
+# YARIÇAP = eski hız-eşiği × bekleme: 0.15 m/s × 15s ≈ 2.25m → 2.5m. Böylece "durdu"
+# semantiği eski 0.15 m/s ile AYNI kalır (0.05-0.15 m/s'de karşı şeritte SÜRÜNEN-takılı
+# araç da yakalanır — /incele algoritma: 0.5m'de bu bir REGRESYON'du, fail-safe hiç
+# ateşlemiyordu). 2.5m hâlâ cm-jitter'dan ÇOK büyük (gürültü-dayanıklılık korunur) ve
+# meşru crawl-sollama (≥0.42 m/s → 15s'de ≥6m > 2.5m) çapayı yeniler → yanlış ateşlemez.
+DURMA_YARICAP_M      = 2.5    # araç bu yarıçapta DURMA_BEKLEME_SN kalırsa "durdu" (m; ≈eski 0.15 m/s)
+# Kilit açma (sağ-şerit/15s) recalc COOLDOWN'u: araç şeritler arasında yanal salınınca
+# _sag_seritte titreyip kilit aç-kapa yapıp her açılışta recalc tetikliyordu (canlı
+# 203548Z: 426 recalc / 1s churn). Açma recalc'ı bu süreden sık tetiklenmez.
+KILIT_COOLDOWN_SN    = 1.5    # kilit açma recalc'ları arası min süre (s) — churn engeli
+KILIT_LOG_PERIYOT_SN = 1.0    # kilitliyken kilit_durum events.jsonl snapshot periyodu (s)
+# Şerit tespiti histerezisi: araç forward(sağ) ve karşı(sol) şerit düğümlerine eşit
+# mesafedeyse (boundary) durumu DEĞİŞTİRME (öncekini koru) → boundary'de flicker biter.
+SERIT_MARJIN_M       = 0.6    # sağ/sol şerit kararını değiştirmek için gereken net mesafe farkı (m)
+
+# ── Karşı-şerit (slalom) enjeksiyonu — plan §16 (S-A/S-B/S-C) ──────────────
+# Yalnız ağırlık şişirme rotayı SAPTIRMIYORDU (§10.3 bilinen kısıt): tek-yön
+# şeritte alternatif yoksa engel kenarı pahalanır ama planlayıcı yine düz geçer.
+# Çözüm (§16, hedef-yönlü karşı-şerit reroute): kenar_blok/sollama geldiğinde
+# engelin ÇEVRESİNE iki tür kenar GEÇİCİ enjekte edilir:
+#   1) crossing (A↔B geçiş, "ters şerite ÇIKMA")  → CEZA_TERS_CIKIS (PAHALI)
+#   2) karşı-şerit boylamasına segment (B'de ileri seyir, "ters şeritte KALMA")
+#                                                  → CEZA_TERS_KALMA (UCUZ)
+# Ayrım (kullanıcı içgörüsü): çıkış riskli → az sayıda yap (tek giriş+çıkış,
+# zig-zag değil); bir kez çıktıysan engeli geçene kadar karşı şeritte KAL
+# (yanal açıklık). VARSAYILAN SERT blokta (BLOK_SERT_AKTIF=True) ileri şerit zaten
+# silindiğinden engelden geçmek imkânsız → bu crossing'ler tek detour. (Eski ağırlık
+# modunda — _agirlik_blok — bloklu kenara ayrıca TOPLAMSAL BLOK_EK_CEZA eklenir;
+# SERT blokta BLOK_EK_CEZA kullanılmaz.) Taban graf TEK-YÖNLÜ kalır: enjekte yalnız
+# (a) blok aktifken, (b) engel çevresinde (R), (c) recalc sonunda geri alınır →
+# "ters şeritten kolay yol" bug'ı (§0) dönmez. Sürülemez U-dönüşlerini turn-aware
+# cusp kapısı eler → enjeksiyon YALNIZ TURN_AWARE iken.
+SLALOM_ENJEKSIYON_AKTIF = True
+# SLALOM_YALNIZ_GEREKINCE (kullanıcı 2026-06-26 "duba sol şeritte → hep sollamaya
+# çalışıyorsun"): enjeksiyonu recalc'ta ÖNCE DENEMEZ. SERT blok uygulanır, rota
+# enjeksiyonSUZ aranır → engel KARŞI ŞERİTTEYSE (kendi şeridini tıkamıyorsa) rota
+# zaten bulunur → karşı şeride GEÇİLMEZ (sollama YAPILMAZ, dubanın olduğu şeride
+# girilmez). YALNIZ kendi şerit gerçekten tıkalıysa (rota None) crossing enjekte
+# edilip tekrar aranır. Böylece "her duba görünce sollama" davranışı, "yalnız
+# kendi şeridindeki dubada dar/yerel sollama"ya iner. False → eski (her blokta
+# enjekte) davranış. Reversible.
+SLALOM_YALNIZ_GEREKINCE = True
+# "Engel kendi rotada mı" eşiği = SERT blok çemberiyle BİREBİR aynı: max(engel_r,
+# BLOK_YARICAP_M). Engel çemberi bloksuz baseline rotayı kesiyorsa rotayı tıkıyor
+# sayılır → sollama gerek. Aynı çember sert_blok'ta rota kenarını da sileceğinden
+# tutarlı (eşik küçük seçilse büyük-r engelde "rota dışı" derken sert_blok rotayı
+# kesip enjeksiyonsuz farklı-sokak yapabilirdi). r≈1m default'ta şerit ayrımı ~2m
+# olduğundan (A y≈-34.27 ↔ B y≈-32.29) kendi şerit (~0m) ile karşı şeridi (~2m) net ayırır.
+CEZA_TERS_CIKIS         = 90    # ters şerite ÇIKMA (crossing) cezası (4.6x) — PAHALI: az geçiş
+CEZA_TERS_KALMA         = 20    # ters şeritte KALMA (karşı-şerit ileri seyir) cezası (1.8x) — engeli
+#                                 geçince sağ şeride ERKEN dön. 2026-07-15: 0(bedava) iken araç engeli
+#                                 geçtikten sonra da solda kalıyordu ("gereğinden fazla sol"); >0 → ilk
+#                                 güvenli çıkış crossing'inde döner (SIYIRMA cezası erken/sıyıran çıkışı eler).
+#                                 Reroute anında okunur → canlı ayarlanabilir (canli_params.yaml 'hedef:').
+BLOK_EK_CEZA            = 50.0  # bloklu kenara TOPLAMSAL ceza (m) — detour'u baskın yap; sonlu (fail-safe)
+SLALOM_ENJEKSIYON_R     = 6.0   # crossing/segment endpoint'i engele bu kadar yakınsa enjekte (m) — 8→6 azalt (lokalize slalom)
+# Giriş crossing'i engeli SIYIRMASIN ("bir waypoint önce dön", kullanıcı 2026-06-24):
+# tek-dip girişi (A→B diyagonali) engele AT başlıyordu → engeli ~0.06m sıyırıp
+# (path engel DÜĞÜMÜnden geçince) karar `engel_blokaj` verip durduruyordu. Çözüm:
+# (a) cone'a r+KENAR_GUVENLI_M'den yakın geçen crossing'e toplamsal SIYIRMA cezası
+# (yakınlıkla orantılı), (b) o crossing'in BİR ÖNCEKİ düğümden (predecessor)
+# başlayan versiyonunu da enjekte et → planlayıcı engeli daha geniş geçen, bir
+# waypoint ÖNCE dönen girişi seçer (engel düğümünü atlar). Mid-cone'da giriş zaten
+# açık → ceza 0, değişmez. Köşe-cone (şeridin ilk düğümü) açıklık 0.06→1.0m.
+KENAR_GUVENLI_M         = 1.2   # crossing engele bundan + r kadar yaklaşırsa "sıyırıyor" sayılır (m)
+CEZA_SIYIRMA_M          = 80.0  # sıyıran crossing'e metre-başına toplamsal ceza (geniş geçeni tercih ettir)
+
+# ── B PLANI (varsayılan KAPALI) — yaw-tabanlı sentetik slalom rotası ───────
+# Kullanıcı (2026-06-26): "gerekirse slalom noktasına geldiğimizde karardan bir
+# bilgi bekle ve aracın yaw değerine bağlı yeni rota oluştur. bunu B planı yapalım,
+# güncelde kullanma ama gerektiğinde açabilelim." A planı (SERT blok + karşı-şerit
+# enjeksiyon) GRAF-tabanlıdır ve normalde yeterli. B planı GRAF-BAĞIMSIZ bir
+# açık-döngü kaçış: karar engeli bildirince (aktif blok) aracın YAW'ına dik
+# (sol = karşı şerit) sentetik yanal-offset waypoint'leri (giriş/orta/çıkış)
+# üretip engeli sollar, sonra çıkış noktasına en yakın graf düğümünden hedefe
+# normal rotayla devam eder. VARSAYILAN KAPALI; yalnız A planı sahada yetersiz
+# kalırsa elle açılır (B_PLAN_YAW_ROTA_AKTIF=True). Kapalıyken hiçbir etkisi yok.
+B_PLAN_YAW_ROTA_AKTIF  = False  # True → A planı yerine yaw-tabanlı sentetik slalom kullan
+B_PLAN_OFFSET_M        = 2.3    # karşı şeride yanal offset (m, ~pist genişliği)
+B_PLAN_OFFSET_MARJIN_M = 1.0    # engel r'sine eklenen pay → offset = max(r+pay, OFFSET_M)
+B_PLAN_LEAD_M          = 3.0    # offset waypoint'lerin engel önü/arkası mesafesi (m)
+
+# ════════════════════════════════════════════════════════════════════════
+#   CANLI PARAMETRELER (restart'sız ayar) — config/canli_params.yaml 'hedef:'
+#   Yukarıdaki sabitleri ÇALIŞIRKEN override eder (~1 sn). DİKKAT: graf-kuruluma
+#   gömülenler (CEZA_DUZ_SERIT/CEZA_BAGLANTI, IKI_YONLU_DURAK_*, R_DURAK_M,
+#   ENABLE_GUI) başlangıçta bir kez okunur → değişiklikleri RESTART ister;
+#   arama/reroute anında okunanlar (SAPMA_*, MATCH_*, ILERI_MESAFE_*, blok/
+#   kilit/slalom parametreleri) canlı etkilidir. Bkz: talos_common/canli_params.py
+# ════════════════════════════════════════════════════════════════════════
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle("hedef", globals())
+except Exception as _canli_e:  # noqa: BLE001
+    _canli_izleyici = None
+    sys.stderr.write(f"[hedef_yoneticisi] canli_params yok, statik parametreler: {_canli_e}\n")
+
+
+def ceza_carpani(ceza_puani: float) -> float:
+    """0-100 ceza puanını D* kenar ağırlık çarpanına çevirir (1.0 + p/100 * CEZA_ETKI).
+    Puan 0-100'e clamp'lenir (dinamik akışta bozuk/aşırı çarpan oluşmasın)."""
+    p = max(0.0, min(100.0, ceza_puani))
+    return 1.0 + (p / 100.0) * CEZA_ETKI
+
+
+# ── Bisiklet-modeli dönüş cezası yardımcıları ────────────────────────────
+def _yon_farki(a: float, b: float) -> float:
+    """İki açının [-pi, pi] sarmalı MUTLAK farkı (rad)."""
+    return abs((a - b + math.pi) % (2 * math.pi) - math.pi)
+
+
+def _nokta_segment_mesafe(px, py, ax, ay, bx, by) -> float:
+    """(px,py) noktasının [a,b] doğru parçasına en kısa mesafesi (m).
+    Engel bloğunun bir kenarı (a→b) kapsayıp kapsamadığını doğru ölçer
+    (orta-nokta yaklaşımı kısa kenarda engeli kaçırabilir)."""
+    dx, dy = bx - ax, by - ay
+    L2 = dx * dx + dy * dy
+    if L2 < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / L2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def bisiklet_donus_cezasi(dtheta: float, d_local: float) -> float:
+    """Bir köşedeki dönüşün bisiklet-modeli cezası (metre-eşdeğeri).
+    dtheta: baş açısı değişimi (rad, mutlak). d_local: dönüşün yayıldığı yerel
+    mesafe (m). Eğrilik κ=dtheta/d_local → gereken direksiyon δ=atan(L·κ).
+      • Yumuşak dönüş (δ küçük) → ucuz (oran²·ağırlık).
+      • Keskin dönüş (δ→δ_max) → pahalı ("kolay dönülebilir" rota tercih edilir).
+      • Aracın çevirebileceğinden keskin (δ>δ_max) → ağır ek ceza.
+      • Cusp (dtheta≥eşik, U-dönüşü) → DONUS_CUSP_CEZA (pratikte yasak).
+    Aynı açı kısa mesafede (60°/3m) uzun mesafeden (60°/10m) ÇOK daha pahalı."""
+    if dtheta < 1e-3:
+        return 0.0
+    if dtheta >= DONUS_CUSP_ESIK or d_local < 1e-3:
+        return DONUS_CUSP_CEZA
+    kappa = dtheta / d_local
+    delta = math.atan(ARAC_DINGIL_M * kappa)
+    oran = delta / ARAC_MAX_DIREKSIYON          # 0..~ (1 = maks direksiyon)
+    # Yumuşak, ÜST SINIRLI ceza: keskin dönüşü mesafeye göre cezalandırır ama
+    # tek bir dönüş büyük bir mesafe kazancını ezemez (DONUS_CEZA_MAX ile sınırlı).
+    # Gerçekten imkânsız U-dönüşleri yukarıdaki cusp bloğu yakalar.
+    return min(DONUS_CEZA_AGIRLIK * oran * oran, DONUS_CEZA_MAX)
+
+
+def rota_donus_metrigi(path, yaw0: float):
+    """Rota boyunca en keskin dönüş (derece) + min dönüş yarıçapı (m).
+    Köşe yerel mesafesi = komşu segmentlerin ortalaması (densify artefaktını
+    sönümler). yaw0: ilk segmente giriş dönüşü için aracın başlangıç yaw'ı."""
+    if not path or len(path) < 2:
+        return 0.0, float('inf')
+    max_deg = 0.0
+    min_r = float('inf')
+    prev_h = yaw0
+    prev_seg = None
+    for i in range(len(path) - 1):
+        dx, dy = path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]
+        seg = math.hypot(dx, dy)
+        if seg < 1e-9:
+            continue
+        h = math.atan2(dy, dx)
+        dtheta = _yon_farki(h, prev_h)
+        d_local = seg if prev_seg is None else 0.5 * (prev_seg + seg)
+        if math.degrees(dtheta) > max_deg:
+            max_deg = math.degrees(dtheta)
+        if dtheta > 1e-3:
+            r = d_local / dtheta
+            if r < min_r:
+                min_r = r
+        prev_h = h
+        prev_seg = seg
+    return max_deg, min_r
 
 
 # ==========================================
@@ -64,7 +361,6 @@ class DLitePlanner:
         self.g:   dict[tuple, float] = {}
         self.rhs: dict[tuple, float] = {}
         self.U:   list = []
-        self.km:  float = 0.0
         self.s_start = None
         self.s_goal  = None
 
@@ -117,10 +413,14 @@ class DLitePlanner:
         return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
     def calculate_key(self, s: tuple) -> tuple:
+        # NOT: Klasik D* Lite'taki km (key modifier) burada YOK. km yalnızca start
+        # hareket ederken g/rhs'yi koruyup artımlı replan yapan sürümde gerekir.
+        # Bu planlayıcı her find_path'te sıfırdan arıyor (aşağıdaki açıklamaya bak),
+        # dolayısıyla km her zaman 0 olurdu → ölü terim, kaldırıldı (Faz4-lite).
         g_val  = self.g.get(s,   float('inf'))
         rhs_val = self.rhs.get(s, float('inf'))
         min_val = min(g_val, rhs_val)
-        return (min_val + self.dist(self.s_start, s) + self.km, min_val)
+        return (min_val + self.dist(self.s_start, s), min_val)
 
     # ── Çekirdek D* Lite ────────────────────────────────────────────
     def update_vertex(self, u: tuple) -> None:
@@ -179,9 +479,17 @@ class DLitePlanner:
                           f"start:{start} goal:{goal}")
             return None
 
+        # ── Soğuk (sıfırdan) arama — bilinçli tercih (Faz4-lite) ────────
+        # Klasik D* Lite g/rhs/U/km'yi replanlar arası korur ve km += h ile
+        # start'ı kaydırarak artımlı (ucuz) replan yapar. Burada her find_path
+        # sıfırdan arıyor. Gerekçe: (1) graf statik ve küçük (644 düğüm) — ölçüm:
+        # cold find_path medyan 0.88ms / p95 3.18ms (20Hz=50ms bütçe içinde önemsiz);
+        # (2) ileri-yön filtresi her replan'da start kenarlarını geçici silip geri
+        # ekliyor → artımlı durumu korumak her seferinde update_vertex yayılımı
+        # gerektirir, küçük kazancı yer ve risk getirir. Bu yüzden artımlı
+        # sürüme geçilmedi (Faz4 atlandı).
         self.s_start = start
         self.s_goal  = goal
-        self.km = 0.0
         self.U  = []
         self.g  = {}
         self.rhs = {}
@@ -221,6 +529,82 @@ class DLitePlanner:
             curr = best_next
 
         return path if len(path) > 1 and curr == self.s_goal else None
+
+    # ── Turn-aware arama (bisiklet-modeli dönüş cezası) ─────────────
+    def find_path_turn_aware(self, start: tuple, goal: tuple,
+                             start_yaw: float = 0.0):
+        """Yönlü-kenar durumları üzerinde Dijkstra + bisiklet-modeli dönüş cezası.
+
+        Durum = (u, v): "v'ye u'dan gelindi" (u→v yönlü kenarı). Geçiş
+        (u,v)→(v,w) maliyeti = get_cost(v,w) + bisiklet_donus_cezasi(Δθ, d_yerel),
+        Δθ = giriş başı (u→v) ile çıkış başı (v→w) arasındaki açı. Başlangıç
+        durumları start'tan çıkan kenarlar (giriş dönüşü start_yaw'a göre).
+        Hedef: v == goal olan ilk (en ucuz) durum.
+
+        D* çekirdeği (find_path) DEĞİŞTİRİLMEZ — bu ayrı, temiz bir aramadır.
+        Pozitif maliyetli Dijkstra → optimal yol basittir (düğüm tekrarı yok).
+        Tüm kenar maliyetleri pozitif olduğundan ve graf küçük (≈700 kenar)
+        olduğundan ucuzdur."""
+        if start not in self.adj_list or goal not in self.adj_list:
+            rospy.logwarn(f"[turn-aware] start/goal graph'ta yok: {start} {goal}")
+            return None
+        if start == goal:
+            return [start]
+
+        def _dir(a, b):
+            return math.atan2(b[1] - a[1], b[0] - a[0])
+
+        pq = []                      # (g_cost, (u, v))
+        dist = {}                    # state → en iyi g_cost
+        came = {}                    # state → önceki state
+
+        # Başlangıç durumları: start'tan çıkan kenarlar (giriş dönüşü yaw'dan)
+        for w in self.adj_list.get(start, []):
+            d_out = self.dist(start, w)
+            dtheta = _yon_farki(_dir(start, w), start_yaw)
+            c = self.get_cost(start, w) + bisiklet_donus_cezasi(dtheta, d_out)
+            st = (start, w)
+            if c < dist.get(st, float('inf')):
+                dist[st] = c
+                came[st] = None
+                heapq.heappush(pq, (c, st))
+
+        goal_state = None
+        while pq:
+            g, (u, v) = heapq.heappop(pq)
+            if g > dist.get((u, v), float('inf')):
+                continue
+            if v == goal:
+                goal_state = (u, v)
+                break
+            d_in = self.dist(u, v)
+            h_in = _dir(u, v)
+            for w in self.adj_list.get(v, []):
+                if w == u:
+                    continue          # birebir geri dönüş (180° cusp) → atla
+                d_out = self.dist(v, w)
+                d_local = 0.5 * (d_in + d_out)
+                dtheta = _yon_farki(_dir(v, w), h_in)
+                nc = g + self.get_cost(v, w) + bisiklet_donus_cezasi(dtheta, d_local)
+                st = (v, w)
+                if nc < dist.get(st, float('inf')):
+                    dist[st] = nc
+                    came[st] = (u, v)
+                    heapq.heappush(pq, (nc, st))
+
+        if goal_state is None:
+            rospy.logwarn("[turn-aware] Yol bulunamadı.")
+            return None
+
+        # Geri iz sür: state zincirini düğüm dizisine çevir
+        states = []
+        st = goal_state
+        while st is not None:
+            states.append(st)
+            st = came.get(st)
+        states.reverse()
+        path = [states[0][0]] + [s[1] for s in states]
+        return path if len(path) > 1 and path[-1] == goal else None
 
 
 # ==========================================
@@ -551,6 +935,12 @@ def build_track_graph():
                 G.nodes[v]['pos'] = (pos_v[0], y_avg)
 
     slalom_connections_to_build = []
+    # Karşı-şerit boylamasına (lane-parallel) segment kenarları: blok geldiğinde
+    # bunların ters yönü "ters şeritte KALMA" (ucuz) cezasıyla enjekte edilir →
+    # araç engeli geçene kadar karşı şeritte İLERİ seyredebilir (yalnız crossing
+    # zig-zag'ı değil). YALNIZ düz paralel kesim node'ları (köşe/connection YOK)
+    # → dikey şeride kaçma artefaktı oluşmaz.
+    slalom_lane_segments = []
     for lane1_nodes, lane2_nodes, orientation in slalom_segments:
         paired = []
         for u in lane1_nodes:
@@ -569,6 +959,9 @@ def build_track_graph():
         for i in range(len(unique_paired) - 1):
             u1, v1 = unique_paired[i]
             u2, v2 = unique_paired[i+1]
+            # İki şeridin boylamasına segmentleri (ardışık eşleşmiş node'lar arası)
+            slalom_lane_segments.append((u1, u2))
+            slalom_lane_segments.append((v1, v2))
             if orientation == "horizontal":
                 slalom_connections_to_build.append((u1, v2, "left", "right"))
                 slalom_connections_to_build.append((v2, u1, "right", "left"))
@@ -582,6 +975,22 @@ def build_track_graph():
 
     for src, dst, app, ex in connections_to_build:
         add_curved_conn(src, dst, app, ex, conn_type='connection')
+
+    # NOT: slalom_connections_to_build (karşı şeride geçme) TABAN grafa BİLİNÇLİ
+    # olarak eklenmiyor — tek-yönlü yapı korunur (yoksa "ters şeritten kolay yol"
+    # bug'ı geri gelir). Bunun yerine karşı-şerit crossing'leri RUNTIME'da, yalnız
+    # karar `kenar_blok`/`sollama` yolladığında ve YALNIZ engelin çevresinde geçici
+    # enjekte edilir (cezalı; turn-aware cusp kapısıyla sürülebilir zig-zag seçilir;
+    # blok kalkınca geri alınır). Bkz. plan §16 / _slalom_enjekte / _blok_uygula.
+    # Crossing listesini G üzerinde sakla (runtime _load_graph_from_import okur).
+    G.graph['slalom_connections'] = slalom_connections_to_build
+    G.graph['slalom_lane_segments'] = slalom_lane_segments
+    # KARŞI ŞERİTLER (sollama/overtake lane'leri) = her slalom çiftinin İKİNCİ şeridi
+    # (forward=ilk: A/C/E/H/K/N/M; karşı=ikinci: B/D/F/I/J/O/L). "Sağ şeride döndü mü"
+    # tespiti için (HESAPLAMA KİLİDİ sağ-şerit-açma): araç bu şeritlerdeyse sollama
+    # ortasında (recalc cusp üretir), değilse forward/sağ şeritte (re-plan güvenli).
+    G.graph['karsi_seritler'] = {G.nodes[l2[0]]['lane']
+                                 for (_l1, l2, _o) in slalom_segments if l2}
 
     # A şeridi ile P1 ve P7 arasındaki bağlantıyı dinamik olarak ekliyoruz
     a_nodes = [n for n in G.nodes() if G.nodes[n].get('lane') == 'A']
@@ -798,10 +1207,100 @@ class HedefYoneticisi:
         self.son_hesaplama_zamani = time.time()
         self._son_varildi_zamani  = time.time()
         self._son_gorev_zamani    = time.time()
+        # FAZ2: sapmanın eşiği kesintisiz aştığı ilk an (debounce); eşik altına
+        # düşünce None'a sıfırlanır. reroute ancak bu süre >= SAPMA_DEBOUNCE_SURE olunca.
+        self._sapma_baslangic     = None
 
         # ── Thread güvenliği ─────────────────────────────────────────
         # FIX: varildi_callback & konum_callback çakışmasını önler
         self._wp_lock = threading.Lock()
+
+        # ── Karar komutu (/hedef_komut) blok durumu ──────────────────
+        # Her blok: {x, y, r, taraf, t}. TTL içinde aktif (karar ~1s tazeler).
+        # _komut_lock callback↔recalc çakışmasını önler.
+        self._bloklu_engeller = []
+        self._komut_lock      = threading.Lock()
+
+        # ── HESAPLAMA KİLİDİ (yol ayrımı + 15s durma + sağ-şerit açma) durumu ──
+        self._forward_poz     = None    # forward(sağ) şerit düğüm pozisyonları; load'da
+        self._karsi_poz       = None    # karşı(sol/overtake) şerit düğüm pozisyon KÜMESİ; load'da
+        self._karsi_seritler  = set()   # sollama/overtake lane kümesi (B/D/F/...); load'da doldurulur
+        self._hesap_kilitli   = False   # True → recalc bastırılır (sollama kararı verildi; sağ şerit/15s açar)
+        self._kilit_sol_serite_girdi = False  # kilitliyken araç sol şeride girdi mi (sağ'a dönüş = açma şartı)
+        self._son_sag_serit   = True    # _sag_seritte histerezis durumu (başlangıç: sağ şerit)
+        self._son_kilit_recalc = 0.0    # son kilit-açma recalc zamanı (yalnız konum thread; sağ-şerit cooldown)
+        self._son_bypass_t    = 0.0     # son kilit-bypass recalc zamanı (yalnız komut thread; bypass churn cooldown)
+        self._durma_baslangic = None    # araç "durdu" sayıldığı an (15s sayacı); çapadan çıkınca yenilenir
+        self._durma_capa_xy   = None    # durma tespiti ÇAPASI (x,y) — gürültü-dayanıklı (DURMA_YARICAP_M)
+        self._son_kilit_log_t = 0.0     # kilit-durum events.jsonl snapshot'ı için throttle damgası
+        # recalc'taki graf mutasyonunu (blok ağırlık-şişirme + slalom enjeksiyon)
+        # serialize eder: konum_callback ile hedef_komut_callback ayrı thread'lerde
+        # eşzamanlı recalc çağırırsa apply/restore çakışıp ağırlık sızdırmasın.
+        self._graf_lock       = threading.Lock()
+        self._slalom_conns    = []  # karşı-şerit crossing adayları (load'da doldurulur)
+        self._slalom_segs     = []  # karşı-şerit boylamasına segment adayları (KALMA)
+
+        # ── Tanı logu (kalıcı; docker kapanınca host'ta kalır) ───────
+        self.logger = None
+        if HedefLogger is not None:
+            try:
+                self.logger = HedefLogger()
+                # SIGTERM/shutdown'da tamponları flush et (son satırlar kaybolmasın)
+                rospy.on_shutdown(lambda: self.logger.close() if self.logger else None)
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write(f"[hedef_yoneticisi] logger başlatılamadı: {e}\n")
+
+        # ── Config/ceza snapshot: bu run hangi parametre/ceza ile çalıştı ──
+        # (ceza-puan ilişkisini sonradan loglardan analiz edebilmek için)
+        if self.logger is not None:
+            self.logger.log_event(
+                "config",
+                ILERI_MESAFE_M=ILERI_MESAFE_M,
+                ILERI_MESAFE_BLOK_M=ILERI_MESAFE_BLOK_M,
+                SAPMA_ESIK_METRE=SAPMA_ESIK_METRE,
+                SAPMA_TEMIZ_METRE=SAPMA_TEMIZ_METRE,
+                SAPMA_DEBOUNCE_SURE=SAPMA_DEBOUNCE_SURE,
+                GOREV_YAKINLIK_M=GOREV_YAKINLIK_M,
+                MATCH_PENCERE=MATCH_PENCERE,
+                MATCH_KORIDOR_M=MATCH_KORIDOR_M,
+                CEZA_ETKI=CEZA_ETKI,
+                ceza_duz_serit=CEZA_DUZ_SERIT,
+                ceza_baglanti=CEZA_BAGLANTI,
+                ceza_serit_degistirme=CEZA_SERIT_DEGISTIRME,
+                ceza_ters_yon=CEZA_TERS_YON,
+                carpan_baglanti=round(ceza_carpani(CEZA_BAGLANTI), 3),
+                carpan_serit_deg=round(ceza_carpani(CEZA_SERIT_DEGISTIRME), 3),
+                iki_yonlu_durak=IKI_YONLU_DURAK_AKTIF,
+                r_durak_m=R_DURAK_M,
+                turn_aware=TURN_AWARE_AKTIF,
+                arac_dingil_m=ARAC_DINGIL_M,
+                arac_max_direksiyon_deg=round(math.degrees(ARAC_MAX_DIREKSIYON), 1),
+                donus_ceza_agirlik=DONUS_CEZA_AGIRLIK,
+                donus_cusp_esik_deg=round(math.degrees(DONUS_CUSP_ESIK), 1),
+                hedef_komut=HEDEF_KOMUT_AKTIF,
+                blok_ttl_s=BLOK_TTL_S,
+                konum_degisim_esik_m=KONUM_DEGISIM_ESIK_M,
+                carpan_ters_yon=round(ceza_carpani(CEZA_TERS_YON), 3),
+                slalom_enjeksiyon=SLALOM_ENJEKSIYON_AKTIF,
+                ceza_ters_cikis=CEZA_TERS_CIKIS,
+                carpan_ters_cikis=round(ceza_carpani(CEZA_TERS_CIKIS), 3),
+                ceza_ters_kalma=CEZA_TERS_KALMA,
+                blok_ek_ceza=BLOK_EK_CEZA,
+                slalom_enjeksiyon_r=SLALOM_ENJEKSIYON_R,
+                kenar_guvenli_m=KENAR_GUVENLI_M,
+                ceza_siyirma_m=CEZA_SIYIRMA_M,
+                blok_sert_aktif=BLOK_SERT_AKTIF,
+                blok_yaricap_m=BLOK_YARICAP_M,
+                hesap_kilidi_aktif=HESAP_KILIDI_AKTIF,
+                durma_bekleme_sn=DURMA_BEKLEME_SN,
+                durma_yaricap_m=DURMA_YARICAP_M,
+                kilit_cooldown_sn=KILIT_COOLDOWN_SN,
+                serit_marjin_m=SERIT_MARJIN_M,
+                b_plan_yaw_rota=B_PLAN_YAW_ROTA_AKTIF,
+                b_plan_offset_m=B_PLAN_OFFSET_M,
+                b_plan_offset_marjin_m=B_PLAN_OFFSET_MARJIN_M,
+                b_plan_lead_m=B_PLAN_LEAD_M,
+            )
 
         # ── Planner ─────────────────────────────────────────────────
         self.planner = DLitePlanner()
@@ -810,7 +1309,7 @@ class HedefYoneticisi:
         # ── Görselleştirme ───────────────────────────────────────────
         if ENABLE_GUI:
             plt.ion()
-            self.fig, self.ax = plt.subplots(figsize=(10, 10))
+            self.fig, self.ax = plt.subplots(figsize=(6, 6))   
             self.ax.set_aspect('equal')
             plt.show(block=False)
         self._static_drawn = False
@@ -826,9 +1325,17 @@ class HedefYoneticisi:
 
         # ── ROS bağlantıları ─────────────────────────────────────────
         self.pub_hedef = rospy.Publisher('/hedef', String, queue_size=10)
+        # Görselleştirme: engel silme çemberleri + çember içine düşen (silinen)
+        # waypoint'ler → can_visualizer harita paneli. Salt-görsel.
+        self.pub_blok  = rospy.Publisher('/hedef/blok', String, queue_size=5)
 
-        rospy.Subscriber('/konum',         Pose2D,        self.konum_callback)
-        rospy.Subscriber('/gorev_durumu',  String,        self.varildi_callback)
+        # queue_size: /konum ~20Hz, recalc'lı callback bazen 50ms'yi aşabilir →
+        # eski konum değersiz, daima en taze kullanılmalı → 1 (sonsuz iç kuyruk
+        # birikmesini önler). Komut/durum mesajları seyrek → küçük tampon.
+        rospy.Subscriber('/konum',         Pose2D,        self.konum_callback,    queue_size=1)
+        rospy.Subscriber('/gorev_durumu',  String,        self.varildi_callback,  queue_size=5)
+        if HEDEF_KOMUT_AKTIF:
+            rospy.Subscriber('/hedef_komut', String,       self.hedef_komut_callback, queue_size=5)
 
         self.new_data_available = True
         print(f"{YESIL}>>> SİSTEM HAZIR. Bekleniyor: /konum{SIFIRLA}")
@@ -848,6 +1355,7 @@ class HedefYoneticisi:
         self.planner.adj_list.clear()
         self.planner.pred_list.clear()
         self.planner.edge_weights.clear()
+        self._forward_poz = None   # ÖNCE invalidate (aşağıdaki node_types.clear ile yarış penceresini kapat)
         self.planner.node_types.clear()
         self.planner.nodes.clear()
         self.pos_to_node = {}
@@ -860,6 +1368,7 @@ class HedefYoneticisi:
                 self.planner.node_types[(pos[0], pos[1])] = data.get('type', 'intermediate')
                 self.pos_to_node[(pos[0], pos[1])] = node_name
 
+        edge_info: dict[tuple[tuple, tuple], tuple[str, float]] = {}
         for u, v, edge_data in G.edges(data=True):
             p1 = node_to_pos.get(u)
             p2 = node_to_pos.get(v)
@@ -870,37 +1379,82 @@ class HedefYoneticisi:
             d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
             etype = edge_data.get('type', 'lane')
 
-            # Calculate forward weight
+            # İleri yön ağırlığı — ceza puanı (0-100) → çarpan
             if etype == 'lane':
-                w_forward = d * AGIRLIK_LANE_DUZ
+                w_forward = d * ceza_carpani(CEZA_DUZ_SERIT)
             elif etype == 'connection':
-                w_forward = d * AGIRLIK_CONN_DUZ
-            elif etype == 'slalom':
-                w_forward = d * AGIRLIK_SLALOM_MULT + AGIRLIK_SLALOM_P
+                w_forward = d * ceza_carpani(CEZA_BAGLANTI)
+            elif etype == 'slalom':   # şu an ÖLÜ dal: slalom kenarı grafa eklenmiyor
+                w_forward = d * ceza_carpani(CEZA_SERIT_DEGISTIRME)   # (dinamik akış gelince anlamlı)
             else:
                 w_forward = d
 
             # Add forward edge
             self.planner.add_edge(p1, p2, w_forward)
+            edge_info[(p1, p2)] = (etype, d)
 
-            # Check if reverse edge exists in G. If not, do NOT add penalized reverse edge for overtaking
-            # (Orijinal tek yönlü DiGraph yapısını korumak ve ters yön planlamasını önlemek için devre dışı bırakıldı)
-            # if not G.has_edge(v, u):
-            #     if etype == 'lane':
-            #         w_reverse = d * AGIRLIK_LANE_TERS_MULT + AGIRLIK_LANE_TERS_P
-            #     elif etype == 'connection':
-            #         w_reverse = d * AGIRLIK_CONN_TERS_MULT + AGIRLIK_CONN_TERS_P
-            #     elif etype == 'slalom':
-            #         w_reverse = d * AGIRLIK_SLALOM_MULT + AGIRLIK_SLALOM_P
-            #     else:
-            #         w_reverse = d * 10.0
-            # 
-            #     self.planner.add_edge(p2, p1, w_reverse)
+            # NOT: Ana tek-yön loop (A,B,C,...) kenarlarının tersi grafa EKLENMEZ
+            # (tek yönlü yapı korunur). Durak çevresi iki yönlü yapımı
+            # _iki_yonlu_durak_ekle()'de (geo_targets kurulduktan SONRA) yapılır.
+
+        # edge_info'yu sakla → iki-yönlü durak adımı (goal'lar kurulunca) kullanır
+        self._edge_info = edge_info
+
+        # ── Karşı-şerit (slalom) crossing adayları (§16 S-A) ──────────────
+        # build_track_graph bunları TABAN grafa eklemez (tek-yön korunur); biz
+        # pozisyon-anahtarlı aday liste olarak saklarız. Blok geldiğinde engel
+        # çevresindekiler _slalom_enjekte() ile GEÇİCİ eklenir, recalc sonunda
+        # geri alınır. (p1, p2, d): yönlü crossing kenarı + ham uzunluk.
+        slalom_conns = []
+        for (u, v, _app, _ex) in G.graph.get('slalom_connections', []):
+            p1 = node_to_pos.get(u)
+            p2 = node_to_pos.get(v)
+            if not p1 or not p2 or p1 == p2:
+                continue
+            if (p1, p2) in self.planner.edge_weights:   # taban grafta zaten varsa atla
+                continue
+            d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            slalom_conns.append((p1, p2, d))
+        self._slalom_conns = slalom_conns
+
+        # ── Karşı-şerit boylamasına segment adayları (§16, "ters şeritte KALMA") ──
+        # Ardışık eşleşmiş şerit node'ları arası (yalnız düz paralel kesim).
+        # Blok geldiğinde EKSİK yönü ucuz (CEZA_TERS_KALMA) enjekte edilir →
+        # araç karşı şeritte İLERİ seyredip engeli geçene dek solda kalabilir.
+        slalom_segs = []
+        for (a, b) in G.graph.get('slalom_lane_segments', []):
+            p1 = node_to_pos.get(a)
+            p2 = node_to_pos.get(b)
+            if not p1 or not p2 or p1 == p2:
+                continue
+            d = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+            slalom_segs.append((p1, p2, d))
+        self._slalom_segs = slalom_segs
+        rospy.loginfo(f"[graph] {len(slalom_conns)} crossing + {len(slalom_segs)} "
+                      f"karşı-şerit segment adayı saklandı (blok-tetikli enjeksiyon).")
+
+        # YOL AYRIMI (out-degree ≥ 2 = yolun dallandığı düğüm) pozisyonlarını YÜKLEME
+        # Forward(sağ) liste + karşı(sol/overtake) şerit düğüm pozisyon KÜMESİ (subscriber'lar
+        # register olmadan, tek-thread doldur). forward: _sag_seritte histerezisi için (min mesafe);
+        # karsi (set): hem _sag_seritte hem "committed rota karşı şeride girdi mi" (kilit) için.
+        self._karsi_seritler = set(G.graph.get('karsi_seritler', set()))
+        self._forward_poz = [node_to_pos[n] for n, data in G.nodes(data=True)
+                             if n in node_to_pos and data.get('lane') not in self._karsi_seritler]
+        self._karsi_poz = {node_to_pos[n] for n, data in G.nodes(data=True)
+                           if n in node_to_pos and data.get('lane') in self._karsi_seritler}
 
         self._graph_loaded = True
         rospy.loginfo(
-            f"[graph] Graf yapısından {len(self.planner.nodes)} düğüm başarıyla yüklendi."
+            f"[graph] Graf yapısından {len(self.planner.nodes)} düğüm başarıyla yüklendi "
+            f"({len(self._karsi_poz)} karşı-şerit düğümü)."
         )
+        # HESAPLAMA KİLİDİ karşı-şerit düğüm kümesine bağlı: boşsa _overtake_rotasi_mi
+        # DAİMA False → kilit hiç kurulmaz, sessizce DEVRE DIŞI (graf metadata'sında
+        # 'karsi_seritler' yoksa olur; /incele güvenlik). Net uyarı bas (sessiz değil).
+        if HESAP_KILIDI_AKTIF and not self._karsi_poz:
+            rospy.logwarn("[kilit] UYARI: karşı-şerit düğümü YOK → HESAPLAMA KİLİDİ "
+                          "İŞLEVSİZ (graf 'karsi_seritler' metadata eksik?). Sollama "
+                          "kararları kilitlenmeyecek.")
 
         if not self.geo_targets_built:
             self._build_geo_targets()
@@ -922,9 +1476,39 @@ class HedefYoneticisi:
 
         self.geo_targets_built = True
 
+        # ── İki-yönlü durak erişimi (goal'lar artık biliniyor) ──────────────
+        if IKI_YONLU_DURAK_AKTIF:
+            self._iki_yonlu_durak_ekle()
+
         # İlk konum zaten geldiyse hemen rota hesapla
         if self._ilk_konum_alindi and self.robot_x is not None:
             self.recalculate_path_from_robot()
+
+    def _iki_yonlu_durak_ekle(self) -> None:
+        """Her durak goal'ünün R_DURAK_M yarıçapındaki TÜM tek-yönlü kenarların
+        (cep içi lane + giriş/çıkış connection'ları) tersini ekler → durağa her
+        iki uçtan girilebilir. Ana tek-yön loop bu yarıçaptan uzakta olduğu için
+        dokunulmaz. Cep çıkmaz yapı → iki yönlü olması ana trafiğe yeni geçiş
+        rotası açmaz. Kalıcı (graf yüklemede bir kez); duraklar sabit."""
+        edge_info = getattr(self, "_edge_info", None)
+        if not edge_info or not self.geo_targets_world:
+            return
+        goals = list(self.geo_targets_world)
+        R = R_DURAK_M
+        n_eklendi = 0
+        for (p1, p2), (et, d) in list(edge_info.items()):
+            if (p2, p1) in edge_info:          # zaten çift yönlü → atla
+                continue
+            yakin = any(math.hypot(p1[0] - gx, p1[1] - gy) <= R and
+                        math.hypot(p2[0] - gx, p2[1] - gy) <= R
+                        for (gx, gy) in goals)
+            if yakin:
+                w = d * (ceza_carpani(CEZA_BAGLANTI) if et == 'connection'
+                         else ceza_carpani(CEZA_DUZ_SERIT))
+                self.planner.add_edge(p2, p1, w)
+                n_eklendi += 1
+        rospy.loginfo(f"[graph] İki-yönlü durak erişimi: {n_eklendi} ters kenar "
+                      f"eklendi (R={R}m, {len(goals)} durak).")
 
     # ==========================================
     #   CALLBACKLER
@@ -951,7 +1535,7 @@ class HedefYoneticisi:
         if (not self.is_path_calculated
                 and self.planner.nodes
                 and self.geo_targets_world):
-            self.recalculate_path_from_robot()
+            self.recalculate_path_from_robot(reason="ilk_rota")
 
         if not self.is_path_calculated or not self.full_path_world:
             self.new_data_available = True
@@ -959,18 +1543,62 @@ class HedefYoneticisi:
 
         now = time.time()
 
-        # ── Otomatik WP geçişi (mesafe bazlı) ───────────────────────
-        with self._wp_lock:
-            wp1_idx = min(self.current_wp_index + 1, len(self.full_path_world) - 1)
-            wx_wp, wy_wp = self.full_path_world[wp1_idx]
-            dist_to_wp   = math.hypot(self.robot_x - wx_wp, self.robot_y - wy_wp)
+        # ── Karar bloğu TTL düşüşü ───────────────────────────────────
+        # NOT: Eskiden blok TTL'i/aktif blok sayısı düşünce bir kez reroute
+        # ediliyordu (fail-safe). KALDIRILDI (canlı off-road bug,
+        # logs/20260624T193310Z): araç sol şeride GEÇERKEN blok düşünce recalc
+        # aracı B düğümüne snap'leyip (blok yok → enjeksiyon yok → B tek-yönlü)
+        # U-dönüşü/yukarı saçma rota çizip YOLDAN ÇIKARIYORDU. Blok kalkınca
+        # yeniden rota çizmiyoruz; araç committed overtake path'ini (B→A→hedef
+        # döner) sürer. (Sadece sayacı izlemeye devam — başka tüketici yok.)
+        if HEDEF_KOMUT_AKTIF:
+            # HESAPLAMA KİLİDİ açma yönetimi (kilitleme recalc'ta yapılır).
+            # NOT (§20 fix): 15s fail-safe artık _kilit_guncelle İÇİNDE, EN BAŞTA ve sade
+            # math ile çalışır (çapa + _kilit_ac kilidi recalc'tan ÖNCE temizler) → bu dış
+            # try/except onu YUTAMAZ. Yutulabilecek tek hesap-yoğun kısım (_sag_seritte) zaten
+            # _kilit_guncelle içinde kendi try/except'iyle korunur. Bu dış guard yalnız
+            # konum_callback'i (üst-düzey guard'sız) öngörülemez bir hatada çökertmemek için.
+            try:
+                self._kilit_guncelle()
+            except Exception as e:  # noqa: BLE001
+                rospy.logwarn_throttle(5.0, f"[kilit] güncelleme hatası: {e!r}")
 
-            if dist_to_wp < WP_GECIS_MESAFE_M and wp1_idx < len(self.full_path_world) - 1:
-                if now - self._son_varildi_zamani > 0.5:
-                    self.current_wp_index = wp1_idx
-                    self._son_varildi_zamani = now
-                    rospy.loginfo(f"[OTO] WP {self.current_wp_index} geçildi "
-                                  f"(d:{dist_to_wp:.1f}m)")
+        # ── Otomatik WP geçişi: hafif map-matching ──────────────────
+        # FAZ3: tek-tek +1 yerine, aracın rotadaki yerini İLERİ pencerede
+        # [idx, idx+MATCH_PENCERE) en yakın noktaya snap'le (geri zıplama yok,
+        # pencere ileri başlar). Sadece koridor içindeyse (best_d < MATCH_KORIDOR_M)
+        # ilerlet; dışındaysa off-route → snap yapma, sapma/reroute mantığı halleder.
+        wp_gecis_log = None   # lock içinde doldurulur, log lock DIŞINDA atılır
+        with self._wp_lock:
+            n_path = len(self.full_path_world)
+            ust    = min(self.current_wp_index + MATCH_PENCERE, n_path)
+            best_i = self.current_wp_index
+            best_d = math.hypot(self.robot_x - self.full_path_world[best_i][0],
+                                self.robot_y - self.full_path_world[best_i][1])
+            for i in range(self.current_wp_index + 1, ust):
+                wx_wp, wy_wp = self.full_path_world[i]
+                d = math.hypot(self.robot_x - wx_wp, self.robot_y - wy_wp)
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+
+            if (best_i > self.current_wp_index
+                    and best_i <= n_path - 1
+                    and best_d < MATCH_KORIDOR_M):
+                atlanan = best_i - self.current_wp_index
+                self.current_wp_index = best_i
+                self._son_varildi_zamani = now
+                rospy.loginfo(f"[OTO] WP {self.current_wp_index} "
+                              f"(map-match +{atlanan}, d:{best_d:.1f}m)")
+                wp_gecis_log = dict(wp_idx=self.current_wp_index,
+                                    n_path=n_path,
+                                    dist=round(best_d, 2),
+                                    atlanan=atlanan,
+                                    task_idx=self.current_task_index)
+
+        # Disk I/O'yu _wp_lock dışında yap (lock contention'ı önler)
+        if wp_gecis_log is not None and self.logger is not None:
+            self.logger.log_event("wp_gecis", **wp_gecis_log)
 
         # ── Ana hedef (durak) kontrolü ───────────────────────────────
         if self.current_task_index < len(self.geo_targets_world):
@@ -983,6 +1611,14 @@ class HedefYoneticisi:
 
                 if self.current_task_index >= len(self.geo_targets_world):
                     print(f"{YESIL}>>> TÜM GÖREVLER TAMAMLANDI!{SIFIRLA}")
+                    # NOT: bu sadece LOG; dur/hold sinyali ayrı iş (control tarafı, bekleyen #1)
+                    if self.logger is not None:
+                        self.logger.log_event(
+                            "tum_gorev_tamam",
+                            son_durak=GOREV_GEOJSON['features'][-1]['properties']['name'],
+                            robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
+                            yaw_deg=(round(math.degrees(self.robot_yaw), 2)
+                                     if self.robot_yaw is not None else None))
                     self.is_path_calculated = False
                     self.full_path_world    = []
                     self.new_data_available = True
@@ -990,23 +1626,84 @@ class HedefYoneticisi:
 
                 next_name = GOREV_GEOJSON['features'][self.current_task_index]['properties']['name']
                 print(f"{YESIL}>>> DURAK TAMAMLANDI! Yeni hedef: {next_name}{SIFIRLA}")
-                self.recalculate_path_from_robot()
+                if self.logger is not None:
+                    self.logger.log_event("gorev_tamam", task_idx=self.current_task_index,
+                                          next_name=next_name,
+                                          robot=[round(self.robot_x, 2), round(self.robot_y, 2)])
+                self.recalculate_path_from_robot(reason="durak_tamamlandi")
 
         # ── Sapma kontrolü ───────────────────────────────────────────
         # FIX: Tüm rota yerine sadece yakındaki WP'lere bak (CPU tasarrufu)
         lookahead = self.full_path_world[self.current_wp_index:
                                          self.current_wp_index + 20]
         if lookahead:
+            # ── FAZ5: sapmayı aracın BURUN noktasından ölç ──────────────
+            # Burun = robot + ILERI_MESAFE_M * yaw yönü (start seçiminde kullanılan
+            # nokta). Böylece on-route'ta mesafe ~0 (döngü kendiliğinden kapanır) ve
+            # ölçüm yön-bilinçli: araç rotaya dönükse burun rotaya yakın → kopmaz.
+            if self.robot_yaw is not None:
+                burun_x = self.robot_x + ILERI_MESAFE_M * math.cos(self.robot_yaw)
+                burun_y = self.robot_y + ILERI_MESAFE_M * math.sin(self.robot_yaw)
+            else:
+                burun_x, burun_y = self.robot_x, self.robot_y
             min_dist = min(
-                math.hypot(self.robot_x - wx, self.robot_y - wy)
+                math.hypot(burun_x - wx, burun_y - wy)
                 for wx, wy in lookahead
             )
-            if (min_dist > SAPMA_ESIK_METRE
+            # ── FAZ2: debounce + histerezis (Schmitt-trigger) ───────────
+            # Sapma SAPMA_DEBOUNCE_SURE boyunca sürmeli. Eşik etrafında salınan
+            # (flapping) araçta sayaç sıfırlanmasın diye: sayaç SAPMA_ESIK üstünde
+            # KURULUR, ancak SAPMA_TEMIZ ALTINA inince SIFIRLANIR. Ara bantta
+            # (TEMIZ..ESIK) sayaca dokunulmaz → kenarda süren araç da tetikler.
+            if min_dist > SAPMA_ESIK_METRE:
+                if self._sapma_baslangic is None:
+                    self._sapma_baslangic = now
+            elif min_dist < SAPMA_TEMIZ_METRE:
+                self._sapma_baslangic = None
+            sapma_sureli = (self._sapma_baslangic is not None
+                            and (now - self._sapma_baslangic) >= SAPMA_DEBOUNCE_SURE)
+
+            if (sapma_sureli
                     and now - self.son_hesaplama_zamani > 5.0):
-                print(f"{SARI}>>> [DİKKAT] Rotadan {min_dist:.1f}m uzak! "
-                      f"Güncelleniyor...{SIFIRLA}")
+                # Sapma → reroute. Mid-manevra (araç sol şeride çıkmışken) cusp/U-dönüşü
+                # re-plan'ını artık HESAPLAMA KİLİDİ engelliyor (burun yol ayrımını geçince
+                # kilitli; recalc kilitliyse erken döner) → ayrı off-road guard gereksiz.
+                sapma_suresi = now - self._sapma_baslangic
+                print(f"{SARI}>>> [DİKKAT] Burun rotadan {min_dist:.1f}m uzak "
+                      f"({sapma_suresi:.1f}s süregeldi)! Güncelleniyor...{SIFIRLA}")
+                if self.logger is not None:
+                    self.logger.log_event("sapma", min_dist=round(min_dist, 2),
+                                          esik=SAPMA_ESIK_METRE,
+                                          burun=[round(burun_x, 2), round(burun_y, 2)],
+                                          robot=[round(self.robot_x, 2), round(self.robot_y, 2)],
+                                          yaw_deg=round(math.degrees(self.robot_yaw), 2)
+                                          if self.robot_yaw is not None else None,
+                                          wp_idx=self.current_wp_index,
+                                          task_idx=self.current_task_index)
                 self.son_hesaplama_zamani = now
-                self.recalculate_path_from_robot()
+                self._sapma_baslangic = None   # FAZ2: reroute sonrası debounce sıfırla
+                self.recalculate_path_from_robot(reason="sapma")
+
+        # ── Konum izi (kısılmış; pose.csv) ──────────────────────────
+        # pose_due(): throttle hint — mesafe hesapları sadece yazılacaksa
+        # yapılır (kısılan tick'lerde boşa hesap yok). d_wp/d_goal o anki
+        # current_wp_index/task ile tutarlı kalsın diye burada hesaplanır.
+        if self.logger is not None and self.logger.pose_due():
+            d_wp = d_goal = None
+            try:
+                nx_idx = min(self.current_wp_index + 1, len(self.full_path_world) - 1)
+                wxn, wyn = self.full_path_world[nx_idx]
+                d_wp = math.hypot(self.robot_x - wxn, self.robot_y - wyn)
+                if self.current_task_index < len(self.geo_targets_world):
+                    gxn, gyn = self.geo_targets_world[self.current_task_index]
+                    d_goal = math.hypot(self.robot_x - gxn, self.robot_y - gyn)
+            except Exception:  # noqa: BLE001
+                pass
+            self.logger.log_pose(
+                self.robot_x, self.robot_y, self.robot_yaw,
+                self.current_task_index, self.current_wp_index,
+                len(self.full_path_world), d_wp, d_goal,
+            )
 
         self.new_data_available = True
 
@@ -1032,10 +1729,581 @@ class HedefYoneticisi:
                 self._son_varildi_zamani = now
                 rospy.loginfo(f"[varildi] WP → {self.current_wp_index}")
 
+    def hedef_komut_callback(self, msg: String) -> None:
+        """karar → hedef komutu (/hedef_komut). String: "komut;taraf;x;y;etiket;yaricap".
+        sollama/kenar_blok → engeli blokla (ağırlık şişirme; recalc'ta uygulanır);
+        kenar_serbest → bloğu kaldır; replan → yalnız yeniden hesapla.
+        Aynı engelin sollama tazelemeleri (≈1s) sadece TTL'i günceller (reroute yok);
+        rota yalnız blok KÜMESİ değişince yeniden çizilir."""
+        try:
+            parcalar = msg.data.strip().split(';')
+            if not parcalar or not parcalar[0]:
+                return
+            komut = parcalar[0].strip().lower()
+            taraf = parcalar[1].strip().lower() if len(parcalar) > 1 else ""
+
+            def _f(i):
+                try:
+                    return float(parcalar[i])
+                except (IndexError, ValueError):
+                    return None
+
+            now = time.time()
+            kume_degisti = False
+            # reroute YALNIZ blok EKLENİNCE (yeni engel) veya replan'da yapılır.
+            # Blok KALDIRMA (kenar_serbest) reroute TETİKLEMEZ — KRİTİK (canlı bug,
+            # logs/20260624T193310Z): araç sol şeride GEÇERKEN karar kenar_serbest
+            # yollayınca recalc, aracı (blok artık yok → enjeksiyon yok) B düğümüne
+            # snap'liyordu; B tek-yönlü olduğundan planlayıcı U-dönüşü/yukarı saçma
+            # rota çizip aracı YOLDAN ÇIKARIYORDU. Çözüm: blok kalkınca yeniden rota
+            # çizme; araç zaten committed overtake path'ini (B→A→hedef döner) sürsün.
+            reroute_iste = False
+            yeni_engel = False   # GERÇEK yeni koni (append) — kilit_bypass için (deadlock fix)
+
+            if komut in ('sollama', 'kenar_blok'):
+                ox, oy = _f(2), _f(3)
+                r = _f(5)
+                if ox is None or oy is None:
+                    return
+                if r is None or r <= 0.0:
+                    r = 1.0
+                with self._komut_lock:
+                    mevcut = self._yakin_blok_bul(ox, oy)
+                    if mevcut is not None:
+                        # KONUM güncelle (her zaman en tazeye) — eski/gürültülü konumda
+                        # donup kalma. Konum yeterince TAŞINDIYSA reroute de tetikle
+                        # (kullanıcı: "duba konumu tetiklesin güncellemeyi").
+                        tasindi = (math.hypot(mevcut['x'] - ox, mevcut['y'] - oy)
+                                   > KONUM_DEGISIM_ESIK_M)
+                        mevcut['x'], mevcut['y'], mevcut['r'], mevcut['t'] = ox, oy, r, now
+                        if tasindi:
+                            kume_degisti = True
+                            reroute_iste = True    # konum değişti → hemen yeniden planla
+                    else:
+                        self._bloklu_engeller.append(
+                            {'x': ox, 'y': oy, 'r': r, 'taraf': taraf, 't': now})
+                        kume_degisti = True
+                        reroute_iste = True        # YENİ engel → bloklu reroute
+                        yeni_engel = True          # → kilit_bypass: karşı şeritte kilitliyse bile recalc çalışsın
+            elif komut == 'kenar_serbest':
+                ox, oy = _f(2), _f(3)
+                with self._komut_lock:
+                    mevcut = (self._yakin_blok_bul(ox, oy)
+                              if ox is not None and oy is not None else None)
+                    if mevcut is not None:
+                        self._bloklu_engeller.remove(mevcut)
+                        kume_degisti = True
+                    elif self._bloklu_engeller:
+                        # Eşleşmeyen serbest TÜM blokları SİLMEZ (çoklu-koni: başka
+                        # koninin bloğunu düşürmek rotayı koninin üstünden geçirir).
+                        # Bayat blok zaten BLOK_TTL_S ile kendiliğinden düşer.
+                        rospy.logwarn_throttle(
+                            5.0, f"[hedef_komut] kenar_serbest ({ox},{oy}) hiçbir "
+                                 f"blokla eşleşmedi — yok sayıldı (TTL düşürür)")
+                # NOT: reroute_iste = False kalır → committed path'i koru (off-road fix)
+            elif komut == 'replan':
+                kume_degisti = True
+                reroute_iste = True
+            else:
+                rospy.logwarn_throttle(5.0, f"[hedef_komut] bilinmeyen komut: {komut}")
+                return
+
+            if self.logger is not None:
+                with self._komut_lock:
+                    n_blok = len(self._bloklu_engeller)
+                self.logger.log_event("hedef_komut", komut=komut, taraf=taraf,
+                                      x=_f(2), y=_f(3), yaricap=_f(5),
+                                      n_blok=n_blok, kume_degisti=kume_degisti,
+                                      reroute=reroute_iste)
+
+            # Rota yalnız YENİ blok/replan'da çizilir (blok kaldırma reroute etmez).
+            # yeni_engel → kilit_bypass: karşı şeritte kilitliyken bile yeni koni recalc'ı geçer.
+            if reroute_iste and self.is_path_calculated:
+                rospy.loginfo(f"[hedef_komut] {komut} → reroute (yeni blok/replan)")
+                self.recalculate_path_from_robot(reason=f"komut_{komut}",
+                                                 kilit_bypass=yeni_engel)
+        except Exception as e:  # noqa: BLE001 — callback node'u çökertmesin
+            rospy.logwarn_throttle(5.0, f"[hedef_komut] işlenemedi: {e!r} (msg={msg.data!r})")
+
+    def _yakin_blok_bul(self, ox, oy, esik=2.0):
+        """(ox,oy)'ye `esik` m'den yakın mevcut bloğu döndürür (yoksa None).
+        ÇAĞIRAN _komut_lock'u tutmalı."""
+        for b in self._bloklu_engeller:
+            if math.hypot(b['x'] - ox, b['y'] - oy) <= esik:
+                return b
+        return None
+
+    def _aktif_bloklar(self):
+        """TTL içindeki blokları döndürür; süresi geçenleri listeden ayıklar.
+        (karar engeli ~1s'de tazeler; dropout'ta karar obstacle_memory köprüsü tutar.)"""
+        now = time.time()
+        with self._komut_lock:
+            taze = [b for b in self._bloklu_engeller if now - b['t'] <= BLOK_TTL_S]
+            if len(taze) != len(self._bloklu_engeller):
+                self._bloklu_engeller = taze
+            return [(b['x'], b['y'], b['r']) for b in taze]
+
+    def _sag_seritte(self):
+        """Araç şu an SAĞ (forward) şeritte mi — karşı/sollama şeridinde DEĞİL mi?
+        HİSTEREZİSLİ: forward şerit düğümlerine en yakın mesafe (d_f) karşı şerit
+        düğümlerine en yakın mesafeden (d_k) SERIT_MARJIN_M kadar AZsa → sağ (True);
+        d_k, d_f'den o kadar azsa → sol (False); ARADA (boundary, yanal salınım) →
+        önceki durumu KORU. Yoksa araç şeritler arasında salınınca flicker olup kilidi
+        39×/s aç-kapa edip recalc churn'ü yapıyordu (canlı 203548Z). Bilgi yoksa True."""
+        if not self._forward_poz or self.robot_x is None or self.robot_y is None:
+            return True
+        rx, ry = self.robot_x, self.robot_y
+        d_f = min((p[0] - rx) ** 2 + (p[1] - ry) ** 2 for p in self._forward_poz) ** 0.5
+        d_k = (min((p[0] - rx) ** 2 + (p[1] - ry) ** 2 for p in self._karsi_poz) ** 0.5
+               if self._karsi_poz else float('inf'))
+        if d_f < d_k - SERIT_MARJIN_M:
+            self._son_sag_serit = True
+        elif d_k < d_f - SERIT_MARJIN_M:
+            self._son_sag_serit = False
+        # arada: histerezis → _son_sag_serit değişmez
+        return self._son_sag_serit
+
+    def _overtake_rotasi_mi(self, path):
+        """Verilen committed path KARŞI (sol/overtake) şeride giriyor mu — yani bu bir
+        SOLLAMA rotası mı? (Herhangi bir WP'si karşı-şerit düğüm kümesinde.) recalc'ta
+        sollama kararı verildiği AN kilitlemek için kullanılır."""
+        if not path or not self._karsi_poz:
+            return False
+        ks = self._karsi_poz
+        return any(wp in ks for wp in path)
+
+    def _log(self, etype, **kw):
+        """Loglama altyapısı yoksa veya log_event hata atarsa callback'i ÇÖKERTMEDEN geç."""
+        if self.logger is None:
+            return
+        try:
+            self.logger.log_event(etype, **kw)
+        except Exception as e:  # noqa: BLE001
+            rospy.logwarn_throttle(30.0, f"[_log] {etype} olayı yazılamadı: {e!r}")
+
+    def _robot_xy(self):
+        """[round(x,2), round(y,2)] veya konum yoksa None — log alanları için."""
+        if self.robot_x is None or self.robot_y is None:
+            return None
+        return [round(self.robot_x, 2), round(self.robot_y, 2)]
+
+    def _kilit_guncelle(self):
+        """HESAPLAMA KİLİDİ durumunu günceller (konum_callback'ten her poz'da). Kilit
+        recalc'ta SOLLAMA KARARIYLA kurulur (_overtake_rotasi_mi → _hesap_kilitli=True).
+        Burada AÇMA yönetilir (kullanıcı 2026-06-27: "sağ şeride döndüğü an bitsin"):
+          • FAIL-SAFE (gürültü-dayanıklı ÇAPA, en başta — yutulamaz): kilitliyken araç
+            DURMA_YARICAP_M çapasında DURMA_BEKLEME_SN kalırsa (durdu) → AÇ. Canlı
+            100603Z deadlock: eski anlık-hız durma tespiti konum gürültüsünde sayacı
+            HER örnekte sıfırlayıp 15s fail-safe'i HİÇ ateşletmedi → 222s kilit.
+          • ASIL: araç SOL şeride girip SAĞ (forward) şeride DÖNÜNCE → AÇ + temiz recalc
+            (sonraki dubayı sağ şeritten planlar). COOLDOWN: churn engeli (203548Z).
+            _sag_seritte hesap-yoğun → SADECE o try/except ile korunur (fail-safe DIŞI).
+        AÇMA reroute TETİKLER (recalc), kilitlemenin kendisi recalc'ta yapılır."""
+        if not HESAP_KILIDI_AKTIF:
+            return
+        rx, ry = self.robot_x, self.robot_y
+        if rx is None or ry is None:
+            return
+        now = time.time()
+        if not self._hesap_kilitli:
+            self._durma_capa_xy = None      # kilit yokken çapayı temizle (taze başla)
+            return
+        # ── FAIL-SAFE (gürültü-dayanıklı ÇAPA, try/except DIŞI — sade math, yutulamaz) ──
+        # Araç çapadan DURMA_YARICAP_M'den uzaklaşınca çapa+sayaç yenilenir; o yarıçapta
+        # DURMA_BEKLEME_SN kalırsa "durdu" → kilidi aç (kalıcı deadlock'tan çık). Tek
+        # gürültülü örnek (jitter < yarıçap) sayacı SIFIRLAMAZ → fail-safe güvenilir ateşler.
+        if (self._durma_capa_xy is None
+                or math.hypot(rx - self._durma_capa_xy[0],
+                              ry - self._durma_capa_xy[1]) > DURMA_YARICAP_M):
+            self._durma_capa_xy = (rx, ry)
+            self._durma_baslangic = now
+        elif now - self._durma_baslangic >= DURMA_BEKLEME_SN:
+            self._kilit_ac(now, "kilit_acildi",
+                           f"araç {DURMA_BEKLEME_SN:.0f}s durdu (fail-safe)")
+            return
+        # ── AÇMA asıl: sol şeride girip SAĞ şeride dönünce. _sag_seritte hesap-yoğun →
+        #    SADECE o try/except'le korunur. sag=None (True DEĞİL): hata olursa lane
+        #    mantığı atlanır + observability "hata" yazar (yanlış sag_serit=True YAZMAZ;
+        #    bu fix'in kapatmak istediği kör-noktayı yeniden üretmesin — /incele bulgusu). ──
+        sag = None
+        try:
+            sag = self._sag_seritte()
+        except Exception as e:  # noqa: BLE001
+            rospy.logwarn_throttle(5.0, f"[kilit] sağ-şerit hesap hatası: {e!r}")
+        if sag is False:
+            self._kilit_sol_serite_girdi = True       # sollama ortası: sol şeride girdi
+        elif (sag is True and self._kilit_sol_serite_girdi
+              and now - self._son_kilit_recalc >= KILIT_COOLDOWN_SN):
+            self._kilit_ac(now, "sag_serit", "araç sağ şeride döndü")
+            return
+        # ── Observability (§20): kilitliyken durum + fail-safe sayacını ~1Hz events'e
+        #    logla. Eski deadlock'ta kilit/fail-safe durumu loglanmadığından fail-safe'in
+        #    neden ateşlenmediği BELİRLENEMİYORDU. Artık durma_s/sag_serit izlenebilir. ──
+        if now - self._son_kilit_log_t >= KILIT_LOG_PERIYOT_SN:
+            self._son_kilit_log_t = now
+            self._log("kilit_durum", kilitli=True,
+                      sag_serit=(sag if sag is not None else "hata"),
+                      sol_girdi=self._kilit_sol_serite_girdi,
+                      durma_s=(round(now - self._durma_baslangic, 1)
+                               if self._durma_baslangic is not None else None),
+                      robot=[round(rx, 2), round(ry, 2)])
+
+    def _kilit_ac(self, now, reason, mesaj):
+        """Kilidi açar + o stabil konumdan tek temiz recalc (cooldown damgalar).
+        Kilit durumu recalc'tan ÖNCE temizlenir → recalc çökse de kilit AÇIK kalır
+        (fail-safe'in açması yutulmaz). recalc try/except ile korunur."""
+        self._hesap_kilitli = False
+        self._kilit_sol_serite_girdi = False
+        self._durma_baslangic = None
+        self._durma_capa_xy = None
+        self._son_kilit_recalc = now
+        rospy.loginfo_throttle(2.0, f"[kilit] {mesaj} → hesaplama AÇILDI (temiz recalc)")
+        self._log("kilit", durum="acildi", reason=reason, mesaj=mesaj, robot=self._robot_xy())
+        try:
+            self.recalculate_path_from_robot(reason=reason)
+        except Exception as e:  # noqa: BLE001
+            rospy.logwarn_throttle(5.0, f"[kilit] açma recalc hatası: {e!r}")
+
+    def _engel_rotada(self, path, engeller):
+        """Aktif engellerden HERHANGİ biri verilen (bloksuz baseline) rotanın
+        ÜZERİNDE mi — SERT blok çemberi (max(r, BLOK_YARICAP_M)) bir rota segmentini
+        kesiyor mu?
+          • True  → engel kendi şeridimizi tıkıyor → karşı-şerit enjeksiyonu (sollama) gerek.
+          • False → engel karşı şeritte / rota dışı (~2m yanal) → blokla ama SOLLAMA YOK.
+        path None/boşsa False (baseline yoksa karar veremeyiz → güvenli: sollama yok)."""
+        if not path or len(path) < 2 or not engeller:
+            return False
+        for (ox, oy, r) in engeller:
+            yaricap = max(r, BLOK_YARICAP_M)
+            for i in range(len(path) - 1):
+                if _nokta_segment_mesafe(ox, oy, path[i][0], path[i][1],
+                                         path[i + 1][0], path[i + 1][1]) <= yaricap:
+                    return True
+        return False
+
+    def _blok_uygula(self, enjekte=True, engeller=None):
+        """Aktif blokları grafa uygular + (enjekte=True ise) engel çevresine karşı-şerit
+        crossing (ÇIKMA) ve boylamasına segment (KALMA) kenarlarını GEÇİCİ enjekte eder (§16).
+        İki blok modu:
+          • SERT (BLOK_SERT_AKTIF=True, VARSAYILAN): engel çemberindeki kenarları
+            grafdan SİLER → ileri şerit kesilir, planlayıcı karşı şeritten dolanmak
+            ZORUNDA (kullanıcı kararı 2026-06-26). Silinen kenarlar `removed_set`'e
+            yazılır → enjeksiyon bunları GERİ EKLEMESİN (yoksa ileri şerit yeniden açılır).
+          • AĞIRLIK (False): eski sonlu ceza-şişirme (fail-safe ama farklı-sokak riski).
+        enjekte=False (SLALOM_YALNIZ_GEREKINCE, engel kendi rotada değil): SADECE
+        blok uygulanır, crossing EKLENMEZ → engel karşı şeritte (rota dışı) → araç
+        kendi şeridinde devam eder, karşı şeride GEÇMEZ (sollama YOK). Karar recalc'ta
+        (_engel_rotada) verilir.
+        engeller: çağıran _aktif_bloklar() snapshot'ını verirse onu kullanır; vermezse
+        kendi çağırır. Çağıran (recalc) _engel_rotada ile AYNI snapshot'ı geçirmeli →
+        D* araması sırasında /hedef_komut yeni blok eklerse enjekte_gerek↔blok seti
+        tutarsızlığı (TOCTOU) oluşmaz (incele bulgusu). Döndürür: (saved, eklenen) —
+        recalc finally'sinde geri yüklenir/kaldırılır."""
+        saved = []
+        eklenen = []
+        if engeller is None:
+            engeller = self._aktif_bloklar()
+        if not engeller:
+            return saved, eklenen
+        # BASE predecessor snapshot — blok kenar SİLMEDEN ÖNCE al. "Bir waypoint
+        # önce dön" enjeksiyonu engelin GERÇEK taban öncülünden başlamalı; SERT blok
+        # öncülün kenarını sileceği için snapshot sonradan alınsa o öncül boş kalır
+        # (predecessor crossing hiç enjekte edilmez). _slalom_enjekte'ye geçirilir.
+        pred_snap = {k: list(v) for k, v in self.planner.pred_list.items()}
+        if BLOK_SERT_AKTIF:
+            saved, removed_set = self._sert_blok(engeller)
+        else:
+            saved, removed_set = self._agirlik_blok(engeller)
+        if not enjekte:
+            return saved, eklenen   # engel rota dışı → blokla, crossing enjekte etme (sollama yok)
+        # Karşı-şerit enjeksiyonu (yalnız turn-aware açıkken → cusp kapısı sürülemez
+        # U-dönüşlerini eler; klasik find_path'te bu güvenlik yok). removed_set:
+        # SERT blokla silinmiş kenarları enjeksiyon geri eklemesin.
+        if SLALOM_ENJEKSIYON_AKTIF and TURN_AWARE_AKTIF:
+            eklenen = self._slalom_enjekte(engeller, removed_set, pred_snap)
+        elif BLOK_SERT_AKTIF:
+            # SERT blok ileri şeridi keser ama karşı-şerit alternatifi enjekte
+            # edilmezse rota çoğu engelde None olur → her seferinde bloksuz fallback
+            # (engele doğru düz rota). İstenen davranış DEĞİL → uyar.
+            rospy.logwarn_throttle(
+                10.0, "[blok] SERT blok açık ama karşı-şerit enjeksiyonu kapalı "
+                      "(SLALOM_ENJEKSIYON_AKTIF/TURN_AWARE_AKTIF) → slalom üretilemez, "
+                      "rota bloksuz fallback'a düşer.")
+        return saved, eklenen
+
+    def _sert_blok(self, engeller):
+        """SERT blok (kullanıcı kararı 2026-06-26): her engelin etkin yarıçapındaki
+        (`max(engel_r, BLOK_YARICAP_M)` ≈ 1m çember) TÜM kenarları grafdan GEÇİCİ
+        SİLER → o çemberdeki waypoint'ler kullanılamaz, ileri şerit engelde KESİLİR.
+        Böylece planlayıcı engeli yalnız karşı-şerit crossing'leriyle (ceza puanı
+        altında) dolanabilir → dar/yerel slalom; ağırlık şişirme gibi 'alternatif
+        yoksa düz geç' DEĞİL. Döndürür: (saved, removed_set); saved=[((p1,p2),w)]
+        geri yükleme için, removed_set=silinen kenar kümesi (enjeksiyon kullanır).
+        Geri alma _blok_geri_al'da (add_edge ile re-add)."""
+        saved = []
+        removed_set = set()
+        for (p1, p2), w in list(self.planner.edge_weights.items()):
+            for (ox, oy, r) in engeller:
+                yaricap = max(r, BLOK_YARICAP_M)
+                if _nokta_segment_mesafe(ox, oy, p1[0], p1[1], p2[0], p2[1]) <= yaricap:
+                    saved.append(((p1, p2), w))
+                    removed_set.add((p1, p2))
+                    self.planner.remove_edge_directed(p1, p2)
+                    self.planner.edge_weights.pop((p1, p2), None)
+                    break
+        return saved, removed_set
+
+    def _agirlik_blok(self, engeller):
+        """ESKİ ağırlık-şişirme bloğu (BLOK_SERT_AKTIF=False ile seçilir): engel
+        yarıçapı + BLOK_MARJIN_M içindeki kenarlara çarpımsal (CEZA_TERS_YON) +
+        toplamsal (BLOK_EK_CEZA) ceza → cone 'neredeyse geçilmez' ama SONLU
+        (alternatif yoksa yine geçer = fail-safe). SERT blok bu fail-safe'i
+        kaldırdığı (ve recalc path=None'da bloksuz fallback yaptığı) için artık
+        varsayılan değil; çıktı kıyası/acil durumlar için korunuyor.
+        Döndürür: (saved, set()) — _sert_blok ile aynı API (removed_set boş; ağırlık
+        modunda kenar silinmez, yalnız ağırlık şişer). ÖNEMLİ: enjeksiyondan ÖNCE
+        çağrılır → enjekte crossing'ler şişirme döngüsüne girmez (çift ceza yok)."""
+        saved = []
+        carp = ceza_carpani(CEZA_TERS_YON)
+        for (p1, p2), w in list(self.planner.edge_weights.items()):
+            for (ox, oy, r) in engeller:
+                if _nokta_segment_mesafe(ox, oy, p1[0], p1[1], p2[0], p2[1]) <= r + BLOK_MARJIN_M:
+                    saved.append(((p1, p2), w))
+                    self.planner.edge_weights[(p1, p2)] = w * carp + BLOK_EK_CEZA
+                    break
+        return saved, set()
+
+    def _slalom_enjekte(self, engeller, removed_set=None, pred_snap=None):
+        """Aktif blokların SLALOM_ENJEKSIYON_R yakınına GEÇİCİ karşı-şerit kenarı ekler:
+          • crossing (A↔B geçiş, "ÇIKMA")  → CEZA_TERS_CIKIS (PAHALI: az geçiş yap)
+          • boylamasına segment EKSİK yönü (karşı şeritte ileri seyir, "KALMA")
+                                           → CEZA_TERS_KALMA (UCUZ: bir kez çıkınca solda kal)
+        Bu ayrım (kullanıcı içgörüsü) → tek giriş+çıkış + engel boyunca karşı şeritte
+        kalma (yanal açıklık), zig-zag yerine. Döndürdüğü [(p1,p2),...] _blok_geri_al'da
+        kaldırılır. Yalnız engel çevresinde + tek-yön taban grafı bozmadan.
+        removed_set: SERT blokla silinmiş kenarlar — bunları enjeksiyon GERİ EKLEMEZ
+        (yoksa engelde kesilen ileri şerit yeniden açılır)."""
+        eklenen = []
+        removed_set = removed_set or set()
+        R = SLALOM_ENJEKSIYON_R
+
+        def _engele_yakin(p1, p2):
+            for (ox, oy, _r) in engeller:
+                if (math.hypot(p1[0] - ox, p1[1] - oy) <= R or
+                        math.hypot(p2[0] - ox, p2[1] - oy) <= R):
+                    return True
+            return False
+
+        # 1) Crossing'ler (ÇIKMA — pahalı) + SIYIRMA cezası + predecessor (bir
+        #    waypoint önce dön) enjeksiyonu. Cone'a yakın geçen giriş crossing'i
+        #    cezalanır; bir önceki düğümden başlayan (engeli daha geniş geçen)
+        #    versiyon da eklenir → planlayıcı erken-dönen, engel düğümünü atlayan
+        #    girişi seçer (path engel düğümünden geçmez → karar engel_blokaj vermez).
+        carp_c = ceza_carpani(CEZA_TERS_CIKIS)
+
+        def _min_acik(a, b):
+            """crossing [a,b] segmentinin en yakın aktif bloğa (cone) açıklığı (m)."""
+            return min(_nokta_segment_mesafe(ox, oy, a[0], a[1], b[0], b[1])
+                       for (ox, oy, _r) in engeller)
+
+        def _siyirma_cezasi(a, b):
+            """Cone'a r+KENAR_GUVENLI_M'den yakın geçen crossing'e yakınlıkla
+            orantılı toplamsal ceza (geniş geçen tercih edilsin)."""
+            ek = 0.0
+            for (ox, oy, r) in engeller:
+                acik = _nokta_segment_mesafe(ox, oy, a[0], a[1], b[0], b[1])
+                ek = max(ek, CEZA_SIYIRMA_M * max(0.0, (r + KENAR_GUVENLI_M) - acik))
+            return ek
+
+        def _enjekte_crossing(a, b):
+            if (a, b) in self.planner.edge_weights:   # zaten varsa dokunma
+                return
+            if (a, b) in removed_set:                  # SERT blokla silindi → geri ekleme
+                return
+            d_ab = math.hypot(b[0] - a[0], b[1] - a[1])
+            self.planner.add_edge(a, b, d_ab * carp_c + _siyirma_cezasi(a, b))
+            eklenen.append((a, b))
+
+        # BASE predecessor snapshot — çağıran (_blok_uygula) blok kenar SİLMEDEN
+        # ÖNCE çekip geçirir → "bir waypoint önce" enjeksiyonu engelin GERÇEK taban
+        # öncülünden başlar (SERT blok öncül kenarını silmiş olsa bile). Geçirilmezse
+        # (ör. doğrudan çağrı) anlık pred_list'ten al.
+        if pred_snap is None:
+            pred_snap = {k: list(v) for k, v in self.planner.pred_list.items()}
+        esik_acik = min(r + KENAR_GUVENLI_M for (_x, _y, r) in engeller)
+        for (p1, p2, d) in self._slalom_conns:
+            if not _engele_yakin(p1, p2):
+                continue
+            _enjekte_crossing(p1, p2)
+            # Sıyırıyorsa: bir önceki düğümden başlayan (daha geniş geçen) crossing'i
+            # de ekle → "bir waypoint önce dön". p1'in BASE öncüllerinden cone'u
+            # DAHA GENİŞ geçenleri enjekte et (planlayıcı en geniş geçeni seçer).
+            acik_p1p2 = _min_acik(p1, p2)
+            if acik_p1p2 < esik_acik:
+                for pu in pred_snap.get(p1, []):
+                    if pu == p2 or pu == p1:
+                        continue
+                    if _min_acik(pu, p2) > acik_p1p2:   # yalnız daha geniş geçeni
+                        _enjekte_crossing(pu, p2)
+
+        # 2) Karşı-şerit boylamasına segmentler (KALMA — ucuz); EKSİK yönü ekle →
+        #    şerit yerel olarak çift-yönlü olur, araç karşı şeritte ileri seyreder.
+        #    (ters yön sürülemez bir U-dönüşü gerektirirse turn-aware cusp eler.)
+        carp_k = ceza_carpani(CEZA_TERS_KALMA)
+        for (p1, p2, d) in self._slalom_segs:
+            if not (_engele_yakin(p1, p2)):
+                continue
+            for (a, b) in ((p1, p2), (p2, p1)):
+                if (a, b) in self.planner.edge_weights:
+                    continue
+                if (a, b) in removed_set:        # SERT blokla silindi → geri ekleme
+                    continue
+                self.planner.add_edge(a, b, d * carp_k)
+                eklenen.append((a, b))
+        return eklenen
+
+    def _blok_geri_al(self, saved, eklenen=None):
+        # saved=[((p1,p2), w)]: hem SERT blokla SİLİNEN taban kenarları (re-add)
+        # hem AĞIRLIK modunda şişirilen kenarları (weight restore) geri yükler.
+        # add_edge ikisini de doğru yapar: kenar yoksa adj/pred/weight ekler, varsa
+        # yalnız ağırlığı w'ye geri çeker (mükerrer komşu eklemez → sızıntı yok).
+        for (e, w) in saved:
+            self.planner.add_edge(e[0], e[1], w)
+        # Enjekte edilen karşı-şerit kenarlarını (crossing + segment) TAMAMEN kaldır
+        # (adj_list + pred_list + edge_weights) → sızıntı yok. Düğümlere
+        # dokunma (her iki uç da mevcut şerit düğümü). saved (taban kenar) ile
+        # eklenen (enjekte kenar) ayrık olduğundan re-add/remove çakışmaz.
+        for (p1, p2) in (eklenen or []):
+            self.planner.remove_edge_directed(p1, p2)
+            self.planner.edge_weights.pop((p1, p2), None)
+
+    # ==========================================
+    #   B PLANI — yaw-tabanlı sentetik slalom (varsayılan KAPALI)
+    # ==========================================
+    def _b_plan_yaw_rota(self, goal_node, engeller):
+        """B PLANI (varsayılan KAPALI — B_PLAN_YAW_ROTA_AKTIF). GRAF-BAĞIMSIZ,
+        yaw-tabanlı sentetik slalom: önümüzdeki engele aracın YAW'ına dik (sol =
+        karşı şerit) yanal-offset'li üç waypoint (giriş/orta/çıkış) üretir, sonra
+        çıkış noktasına en yakın graf düğümünden hedefe NORMAL rotayla devam eder.
+        Başlangıç noktası aracın GERÇEK konumu (robot_x/y); start_node kullanılmaz.
+        Açık-döngü; A planı (SERT blok + enjeksiyon) yeterken kullanılmaz. Dönüş:
+        [(x,y),...] veya None (üretilemezse çağıran A planına düşer).
+
+        ⚠ AÇILIRSA bilinen sınırlar (B planı KAPALI olduğundan şimdilik etkisiz):
+          • Sentetik waypoint'ler (p_in/p_mid/p_out) graf-bağımsız → HARİTA/pist
+            sınırını görmez; engel virajdaysa offset duvar/pist-dışına işaret
+            edebilir. Açmadan önce saha/sim ile doğrula.
+          • Devam rotası (`rejoin→goal`) blok UYGULAMADAN hesaplanır; rejoin engelin
+            ÖTESİNDE seçildiği için normalde engele dönmez, ama garanti değil.
+          • Graf okumaları (_rota_ara + nodes) _graf_lock altında → eşzamanlı
+            A-planı blok mutasyonuyla yarış yok.
+
+        Not: 'sol' tarafı sabit (yaw+90°). Gerekirse karar `taraf` bilgisinden
+        türetilebilir; şimdilik tek-yön loop'ta karşı şerit hep solda."""
+        if self.robot_x is None or self.robot_yaw is None or not engeller:
+            return None
+        rx, ry, yaw = self.robot_x, self.robot_y, self.robot_yaw
+        fwd_x, fwd_y = math.cos(yaw), math.sin(yaw)
+        # Aracın ÖNÜNDEki (ileri-projeksiyon pozitif) en yakın engel
+        onde = [(ox, oy, r) for (ox, oy, r) in engeller
+                if (ox - rx) * fwd_x + (oy - ry) * fwd_y > 0.0]
+        if not onde:
+            return None
+        ox, oy, r = min(onde, key=lambda o: (o[0] - rx) * fwd_x + (o[1] - ry) * fwd_y)
+        # Sol birim vektör (yaw + 90°) = karşı şerit yönü
+        lat_x, lat_y = math.cos(yaw + math.pi / 2), math.sin(yaw + math.pi / 2)
+        off = max(r + B_PLAN_OFFSET_MARJIN_M, B_PLAN_OFFSET_M)
+        lead = B_PLAN_LEAD_M
+        p_in  = (ox - lead * fwd_x + off * lat_x, oy - lead * fwd_y + off * lat_y)
+        p_mid = (ox + off * lat_x, oy + off * lat_y)
+        p_out = (ox + lead * fwd_x + off * lat_x, oy + lead * fwd_y + off * lat_y)
+        # Çıkıştan sonra grafa geri dön: p_out'a en yakın düğümden hedefe rota.
+        # Graf okuması _graf_lock altında (eşzamanlı A-planı blok mutasyonuna karşı).
+        with self._graf_lock:
+            rejoin = min(self.planner.nodes,
+                         key=lambda n: (n[0] - p_out[0]) ** 2 + (n[1] - p_out[1]) ** 2)
+            graf = self._rota_ara(rejoin, goal_node, yaw)
+        if not graf:
+            return None
+        return [(rx, ry), p_in, p_mid, p_out] + list(graf)
+
     # ==========================================
     #   ROTA HESAPLAMA
     # ==========================================
-    def recalculate_path_from_robot(self) -> None:
+    def _rota_ara(self, start_node, goal_node, yaw0):
+        """Rota arama: turn-aware (bisiklet modeli) veya klasik forward-filtre.
+        Karar blokları (ağırlık şişirme) çağırandan ÖNCE uygulanıp sonra geri
+        alınır; bu fonksiyon güncel edge_weights üzerinden arar."""
+        if TURN_AWARE_AKTIF:
+            # Turn-aware arama: yönlü-kenar durumları üzerinde, her köşede
+            # δ=atan(L·Δθ/d) direksiyon cezasıyla. Başlangıç yaw'ından itibaren
+            # keskin dönüş/cusp pahalı → start'tan geri-yön çıkışı zaten cezalı;
+            # ayrı forward-filtre GEREKMEZ. İki-yönlü durakta yumuşak girişi seçer.
+            return self.planner.find_path_turn_aware(start_node, goal_node, yaw0)
+
+        # ── Klasik: ileri yönlü filtre + D* find_path (geçici kenar silme) ──
+        removed_fwd, removed_back = [], []
+        try:
+            if self.robot_yaw is not None:
+                neighbors = list(self.planner.adj_list.get(start_node, []))
+                candidates = []
+                for n in neighbors:
+                    dx, dy = n[0] - start_node[0], n[1] - start_node[1]
+                    if dx == 0 and dy == 0:
+                        continue
+                    diff = (math.atan2(dy, dx) - self.robot_yaw + math.pi) \
+                           % (2 * math.pi) - math.pi
+                    if abs(diff) > YON_FILTRE_ACIISI:
+                        candidates.append(n)
+                if len(candidates) < len(neighbors):
+                    for n in candidates:
+                        if self.planner.remove_edge_directed(start_node, n):
+                            removed_fwd.append(n)
+                        if self.planner.remove_edge_directed(n, start_node):
+                            removed_back.append(n)
+            return self.planner.find_path(start_node, goal_node)
+        finally:
+            for n in removed_fwd:
+                self.planner.restore_edge_directed(start_node, n)
+            for n in removed_back:
+                self.planner.restore_edge_directed(n, start_node)
+
+    def recalculate_path_from_robot(self, reason: str = "?",
+                                    kilit_bypass: bool = False) -> None:
+        # ── HESAPLAMA KİLİDİ (yol ayrımı + sağ-şerit/15s açma) ──
+        # Burun bir yol ayrımını geçtiyse (_hesap_kilitli) ve elde committed path VARSA →
+        # recalc BASTIRILIR. Mid-manevra (sol şeritte) cusp/U-dönüşü re-plan'ı biter.
+        # Kilit, araç SAĞ ŞERİDE dönünce ya da 15s durunca açılır; _kilit_guncelle o an
+        # _hesap_kilitli'yi False yapıp recalc'ı çağırdığı için bu kapı geçilir.
+        # İlk rota (committed yok) daima geçer (araç başlasın).
+        # İSTİSNA — kilit_bypass (YENİ ENGEL): araç karşı şeritte kilitliyken YENİ bir
+        # koni (kume_degisti append) belirirse reroute ÇALIŞMALI (canlı 100603Z deadlock:
+        # koni1 sollanıp karşı şeritte kalınca kilit hiç açılmadı → koni2'nin 37 reroute
+        # komutu burada yutuldu → 222s kilit). Bypass churn cooldown'u AYRI bir damgaya
+        # (`_son_bypass_t`, yalnız komut thread) yazar → konum thread'in `_son_kilit_recalc`
+        # (sağ-şerit açma cooldown'u) ile cross-thread paylaşımı YOK (/incele ros+algoritma:
+        # paylaşım hem race hem sag-serit açmayı bypass başına 1.5s erteliyordu).
+        # INVARIANT (/incele): `kilit_bypass=True` YALNIZ hedef_komut_callback'ten (komut
+        # thread) geçilir → `_son_bypass_t` tek-thread; konum thread çağrıları default False
+        # (short-circuit ile `_son_bypass_t`'ye dokunmaz). Bu invariant bozulursa lock gerekir.
+        if HESAP_KILIDI_AKTIF and self._hesap_kilitli and self.full_path_world:
+            now = time.time()
+            if kilit_bypass and now - self._son_bypass_t >= KILIT_COOLDOWN_SN:
+                self._son_bypass_t = now
+                rospy.loginfo_throttle(
+                    2.0, f"[kilit] YENİ ENGEL → kilit bypass, reroute çalışıyor ({reason})")
+                self._log("kilit_bypass", reason=reason, robot=self._robot_xy())
+                # düş → recalc çalışsın. Kilit durumu commit bloğunda yeniden değerlendirilir:
+                # rota hâlâ overtake ise kilitli kalır, sağ-şerit rotası ürettiyse TEMİZLENİR
+                # (stale-lock heal, aşağıda).
+            else:
+                rospy.loginfo_throttle(
+                    2.0, f"[kilit] hesaplama kilitli (sol şerit / yol ayrımı) → recalc atlandı "
+                         f"({reason}); sağ şerit veya 15s durma açar")
+                self._log("kilit_recalc_atlandi", reason=reason,
+                          bypass_istendi=kilit_bypass, robot=self._robot_xy())
+                return
+
         if not self.geo_targets_world or not self.planner.nodes:
             rospy.logwarn("[recalculate] geo_targets veya planner.nodes boş!")
             return
@@ -1051,93 +2319,234 @@ class HedefYoneticisi:
 
         rx, ry = self.robot_x, self.robot_y
 
-        # Son aktif şeridi belirle (şerit koruma / hysteresis için)
-        last_lane = None
-        if hasattr(self, 'pos_to_node') and self.full_path_world and self.current_wp_index < len(self.full_path_world):
-            last_p = self.full_path_world[self.current_wp_index]
-            last_node = self.pos_to_node.get(last_p)
-            if last_node:
-                last_lane = self.G.nodes[last_node].get('lane')
-
-        # Düğümleri mesafe ve şerit koruma cezasına göre puanla
-        def get_node_cost(n):
-            dist_sq = (n[0] - rx)**2 + (n[1] - ry)**2
-            if last_lane is not None:
-                n_node = self.pos_to_node.get(n)
-                if n_node:
-                    n_lane = self.G.nodes[n_node].get('lane')
-                    # Eğer düğüm son aktif şeritte değilse ceza ekle (16.0 = 4 metre sapma eşdeğeri)
-                    if n_lane != last_lane:
-                        return dist_sq + 16.0
-            return dist_sq
-
-        # Aracın arkasında kalan ve U dönüşü / geri gitme tetikleyebilecek düğümleri filtrele
-        candidates = []
+        # ── Yaw forward-projection start seçimi (Samed'in eski sürümünden) ──
+        # Aracın ÖNÜNDE (yaw yönünde) ileride sanal bir nokta hesapla, start
+        # düğümünü O noktaya en yakın düğüm yap. Böylece rota aracın BAKTIĞI yöne
+        # göre başlar (yaw'a göre döner) — salt mesafe değil.
+        # BLOK aktifken ileri-projeksiyon 0'a iner: 2m ileri-okuma, aracın o anki
+        # konumundaki karşı-şerit GİRİŞ crossing'ini atlayıp girişi engele
+        # yaklaştırıyordu (yanal açıklık engelin ilerisinde oluşuyordu, engel geç
+        # algılanırsa çarpma). Blokta lead-in kritik → path gerçek konumdan başlasın.
+        _bloklu = bool(HEDEF_KOMUT_AKTIF and self._aktif_bloklar())
+        _ileri = ILERI_MESAFE_BLOK_M if _bloklu else ILERI_MESAFE_M
         if self.robot_yaw is not None:
-            cos_yaw = math.cos(self.robot_yaw)
-            sin_yaw = math.sin(self.robot_yaw)
-            for n in self.planner.nodes:
-                dx = n[0] - rx
-                dy = n[1] - ry
-                # Araç yönü üzerindeki izdüşüm (en fazla 0.5 metre geriye kadar izin verilir)
-                if dx * cos_yaw + dy * sin_yaw >= -0.5:
-                    candidates.append(n)
-
-        if candidates:
-            start_node = min(
-                candidates,
-                key=get_node_cost
-            )
+            front_x = rx + _ileri * math.cos(self.robot_yaw)
+            front_y = ry + _ileri * math.sin(self.robot_yaw)
         else:
-            start_node = min(
-                self.planner.nodes,
-                key=get_node_cost
-            )
+            front_x, front_y = rx, ry
+
+        start_node = min(
+            self.planner.nodes,
+            key=lambda n: (n[0] - front_x) ** 2 + (n[1] - front_y) ** 2
+        )
 
         goal_node = self.geo_targets_world[self.current_task_index]
         rospy.loginfo(f"[recalculate] {start_node} → {goal_node}")
 
-        # ── İleri yönlü filtre ──────────────────────────────────────
-        # FIX: her iki tarafı da güvenli sil + finally ile geri yükle
-        removed_fwd  = []   # start_node → n silinen kenarlar
-        removed_back = []   # n → start_node silinen kenarlar
+        yaw0 = self.robot_yaw if self.robot_yaw is not None else 0.0
 
-        try:
-            if self.robot_yaw is not None:
-                neighbors = list(self.planner.adj_list.get(start_node, []))
-                candidates = []
-                for n in neighbors:
-                    dx, dy = n[0] - rx, n[1] - ry
-                    if dx == 0 and dy == 0:
-                        continue
-                    diff = (math.atan2(dy, dx) - self.robot_yaw + math.pi) \
-                           % (2 * math.pi) - math.pi
-                    if abs(diff) > YON_FILTRE_ACIISI:
-                        candidates.append(n)
+        # ── B PLANI (varsayılan KAPALI): yaw-tabanlı sentetik slalom rotası ──
+        # Slalom noktasına gelince karar engeli bildirince (aktif blok), graf-bağımsız
+        # olarak aracın YAW'ına göre karşı şeride sentetik offset waypoint'leri üretip
+        # engeli sollar. B_PLAN_YAW_ROTA_AKTIF=True ile açılır (A planı sahada
+        # yetersiz kalırsa). KAPALIYKEN bu blok atlanır; aşağıdaki A planı çalışır.
+        # CAVEAT (/incele, latent — B_PLAN default KAPALI): bu dal commit edip return
+        # ettiğinden aşağıdaki commit-bloğu KUR/TEMİZLE (stale-lock heal) ÇALIŞMAZ. B_PLAN
+        # etkinleştirilirse kilit yönetimi (engage + heal) buraya da eklenmeli.
+        if B_PLAN_YAW_ROTA_AKTIF and HEDEF_KOMUT_AKTIF:
+            engeller_b = self._aktif_bloklar()
+            if engeller_b:
+                b_path = self._b_plan_yaw_rota(goal_node, engeller_b)
+                if b_path:
+                    with self._wp_lock:
+                        self.full_path_world    = b_path
+                        self.current_wp_index   = 0
+                        self.is_path_calculated = True
+                    if self.logger is not None:
+                        try:
+                            self.logger.log_event(
+                                "b_plan_yaw_rota", reason=reason, n_wp=len(b_path),
+                                robot=[round(rx, 2), round(ry, 2)],
+                                yaw_deg=round(math.degrees(yaw0), 2))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    print(f"{YESIL}>>> [B-PLAN] {len(b_path)} WP "
+                          f"(yaw-tabanlı sentetik slalom).{SIFIRLA}")
+                    return
 
-                # FIX: tüm komşular kaldırılacaksa filtreyi uygulama
-                if len(candidates) < len(neighbors):
-                    for n in candidates:
-                        if self.planner.remove_edge_directed(start_node, n):
-                            removed_fwd.append(n)
-                        if self.planner.remove_edge_directed(n, start_node):
-                            removed_back.append(n)
+        # ── Rota arama (A planı). Karar blokları: SERT blok (varsayılan) veya
+        #    ağırlık-şişirme + karşı-şerit crossing enjeksiyonu; finally'de geri
+        #    al/kaldır. _graf_lock graf mutasyonunu serialize eder (eşzamanlı
+        #    recalc'lar ağırlık sızdırmasın). ──
+        fallback_bloksuz = False
+        with self._graf_lock:
+            # SLALOM_YALNIZ_GEREKINCE (kullanıcı 2026-06-26 "duba sol şeritte → hep
+            # sollamaya çalışıyorsun"): karşı-şerit crossing'i YALNIZ engel KENDİ
+            # ROTAMIZI tıkıyorsa enjekte et. Önce engeli hesaba katmadan bloksuz
+            # baseline rota çıkar; engelin çemberi bu rotayı KESMİYORSA (karşı şeritte,
+            # ~2m yanal) sollama gereksiz → enjekte ETME (blokla, kendi şeritte devam).
+            # KESİYORSA (kendi şeridimizde, ~0m) enjekte → karşı şeritten solla.
+            # (Not: graf bağlı olduğundan kendi şerit silinse bile "farklı sokak" rotası
+            # bulunur, path None olmaz → "None olunca enjekte et" yaklaşımı yetmez;
+            # bu yüzden engel-rotada testi yapılır.)
+            enjekte_gerek = True
+            path_base = None
+            # engeller_aktif TEK snapshot — _engel_rotada + _blok_uygula AYNI kümeyi
+            # kullansın (TOCTOU: D* araması sırasında yeni blok eklenirse tutarsızlık).
+            engeller_aktif = self._aktif_bloklar() if HEDEF_KOMUT_AKTIF else []
+            if engeller_aktif and SLALOM_YALNIZ_GEREKINCE and SLALOM_ENJEKSIYON_AKTIF:
+                path_base = self._rota_ara(start_node, goal_node, yaw0)
+                enjekte_gerek = self._engel_rotada(path_base, engeller_aktif)
+                if not enjekte_gerek:
+                    rospy.loginfo_throttle(
+                        2.0, "[slalom] engel kendi rotada DEĞİL (karşı şeritte) → "
+                             "sollama YOK, yalnız blokla + kendi şeritte devam")
 
-            path = self.planner.find_path(start_node, goal_node)
+            blok_saved, blok_eklenen = ([], [])
+            if path_base is not None and not enjekte_gerek:
+                # Engel rota dışı (karşı şerit): SERT blok çemberi = _engel_rotada eşiği
+                # olduğundan blok baseline rotayı DEĞİŞTİRMEZ → baseline'ı doğrudan kullan
+                # (2. D* aramasını ATLA; engelin WP'si zaten rota dışı, blokla gerek yok).
+                path = path_base
+            else:
+                blok_saved, blok_eklenen = (
+                    self._blok_uygula(enjekte=enjekte_gerek, engeller=engeller_aktif)
+                    if HEDEF_KOMUT_AKTIF else ([], []))
+                if blok_eklenen:
+                    rospy.loginfo_throttle(
+                        2.0, f"[slalom] {len(blok_eklenen)} karşı-şerit crossing enjekte "
+                             f"(engel kendi rotayı tıkıyor) → karşı şeritten reroute")
+                try:
+                    path = self._rota_ara(start_node, goal_node, yaw0)
+                finally:
+                    self._blok_geri_al(blok_saved, blok_eklenen)
 
-        finally:
-            # FIX: exception olsa bile kenarları geri yükle
-            for n in removed_fwd:
-                self.planner.restore_edge_directed(start_node, n)
-            for n in removed_back:
-                self.planner.restore_edge_directed(n, start_node)
+            # ── Fail-safe: SERT blokla yol YOK (karşı şerit yok / giriş kapalı) ──
+            # FARKLI BİR SOKAĞA SAPMA. Blok geri alındıktan SONRA (graf temizken)
+            # bloksuz düz rotayı ver; araç engele yaklaşınca control latched e-stop
+            # ile durur (plan §12.13). Wrong-street'ten (yarış cezası) iyidir.
+            if path is None and blok_saved:
+                rospy.logwarn_throttle(
+                    2.0, "[blok] bloklu rota YOK → bloksuz düz rota (control e-stop); "
+                         "farklı sokağa sapılmaz")
+                path = self._rota_ara(start_node, goal_node, yaw0)
+                fallback_bloksuz = True
+            elif (path is None and not blok_saved and HEDEF_KOMUT_AKTIF
+                  and BLOK_SERT_AKTIF and self._aktif_bloklar()):
+                # Engel var ama hiçbir TABAN kenarı çembere girmedi (blok_saved boş)
+                # ve yine de yol yok → engel koordinatı taban graftan uzak olabilir
+                # (karar yanlış dünya konumu yolluyor?) ya da goal erişilemez. Tanı.
+                rospy.logwarn_throttle(
+                    5.0, "[blok] SERT blok aktif ama çembere giren taban kenar YOK "
+                         "(engel koordinatı graftan uzak?) ve rota None.")
 
-        if path:
+        # ── Dönüş kalitesi (bisiklet modeli): en keskin dönüş + min dönüş yarıçapı ──
+        max_donus_deg, min_yaricap = rota_donus_metrigi(path, yaw0)
+        if path and max_donus_deg >= math.degrees(DONUS_CUSP_ESIK):
+            print(f"{SARI}>>> [DÖNÜŞ] rota maks dönüş {max_donus_deg:.0f}° "
+                  f"(min yarıçap {min_yaricap:.1f}m) — sıkışık!{SIFIRLA}")
+
+        # ── ÇIKTI KAPISI: sürülemez (cusp/U-dönüşü) rotayı COMMIT ETME ──
+        # Kullanıcı (2026-06-26): "araç buna uymasa da yine de hatalı rota çizmemeli."
+        # Tetikleyiciyi tahmin etmek (girdi-tarafı guard'lar) yerine ÇIKTIYI denetle:
+        # rota bir cusp (≥DONUS_CUSP_ESIK ~150° tek dönüş = U-dönüşü) içeriyorsa ve elde
+        # KORUNACAK committed path varsa → çizme, eskisini koru. Cusp net sinyaldir:
+        # meşru rotalar (düz takip, geçerli sollama) <150°; cusp yalnız araç kötü konumda
+        # (karşı şeritte) reroute zorlandığında çıkar (canlı 141631Z max-dönüş 167°,
+        # off-road). Tetikleyiciden BAĞIMSIZ → eski _ters_yon_start_riski (başlangıç-düğümü
+        # tahmini) yerine GERÇEK rotayı keser. İlk rota (committed yok) daima kabul edilir
+        # (yoksa araç hiç başlamaz; engele yaklaşırsa control e-stop güvenlik ağı).
+        rota_reddedildi = False
+        if path and self.full_path_world and max_donus_deg >= math.degrees(DONUS_CUSP_ESIK):
+            rota_reddedildi = True
+            rospy.logwarn_throttle(
+                2.0, f"[rota] SÜRÜLEMEZ rota reddedildi (maks dönüş {max_donus_deg:.0f}° "
+                     f"≥ cusp; min yarıçap {min_yaricap:.2f}m) → committed path korunuyor "
+                     f"({reason})")
+
+        # ── Tanı logu: rota uzaktan mı çiziliyor? ───────────────────
+        if self.logger is not None:
+            try:
+                task_name = (GOREV_GEOJSON['features'][self.current_task_index]
+                             ['properties']['name'])
+            except Exception:  # noqa: BLE001
+                task_name = None
+            # log buradan önce full_path_world hâlâ ESKİ rota → kıyas geçerli.
+            # path_changed=False → rota değişmedi (boşa recalc / oscillation işareti)
+            path_changed = (path != self.full_path_world) if path else None
+            # Rotanın CEZALI (ağırlıklı) toplam maliyeti — ceza-puan etkisini gösterir.
+            # log_recalc bunu ham path_len_m ile kıyaslayıp ceza_orani üretir (>1 = ceza uygulandı).
+            weighted = None
+            if path and len(path) > 1:
+                try:
+                    weighted = sum(self.planner.get_cost(path[i], path[i + 1])
+                                   for i in range(len(path) - 1))
+                except Exception:  # noqa: BLE001
+                    weighted = None
+            self.logger.log_recalc(
+                reason=reason, rx=rx, ry=ry, yaw=self.robot_yaw,
+                front=(front_x, front_y), start_node=start_node,
+                goal_node=goal_node, task_idx=self.current_task_index,
+                task_name=task_name, path=path, path_changed=path_changed,
+                weighted_cost=weighted,
+            )
+            # Dönüş kalitesi izi (bisiklet modeli): rotanın en keskin dönüşü +
+            # min dönüş yarıçapı — turn-aware aramanın etkisi loglardan görülür.
+            if path:
+                self.logger.log_event(
+                    "donus_metrik", reason=reason,
+                    turn_aware=TURN_AWARE_AKTIF,
+                    iki_yonlu_durak=IKI_YONLU_DURAK_AKTIF,
+                    max_donus_deg=round(max_donus_deg, 1),
+                    min_yaricap_m=round(min_yaricap, 2),
+                    arac_min_yaricap_m=round(ARAC_DINGIL_M / math.tan(ARAC_MAX_DIREKSIYON), 2),
+                    bloklu_kenar=len(blok_saved),
+                    blok_sert=BLOK_SERT_AKTIF,
+                    fallback_bloksuz=fallback_bloksuz,
+                    rota_reddedildi=rota_reddedildi,
+                    task_idx=self.current_task_index,
+                )
+
+        if path and not rota_reddedildi:
             with self._wp_lock:
                 self.full_path_world   = path
                 self.current_wp_index = 0
                 self.is_path_calculated = True
+            # ── HESAPLAMA KİLİDİ — committed rotanın overtake'liğine göre KUR/TEMİZLE ──
+            # KUR: rota KARŞI (sol) şeride giriyorsa → SOLLAMA kararı verildi → bu AN kilitle
+            #   (kullanıcı 2026-06-27). Sağ şeride dönünce / 15s durunca _kilit_guncelle açar.
+            # TEMİZLE (stale-lock heal, /incele algoritma+güvenlik YÜKSEK): kilitliyken commit
+            #   edilen rota artık KARŞI şeride GİRMİYORSA (ör. kilit_bypass yeni-koni recalc'ı
+            #   SAĞ-şerit rotası ürettiyse) VE araç SAĞ şeritteyse → ortada sollama YOK → temizle.
+            #   Yoksa: bypass kilidi True bırakır + araç sol şeride hiç girmediği için
+            #   _kilit_sol_serite_girdi=False kalır + hareketli olduğundan fail-safe ateşlemez
+            #   → ne sağ-şerit ne fail-safe açar → KALICI stale-lock (görev tamamlanamaz).
+            #   `_son_sag_serit` guard (/incele): araç GERÇEKTEN sol şeritteyken (mid-overtake)
+            #   start_node şerit-sınırında sağ düğüme snap'lerse rota sağ-şerit çıkıp kilidi
+            #   YANLIŞ açabilirdi → yalnız araç sağ şeritte (son histerezis durumu) iken temizle.
+            overtake = self._overtake_rotasi_mi(path)
+            if HESAP_KILIDI_AKTIF and overtake and not self._hesap_kilitli:
+                self._hesap_kilitli = True
+                self._kilit_sol_serite_girdi = False
+                self._durma_capa_xy = None     # taze kilit → fail-safe çapasını sıfırla
+                rospy.loginfo_throttle(
+                    2.0, "[kilit] sollama kararı (rota karşı şeride girdi) → KİLİTLENDİ "
+                         "(sağ şeride dönünce açılır)")
+                self._log("kilit", durum="kilitlendi", reason=reason,
+                          robot=[round(rx, 2), round(ry, 2)])
+            elif (HESAP_KILIDI_AKTIF and self._hesap_kilitli and not overtake
+                    and self._son_sag_serit):
+                self._hesap_kilitli = False
+                self._kilit_sol_serite_girdi = False
+                self._durma_capa_xy = None
+                rospy.loginfo_throttle(
+                    2.0, "[kilit] committed rota + araç sağ şeritte → kilit TEMİZLENDİ (stale-lock heal)")
+                self._log("kilit", durum="acildi", reason=f"sag_serit_rota:{reason}",
+                          robot=[round(rx, 2), round(ry, 2)])
             print(f"{YESIL}>>> [ROTA] {len(path)} WP oluşturuldu.{SIFIRLA}")
+        elif rota_reddedildi:
+            # committed path KORUNUR (overwrite yok) → araç eski sürülebilir rotayı sürer.
+            print(f"{SARI}>>> [ROTA] sürülemez rota reddedildi, committed path korundu.{SIFIRLA}")
         else:
             print(f"{KIRMIZI}!!! [HATA] Rota bulunamadı! "
                   f"{start_node} → {goal_node}{SIFIRLA}")
@@ -1163,6 +2572,30 @@ class HedefYoneticisi:
             msg_parts.append(f"{wx:.2f},{wy:.2f},{ntype}")
 
         self.pub_hedef.publish("|".join(msg_parts))
+
+    def publish_bloklar(self) -> None:
+        """Karar'ın engel bloklarını (silme çemberi) + çember içine düşen
+        'silinen' waypoint'leri görselleştiriciye yayınla. Salt-görsel:
+        planlama davranışını etkilemez. Biçim: 'cx,cy,r|...#wx,wy|...'
+        (etkin yarıçap = max(engel_r, BLOK_YARICAP_M), _sert_blok ile aynı).
+        try/except: bir viz-yayın hatası ASLA ana döngüyü/planlayıcıyı düşürmesin."""
+        try:
+            bloklar = self._aktif_bloklar()   # [(x,y,r)] — TTL süzülü
+            cember_parts = [f"{cx:.2f},{cy:.2f},{max(r, BLOK_YARICAP_M):.2f}"
+                            for (cx, cy, r) in bloklar]
+            # Çember içine düşen graf düğümleri = _sert_blok'un kullanılamaz kıldığı
+            # (silinen) waypoint'ler. Düğüm-merkez yaklaşımı (_sert_blok segment-mesafe
+            # kullanır; görsel amaçlı yeterince yakın). Blok yokken düğüm taraması atlanır.
+            silinen = []
+            if bloklar:
+                for (nx, ny) in self.planner.nodes:
+                    for (cx, cy, r) in bloklar:
+                        if math.hypot(nx - cx, ny - cy) <= max(r, BLOK_YARICAP_M):
+                            silinen.append(f"{nx:.2f},{ny:.2f}")
+                            break
+            self.pub_blok.publish("|".join(cember_parts) + "#" + "|".join(silinen))
+        except Exception:
+            pass
 
     # ==========================================
     #   ÇİZİM
@@ -1273,6 +2706,25 @@ class HedefYoneticisi:
                 spine.set_edgecolor('#3d3c38')
                 spine.set_linewidth(0.6)
 
+            # ── HESAPLAMA KİLİDİ göstergesi: çizili asma kilit + metin (sol-üst) ──
+            # Emoji DejaVu'da tofu → kilidi patch ile çiziyoruz (gövde + halka). Renk
+            # durumu verir: KIRMIZI=kilitli, YEŞİL=açık. figure-fraction (kare figür → bozulmaz).
+            from matplotlib.patches import FancyBboxPatch, Arc
+            lx, ly, bw, bh = 0.05, 0.80, 0.055, 0.05   # başlığın altı, sol-üst
+            self.lock_body = FancyBboxPatch(
+                (lx, ly), bw, bh, transform=self.fig.transFigure,
+                boxstyle='round,pad=0.004,rounding_size=0.012',
+                facecolor='#ff4d5e', edgecolor='none', zorder=30, clip_on=False)
+            self.fig.add_artist(self.lock_body)
+            self.lock_shackle = Arc(
+                (lx + bw / 2, ly + bh), bw * 0.62, bh * 0.95, angle=0, theta1=0, theta2=180,
+                transform=self.fig.transFigure, lw=2.2, edgecolor='#ff4d5e', zorder=29, clip_on=False)
+            self.fig.add_artist(self.lock_shackle)
+            self.lock_text = self.fig.text(
+                lx + bw + 0.02, ly + bh / 2, '', transform=self.fig.transFigure,
+                fontsize=9, fontfamily='monospace', fontweight='bold',
+                va='center', ha='left', color='#ff4d5e', zorder=30)
+
             self._static_drawn = True
 
         # ── Rota ────────────────────────────────────────────────────
@@ -1352,6 +2804,15 @@ class HedefYoneticisi:
                       edgecolor='#3d3c38', alpha=0.6)
         )
 
+        # ── HESAPLAMA KİLİDİ göstergesi (çizili kilit + metin) ───────
+        if getattr(self, 'lock_body', None) is not None:
+            kilitli = bool(HESAP_KILIDI_AKTIF and self._hesap_kilitli)
+            col = '#ff4d5e' if kilitli else '#39ff14'   # kırmızı=kilitli, yeşil=açık
+            self.lock_body.set_facecolor(col)
+            self.lock_shackle.set_edgecolor(col)
+            self.lock_text.set_color(col)
+            self.lock_text.set_text('KİLİTLİ' if kilitli else 'AÇIK')
+
         self.fig.canvas.draw_idle()
 
     # ==========================================
@@ -1362,6 +2823,7 @@ class HedefYoneticisi:
         while not rospy.is_shutdown():
             if self.is_path_calculated:
                 self.publish_current_waypoint()
+            self.publish_bloklar()   # salt-görsel: silme çemberi + silinen WP
             if ENABLE_GUI and self.new_data_available:
                 self.draw()
                 self.new_data_available = False

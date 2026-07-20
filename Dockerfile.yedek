@@ -1,0 +1,35 @@
+# TALOS YEDEK İMAJI — kendi kendine yeten acil durum imajı
+# =========================================================
+# talos-all (tüm çalışma-zamanı bağımlılıkları) ÜZERİNE kodun kendisi ve
+# devel/ (cart_sim + smart_can_msgs mesaj paketleri) GÖMÜLÜR. Bind-mount
+# GEREKMEZ: host'taki kod ağacı bozulsa/kaybolsa bile bu imaj + host'ta
+# roscore/docker ile sistem ayağa kalkar.
+#
+# Çalıştırma: docker-compose.yedek.yml (+ araçta docker-compose.yedek-beemobs.yml)
+# — her servis, base compose'un bind-mount'la /app'e koyduğu dosyaları
+# başlangıçta /talos-kod'dan /app'e KOPYALAYIP aynı komutu çalıştırır.
+#
+# Build'i arac_paketi_olustur.sh yapar (staging dizini: talos26_ws kodu
+# logs/.git/__pycache__ HARİÇ + devel/). Elle build etme; script kullan.
+#
+# NOT: Bu imajda kod SABIT (build anındaki hali). Kod düzenlemesi bu modda
+# uygulanamaz — normal mount modeline dönülmeli (bkz. 07 rehber).
+
+FROM talos-all:latest
+
+LABEL description="TALOS yedek imaji: talos-all + kod + devel gomulu; bind-mount gerektirmez (acil durum)"
+
+# Kod ağacı ve devel (compose'daki /talos-devel mount hedefiyle AYNI yol —
+# PYTHONPATH satırları değişmeden çalışır)
+COPY talos26_ws /talos-kod
+COPY devel /talos-devel
+
+# Sabit hedefli mount'ların birebir imaj-içi karşılıkları:
+#  - /missions, /maps           : hedef-teslimi / controller / visualizer okur
+#  - /root/catkin_ws/.../best.pt: traffic-node'un model yolu (base compose ile aynı)
+RUN cp -a /talos-kod/missions /missions && \
+    cp -a /talos-kod/maps /maps && \
+    mkdir -p /root/catkin_ws/src/yolov8_ros/scripts && \
+    cp /talos-kod/algi/levha/yolov8_ros/scripts/best.pt /root/catkin_ws/src/yolov8_ros/scripts/best.pt
+
+CMD ["bash"]
