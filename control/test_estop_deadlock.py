@@ -33,7 +33,7 @@ def _stub_module(name, attrs):
         setattr(m, a, object)
     sys.modules[name] = m
 _stub_module('nav_msgs', []); _stub_module('nav_msgs.msg', ['Odometry'])
-_stub_module('std_msgs', []); _stub_module('std_msgs.msg', ['Float32', 'String'])
+_stub_module('std_msgs', []); _stub_module('std_msgs.msg', ['Bool', 'Float32', 'String'])
 _stub_module('visualization_msgs', []); _stub_module('visualization_msgs.msg', ['Marker'])
 _stub_module('geometry_msgs', []); _stub_module('geometry_msgs.msg', ['Point', 'PoseArray'])
 _stub_module('tf.transformations', ['euler_from_quaternion'])

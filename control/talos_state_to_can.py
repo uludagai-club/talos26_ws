@@ -130,8 +130,8 @@ class TalosStateToCAN:
         # El freni durumu (0.5'ten büyükse aktif).
         # getattr: sim v0.3'un cart_control.msg'inde 'handbrake' alani YOK. Duz erisim
         # her karede AttributeError atardi — rospy callback istisnasini yutar, yani node
-        # olmez ama 20 Hz log spam'i akar. Alan yoksa "park freni serbest" varsayiyoruz
-        # (can_bridge de o surumde 0x305 geri-bildirimini zaten yaymiyor).
+        # olmez ama 20 Hz log spam'i akar ve 0x305 zaten yayinlanamaz. Alan yoksa
+        # "park freni serbest" varsayiyoruz (can_bridge de o surumde 0x305'i yaymiyor).
         self.park_brake_active = getattr(msg, 'handbrake', 0.0) > 0.5
 
     def send_can_messages(self, event):

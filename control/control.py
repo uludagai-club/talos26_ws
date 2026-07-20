@@ -20,15 +20,24 @@ import os
 import threading
 import time
 import numpy as np
+from collections import deque
 try:
     import ackermann
 except ImportError:
     ackermann = None
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Float32, String
+from std_msgs.msg import Bool, Float32, String
 from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Point, PoseArray
+from geometry_msgs.msg import PoseArray
 from tf.transformations import euler_from_quaternion
+# /karar_decision (cart_sim/Decision): karar'ın reason alanı — DUR-kaçış filtresi
+# (P0 №1, inceleme 2026-07-16) bunu okur. devel mount yoksa import düşer ve
+# yalnız /karar String ile çalışılır → reason hiç dolmaz → engel-DUR kaçışı
+# tetiklenmez (fail-safe: özellik sessizce kapanır, davranış bozulmaz).
+try:
+    from cart_sim.msg import Decision as DecisionMsg
+except ImportError:
+    DecisionMsg = None
 
 
 # =============================================================================
@@ -85,9 +94,10 @@ def select_blocking_obstacle(points, fwd_min, fwd_max, corridor_m):
 
 
 def select_arc_blocking_obstacle(points, fwd_min, fwd_max, corridor_m,
-                                 steer_deg, wheelbase_m, safe_radius_m):
-    """Koridor adayları arasından mevcut direksiyon yayının GEÇEMEDİĞİ en yakın
-    engeli seç (yoksa None).
+                                 steer_deg, wheelbase_m, half_width_m,
+                                 sensor_to_ra_m, nose_m):
+    """Koridor adayları arasından mevcut direksiyonun 2B SÜPÜRME BANDININ
+    içine aldığı en yakın engeli seç (yoksa None).
 
     İncele düzeltmesi (2026-07-04, CONFIRMED): eskiden yalnız en-yakın aday yay
     testine sokuluyordu — yakın-ama-yanal (yayın zaten geçtiği) bir koni, biraz
@@ -100,31 +110,128 @@ def select_arc_blocking_obstacle(points, fwd_min, fwd_max, corridor_m,
             continue
         if abs(lat) >= corridor_m:
             continue
-        if ackermann_path_clears(fwd, lat, steer_deg, wheelbase_m, safe_radius_m):
+        if ackermann_path_clears(fwd, lat, steer_deg, wheelbase_m,
+                                 half_width_m, sensor_to_ra_m, nose_m):
             continue
         if best is None or fwd < best[0]:
             best = (fwd, lat)
     return best
 
 
-def ackermann_path_clears(fwd, lat, steer_deg, wheelbase_m, safe_radius_m):
-    """Araç MEVCUT direksiyonla (bisiklet/Ackermann yayı) gövde-çerçevesi engeli
-    (fwd, lat) `safe_radius` payıyla geçer mi?
+def ackermann_path_clears(fwd, lat, steer_deg, wheelbase_m, half_width_m,
+                          sensor_to_ra_m, nose_m):
+    """Araç MEVCUT direksiyonla giderken 2B SÜPÜRME BANDI engeli (fwd, lat)
+    içine alıyor mu? (kullanıcı 2026-07-04: bisiklet yayını araç GENİŞLİĞİYLE
+    iki boyutlu yap; koni bandın dışındaysa dur emri verme)
 
-    Düz (~0°): yalnız yanal ayrım önemli (|lat| ≥ safe → geçer).
-    Dönüşte: arka-aks referanslı ICR (0, ±R), R = L/tan|δ| (δ>0 sol → ICR +y).
-    Engelin yay çemberine uzaklığı |d_c − R| ≥ safe → araç yayı engele değmeden geçer.
-    True = geçer (DURMA gerekmez); False = yay engele safe'ten yakın → tam fren.
+    (fwd, lat) SENSÖR (lidar) çerçevesindedir; bisiklet modeli ARKA AKS
+    referanslıdır → ICR sensörün sensor_to_ra_m arkasında: (−sensor_to_ra_m, ±R).
+    (Eski kod ICR'yi (0, ±R) alıyordu = yayı lidar-arka aks mesafesi kadar,
+    ~1.76 m, İLERİ kaydırma hatası; ayrıca genişlik yerine tek 0.9 m 'pay' vardı.)
 
-    Bu, "dubaya çarpacağını sanıp erken durma" sorununu çözer: araç yeterince
-    keskin dönüyorsa (yay engeli kaçırıyorsa) e-stop tetiklenmez (kullanıcı isteği)."""
+    Düz (~0°): |lat| ≥ half_width_m → geçer (bant sensör ekseniyle paralel).
+    Dönüşte: R = L/tan|δ| (δ>0 sol → ICR +y). Gövdenin süpürdüğü HALKA:
+      iç kenar  r_ic  = R − half_width (arka iç yan)
+      dış kenar r_dis = hypot(R + half_width, nose_m) (ÖN DIŞ KÖŞE dışa taşar)
+    Engelin ICR'ye uzaklığı d_c bu halkanın DIŞINDAysa (d_c ≤ r_ic veya
+    d_c ≥ r_dis) araç engele değmeden geçer.
+    True = geçer (DURMA gerekmez); False = bant içinde → engel."""
     delta = math.radians(steer_deg)
     if abs(delta) < math.radians(1.0):
-        return abs(lat) >= safe_radius_m       # düz gidiş: yanal ayrım yeterli mi
+        return abs(lat) >= half_width_m        # düz gidiş: yanal ayrım yeterli mi
     R = wheelbase_m / math.tan(abs(delta))
     cy = R if delta > 0.0 else -R              # sol dönüş (δ>0) → dönüş merkezi +y
-    d_c = math.hypot(fwd, lat - cy)
-    return abs(d_c - R) >= safe_radius_m
+    d_c = math.hypot(fwd + sensor_to_ra_m, lat - cy)
+    r_ic = R - half_width_m
+    r_dis = math.hypot(R + half_width_m, nose_m)
+    return d_c <= r_ic or d_c >= r_dis
+
+
+def govde_disi_filtre(points_ra, arka_m, burun_m, yari_gen_m, pay_m=0.05):
+    """Aracın KENDİ GÖVDE kutusu içindeki noktaları ele (arka-aks çerçevesi).
+
+    CANLI BULGU (run 092553Z, 2026-07-15): /obstacles/poses araç-üstü noktalar
+    da içeriyor (arka-aks +0.55m, lat ~0 — lidar'ın 1.2m ARKASI, yani gövde).
+    E-stop OBSTACLE_FWD_MIN=0.3 (yalnız önde) ile bağışıktı; güvenli-dönüş
+    kapısı yan/arka noktalara muhtaç olduğundan o filtreyi kullanamaz → gövde
+    kutusu dışlaması şart, yoksa alan HİÇ temizlenmez (DÜZ TUT → timeout →
+    İPTAL → pursuit engele sürer; bag replay kanıtlı). Gerçek bir koni gövde
+    kutusunun içindeyse zaten temas etmiştir — kapının kurtaracağı durum değil."""
+    return [(f, l) for f, l in points_ra
+            if not ((-arka_m - pay_m) <= f <= (burun_m + pay_m)
+                    and abs(l) <= yari_gen_m + pay_m)]
+
+
+def tam_kilit_donus_riskli(points_ra, swing_deg, donus_yonu, max_steer_deg,
+                           wheelbase_m, half_width_m, nose_m, arka_m, tail_m):
+    """GÜVENLİ DÖNÜŞ ALANI: araç ŞU AN tam-kilitle "eski şeride dönüş"e başlasa
+    süpüreceği alanın içinde engel var mı? (kullanıcı 2026-07-15: koni bu riskli
+    alandan çıkmadan şeride dönme.)
+
+    Dönüş yolu iki parçadan oluşur (ARKA AKS çerçevesi, x ileri / y sol):
+      1) YAY: tam-kilit (R = L/tan(max_steer)) donus_yonu yönünde, heading
+         swing_deg kadar dönene dek (S-manevra başlangıç yönüne hizalanma).
+         Gövde süpürme HALKASI [R−half_width, hypot(R+half_width, nose)]; açı
+         sektörü [−atan(arka/R), swing + atan(nose/R)] (arka/ön taşma payları).
+      2) KUYRUK: yay bitiminden itibaren tail_m uzunluğunda düz koridor
+         (|yanal| ≤ half_width) — dönüş tamamlanınca eski şeritte üstünden
+         geçilecek bölge. Kuyruk olmadan, manevra başında hâlâ ÖNDE duran koni
+         "yay değmiyor" diye alan-dışı sayılır ve araç koninin üstüne dönerdi.
+         NOT: ön-iç köşe kapsaması kısmen kuyruğun yay bitişiyle hizalı ve
+         half_width genişliğinde olmasına dayanır — kuyruksuz (tail_m=0) veya
+         farklı genişlikli kullanım (ör. gelecekteki park manevrası) bu örtük
+         telafiyi kaybeder; on_pay/arka_pay bu yüzden r_ic ile (muhafazakâr)
+         hesaplanır (algoritma incelemesi 2026-07-15).
+
+    points_ra : ARKA AKS çerçevesinde (fwd, lat) engel noktaları
+    swing_deg : şu anki heading swing'i (başlangıç yönünden sapma, ≥0 beklenir)
+    donus_yonu: dönüş yönü işareti (+1 sol, −1 sağ) — S-manevrada −_sman_dir
+    Döner: alan İÇİNDEKİ araca en yakın nokta (fwd, lat) ya da None (temiz)."""
+    phi = math.radians(max(0.0, swing_deg))
+    R = wheelbase_m / math.tan(math.radians(max_steer_deg))
+    s = 1.0 if donus_yonu > 0 else -1.0
+    icr_y = s * R
+    r_ic = R - half_width_m
+    # Dış yarıçap = ICR'den en uzak GÖVDE KÖŞESİ (ön/arka hangisi uzunsa) +
+    # FP-epsilon (köşe tam sınır yarıçapında sabit kalır; d_c<=r_dis testi
+    # 1e-15'lik aritmetik farkla titremesin — algoritma incelemesi 2026-07-15).
+    r_dis = math.hypot(R + half_width_m, max(nose_m, arka_m)) + 1e-9
+    # Açısal taşma payları İÇ yarıçapla (r_ic) hesaplanır: ICR tarafındaki köşe
+    # aynı boyuna ötelemeye daha BÜYÜK açıyla taşar (atan2(x, r) r küçüldükçe
+    # büyür). Eski atan2(x, R) merkez-hat varsayımı arka-iç köşe şeridini hiçbir
+    # swing'de yakalamıyordu (algoritma incelemesi 2026-07-15, sayısal kanıtlı).
+    on_pay = math.atan2(nose_m, r_ic)    # burnun açısal taşması (yay sektörü ilerisi)
+    arka_pay = math.atan2(arka_m, r_ic)  # arka tamponun açısal taşması (sektör gerisi)
+    # Yay bitişindeki arka-aks konumu + oradaki heading (kuyruk ekseni)
+    ex = R * math.sin(phi)
+    ey = s * R * (1.0 - math.cos(phi))
+    ux = math.cos(s * phi)
+    uy = math.sin(s * phi)
+
+    best = None
+    for fwd, lat in points_ra:
+        riskli = False
+        # (1) YAY halkası + açı sektörü. Nokta açısı, başlangıç konum vektöründen
+        #     (araç→ICR ekseni) gidiş yönünde ölçülür: θ = s·açı(v0→v).
+        vx, vy = fwd, lat - icr_y
+        d_c = math.hypot(vx, vy)
+        if r_ic <= d_c <= r_dis:
+            v0x, v0y = 0.0, -icr_y
+            theta = s * math.atan2(v0x * vy - v0y * vx, v0x * vx + v0y * vy)
+            if -arka_pay <= theta <= phi + on_pay:
+                riskli = True
+        # (2) KUYRUK düz koridoru (yay bitiminden ileri)
+        if not riskli:
+            wx, wy = fwd - ex, lat - ey
+            along = wx * ux + wy * uy
+            yanal = ux * wy - uy * wx
+            if 0.0 <= along <= tail_m and abs(yanal) <= half_width_m:
+                riskli = True
+        if riskli:
+            d_arac = math.hypot(fwd, lat)
+            if best is None or d_arac < math.hypot(best[0], best[1]):
+                best = (fwd, lat)
+    return best
 
 
 # =============================================================================
@@ -253,7 +360,6 @@ SLOWDOWN_BRAKE_MAX = 45.0    # % - yavaşlama freni tavanı (yumuşak; DUR/ACIL 
 # --- /karar staleness watchdog (fail-safe) ---
 KARAR_TIMEOUT = 1.0         # saniye - karar node bu süre sessiz kalırsa DUR (karar 10Hz)
 DUR_WAIT_TIME = 17.0        # saniye - durakta bekleme (yolcu al/bırak 15-20 sn şartı, +70/nokta — rapor §2/H5; eski 3.0 puan kaybı)
-PARK_WAIT_TIMEOUT = 8.0     # (KULLANILMIYOR — H5'te hedef=None creep'i kaldırıldı, anında dur. Eski 8 sn drift için duruyor.)
 # --- Engelden kaçınma MİMARİSİ (H-A/H-B, 2026-06-24) ---
 # KARAR (mimari dönüş): control artık sentetik yanal-offset manevrası YAPMAZ.
 # Kör ±offset (eski H2, §12.10/§12.12) iki canlı koşuda da engeli geçemedi —
@@ -280,8 +386,22 @@ ESTOP_HARD_M = 1.0            # m - bu kadar yakın + dar koridor → KOŞULSUZ 
 ESTOP_FWD_M = 2.5             # m - bu menzile kadar Ackermann-yay kontrolü yapılır (çarpacaksa dur)
 ESTOP_CORRIDOR_M = 0.7        # m - hard floor DAR koridoru (gerçekten yolun ortasındaki engel)
 ESTOP_CHECK_CORRIDOR_M = 1.5  # m - Ackermann kontrolü için (genişçe) aday koridoru; yay yine de geçerse durmaz
-ESTOP_SAFE_RADIUS = 0.9       # m - yay-engel açıklık payı (araç yarı-gen. ~0.6 + duba ~0.15 + marj); düşür=daha cesur geçiş
-ESTOP_RELEASE_S = 0.5         # s - tazece TEMİZ kalınca e-stop'u bırakmadan önceki debounce
+# 2B süpürme bandı geometrisi (eski tek ESTOP_SAFE_RADIUS=0.9 'payı' yerine —
+# kullanıcı 2026-07-04: bant = araç genişliği; koni dışındaysa dur yok):
+ARAC_GENISLIK_M = 1.2         # m - araç gövde genişliği (yarı-gen. 0.6)
+ENGEL_YARICAP_M = 0.15        # m - duba/koni yarıçapı (banda eklenir)
+ESTOP_BANT_YARIM_M = ARAC_GENISLIK_M / 2.0 + ENGEL_YARICAP_M  # 0.75 m - bant yarı-genişliği; düşür=daha cesur geçiş
+LIDAR_ARKA_AKS_M = 1.76       # m - lidar → arka aks mesafesi (sim: urdf lidar x=+0.9, arka aks x=−0.862; Bee1'de sahada kalibre edilecek)
+ARAC_BURUN_M = 2.34           # m - arka aks → ön tampon (dönüşte ÖN DIŞ KÖŞE süpürmesi bununla
+                              #     hesaplanır; golf.urdf ölçümü 2026-07-15: ön tampon kutusu
+                              #     x=1.177+0.3=1.477, arka aks x=−0.862 → 1.477+0.862=2.34)
+ESTOP_RELEASE_S = 1.0         # s - tazece TEMİZ kalınca e-stop'u bırakmadan önceki debounce
+                              #     (P1 №8 / E5-O5: 0.5→1.0 — bang-bang periyodunu uzatır; canli_params'ta)
+ESTOP_HISTEREZIS_M = 0.10     # m - BIRAKMA testinin bant yarı-genişliğine eklenen uzamsal histerezis
+                              #     (P1 №8 / E5-O1: tetik ve bırakma AYNI bantla değerlendirildiğinden
+                              #      bant KENARINDAKİ engel (E5: 7 tetiğin hepsi yanal +0.57..+0.72 m)
+                              #      jitter'la tetik→bırak limit çevrimi kuruyordu; bırakma artık
+                              #      +0.10 m geniş bandın da temiz olmasını ister. Tetik yolu AYNEN.)
 ESTOP_CRAWL_KMH = 1.5         # km/h - SOFT (Ackermann-yay) e-stop: tam fren YERİNE bu hıza
                               #   sınırla → S-manevra/pursuit engeli sollayabilsin (deadlock fix,
                               #   run 214118). HARD floor (<ESTOP_HARD_M) hâlâ koşulsuz tam fren.
@@ -390,9 +510,160 @@ SMANEUVER_ALIGN_DEG = 8.0          # derece - faz TAM SAĞ: heading başlangıç
 SMANEUVER_TIMEOUT = 6.0            # s - faz başına süre güvenliği; aşılırsa pursuit'e dön
 SMANEUVER_PENDING_TTL = 1.0       # s - reroute tetiği bu kadar taze olmalı (eski sıçramayla başlamasın)
 
+# --- GÜVENLİ DÖNÜŞ KAPISI (kullanıcı 2026-07-15): tam-kilit süpürme alanı ---
+# "Eski şeride dönüş" (TOWARD→AWAY) artık koni-farkında: her tick, araç ŞİMDİ
+# tam-kilit ters dönüşe başlasa süpüreceği alan (yay halkası + eski-şeritteki
+# düz koridor; bkz. tam_kilit_donus_riskli) hesaplanır. Koni bu RİSKLİ ALANDAN
+# çıkmadan dönüş BAŞLAMAZ; çıkınca (debounce sonrası) hemen başlar. Swing kapısı
+# (45°) döngü-önleme backstop'u olarak kalır. Koni verisi: taze /obstacles/poses
+# + dünya-çerçevesi koni hafızası (detektör kare düşürünce erken dönmesin —
+# koniler statik). Veri tamamen yoksa eski sol-WP-hizası davranışına düşülür.
+# Aynı saf fonksiyon gelecekteki PARK/DURAK manevra dönüşlerinde de kullanılacak
+# (şerit terk edip geri girilen HER manevra bu kapıdan geçmeli).
+SMAN_DONUS_KAPISI_AKTIF = True
+# KORİDOR SINIRI (şartname s.8: "şerit ihlali (2 tekerlek tamamen dışarı)" ceza,
+# kurallara uymamak diskalifiye; run 092553Z'de sınırsız DÜZ TUT aracı WP
+# hizasının 1.75m ötesine sürükledi → YOLDAN ÇIKMA/ELEME). Reroute WP hizası =
+# planlayıcının yasal koridoru; yanal sapma + dönüş yayının EK kazancı bu hizayı
+# +ASIM'dan fazla AŞAMAZ — koni riskli olsa da dönüş ZORLANIR (e-stop emekleme
+# korur). Öncelik: yolda kal > koni klirensi.
+SMAN_KORIDOR_ASIM_M = 0.3     # m - WP hizası üzerine izinli yanal aşım payı
+SMAN_DONUS_TAIL_M = 8.0       # m - dönüş sonrası eski-şeritte denetlenen düz koridor (arka akstan; kısa=erken dönüş, uzun=sonraki koniye takılma)
+SMAN_DONUS_KLIRENS_M = 0.15   # m - süpürme bandına ek güvenlik payı (ESTOP_BANT_YARIM_M üstüne)
+SMAN_DONUS_TEMIZ_S = 0.3      # s - alan bu süre KESİNTİSİZ temiz kalmadan dönüş başlamaz (tek-kare gürültü debounce'u)
+KONI_HAFIZA_TTL_S = 3.0       # s - dünya koni hafızası yaşam süresi (dropout köprüsü)
+KONI_HAFIZA_ESLE_M = 0.5      # m - yeni tespit bu mesafedeki hafıza kaydını tazeler (aynı koni)
+KONI_HAFIZA_MAX = 30          # adet - hafıza tavanı (gürültü patlamasına sigorta)
+BASE_ARKA_AKS_M = 0.862       # m - base_link → arka aks (golf.urdf rear_wheel_joint x=−0.862; LIDAR_ARKA_AKS_M ≈ 0.9 + 0.862)
+ARAC_ARKA_M = 0.5             # m - arka aks → arka taşma (golf.urdf back_bumper 0.33 + pay; dönüşte arka köşe açısal payı)
+
 # --- Vites Sabitleri (değiştirmeyin) ---
 GEAR_NEUTRAL = 1
 GEAR_FORWARD = 2
+GEAR_REVERSE = 3            # cart_control.msg REVERSE=3 - geri sürüş vitesi
+
+# --- Geri Sürüş (breadcrumb retrace) ---
+# İleri sürüşte gönderilen (direksiyon, gaz) çifti "iz" olarak kaydedilir;
+# /geri_komut True olunca iz TERS sırayla + vites REVERSE ile oynatılır →
+# araç geldiği rotayı geri izler. Direksiyon İŞARETİ AYNI kalır (bisiklet
+# modeli: hız ters + aynı direksiyon açısı = aynı yayı geri çizer; negatiflemek
+# retrace'i bozar). NOT: arka sensör YOK → yalnız az önce ileri geçilen (temiz)
+# izi geri izlemek içindir; ACIL_DURUS geri sürüşte de tam fren'i korur.
+GERI_BREADCRUMB_MAXLEN = 20000   # maks iz örneği (50Hz'de ~ hareketli 6-7 dk); eski örnekler düşer
+GERI_RECORD_MIN_KMH = 0.2        # km/h - yalnız bu hızın üstünde ilerlerken kaydet (dur/emekle tick'leri izi şişirmesin)
+GERI_MAX_THROTTLE = 100.0        # % - geri sürüş gaz tavanı (TUNABLE; düşür=daha yavaş/güvenli ama retrace sadakati azalır)
+
+# --- Sıkışma Kaçışı (stuck → geri) ---
+# Araç ilerlemeye ÇALIŞIRKEN (hedef hız var) bu süre boyunca hareketsiz kalırsa
+# = kurtulamadığı bir engele saplanmış → izini GERİ_ESCAPE_DISTANCE_M kadar geri
+# izleyerek engelden çık. Anti-stall kick-start (FIX 4, ~2 s) önce şansını denesin
+# diye eşik ondan uzun. Kaçış tamamlanınca COOLDOWN boyunca yeniden tetiklenmez
+# (aynı engelde ileri-geri thrash olmasın; kalıcı kurtuluş planlayıcının işi).
+STUCK_ESCAPE_TIME_S = 3.0        # s - ilerlemeye çalışırken bu kadar hareketsiz = sıkıştı
+STUCK_ESCAPE_SPEED_KMH = 0.3     # km/h - bu hızın altı "hareketsiz" sayılır
+GERI_ESCAPE_DISTANCE_M = 2.0     # m - sıkışma kaçışında geri gidilecek mesafe (kullanıcı 2026-07-04: 1→2 m; 1 m graf start-node'unu değiştirmiyordu → aynı reddedilen rota döngüsü)
+STUCK_ESCAPE_COOLDOWN_S = 5.0    # s - kaçıştan sonra yeniden tetikleme bekleme süresi
+STUCK_EVAL_GAP_S = 0.5           # s - _stuck_check bundan uzun süre çağrılmadıysa sayaç bayat → sıfırla
+                                 #     (P0 №2, inceleme 2026-07-16 E1-O2/E4-O2: DUR/ACİL dallarında
+                                 #      _stuck_check hiç koşmadığından sayaç eski bir cruise-flicker'ından
+                                 #      donuk kalıp 209 s sonra şans eseri ateşliyordu)
+
+# --- Engel-DUR kilidi kaçışı (P0 №1, inceleme 2026-07-16 E1-O1/E8-R2) ---
+# Karar=dur kilidi: reason ENGEL BLOKAJI ise ve araç DUR_KACIS_TIME_S boyunca
+# hareketsizse mevcut breadcrumb kaçışı (_start_geri) tetiklenir → araç geri
+# çekilir, hedef'in start-node'u değişir, cusp-reddine takılan recalc fizibil
+# olur. Reason filtresi: levha/yaya/kırmızı-ışık dur'larında geri kaçış ASLA.
+# ACİL dalına bilerek KONMADI (güvenlik: acildurus'ta araç kımıldamaz).
+# Reason /karar_decision'dan gelir; topic yoksa kaçış hiç tetiklenmez.
+DUR_KACIS_TIME_S = 20.0          # s - engel-DUR'da bu kadar hareketsizlik → geri kaçış
+DUR_KACIS_REASONS = ('engel_blokaj_reroute',  # RerouteKarar güvenlik-ağı dur'u
+                     'muhur_statik_dur')      # karar mührünün statik-inişi (P0 №3)
+DUR_KACIS_EVAL_GAP_S = 1.0       # s - DUR dalı bundan uzun ziyaret edilmediyse sayaç sıfırla
+                                 #     (karar churn'ünün tek-tick flicker'ları sayacı BOZMAZ,
+                                 #      gerçek sürüşe dönüş sıfırlar)
+
+# --- Kaçış eskalasyonu (P0 №4, inceleme 2026-07-16 E6-O2) ---
+# 2 m'lik kaçış aynı izi geri oynatıp aynı dar köşeye dönüyordu (deterministik
+# takılma döngüsü). Aynı noktada ikinci tetikte mesafe 2→4 m'ye çıkar.
+GERI_ESCAPE_ESKALASYON_M = 4.0        # m - aynı noktada 2. tetikte geri mesafe
+GERI_ESCAPE_AYNI_NOKTA_M = 3.0        # m - önceki tetik bu yarıçap içindeyse "aynı nokta"
+GERI_ESCAPE_ESKALASYON_PENCERE_S = 120.0  # s - bundan eski tetik "aynı nokta" sayılmaz (tur atıp dönme)
+
+# --- Hız PID Kazançları (PIDPresets buradan okur; canlı değişiklik aktif PID'e uygulanır) ---
+PID_SPEED_AGGRESSIVE = {'kp': 5.0, 'ki': 1.0, 'kd': 0.3}   # Hızlı tepki
+PID_SPEED_NORMAL     = {'kp': 3.0, 'ki': 0.5, 'kd': 0.2}   # Dengeli (varsayılan mod)
+PID_SPEED_SMOOTH     = {'kp': 2.0, 'ki': 0.3, 'kd': 0.1}   # Yumuşak
+PID_SPEED_LOW_SPEED  = {'kp': 4.0, 'ki': 0.8, 'kd': 0.2}   # Düşük hız (park/manevra)
+PID_ADAPT_VIRAJ      = {'kp': 3.0, 'ki': 0.5}              # adaptif: büyük heading hatası (viraj)
+PID_ADAPT_YAKIN      = {'kp': 4.0, 'ki': 0.6}              # adaptif: hedefe yaklaşırken hassas kontrol
+SPEED_PID_INTEGRAL_LIMIT = 10.0                            # hız PID integral clamp'i
+SPEED_PID_DERIV_FILTER   = 0.3                             # hız PID türev filtresi (0-1)
+ADAPTIVE_PID_ENABLED     = True                            # argparse --no-adaptive bunu kapatır
+ADAPTIVE_HEADING_ESIK_DEG = 30.0                           # derece - bu heading hatası üstünde viraj kazancı
+
+# =============================================================================
+# CANLI PARAMETRELER (restart'sız ayar) — config/canli_params.yaml 'control:'
+# bölümü yukarıdaki sabitleri ÇALIŞIRKEN override eder (~1 sn). Türetilmiş
+# sabitler + canlı PID nesnesi _canli_degisiklik ile senkron tutulur.
+# Bkz: talos_common/canli_params.py
+# =============================================================================
+_AKTIF_KONTROLCU = None  # CANWaypointFollower örneği (callback canlı PID'e ulaşsın diye)
+
+
+def _canli_degisiklik(degisenler):
+    """Canlı override sonrası türetilmiş sabitleri ve aktif nesneleri senkronla."""
+    global MAX_SPEED_MS, LOOP_DT, ESTOP_BANT_YARIM_M
+    if 'MAX_SPEED_KMH' in degisenler:
+        MAX_SPEED_MS = MAX_SPEED_KMH / 3.6
+    if 'LOOP_RATE_HZ' in degisenler:
+        LOOP_DT = 1.0 / LOOP_RATE_HZ
+    if 'ARAC_GENISLIK_M' in degisenler or 'ENGEL_YARICAP_M' in degisenler:
+        ESTOP_BANT_YARIM_M = ARAC_GENISLIK_M / 2.0 + ENGEL_YARICAP_M
+    inst = _AKTIF_KONTROLCU
+    if inst is None:
+        return
+    if 'ADAPTIVE_PID_ENABLED' in degisenler:
+        inst.adaptive_pid_enabled = ADAPTIVE_PID_ENABLED
+    if 'ADAPTIVE_HEADING_ESIK_DEG' in degisenler:
+        inst.heading_error_threshold = math.radians(ADAPTIVE_HEADING_ESIK_DEG)
+    # Aktif modun preset'i değiştiyse kazançları canlı hız PID'ine bas
+    # (adaptif mod bir sonraki _adapt_pid_gains çağrısında zaten günceli okur)
+    preset_adi = 'PID_SPEED_' + inst.pid_mode.upper()
+    if preset_adi in degisenler and isinstance(degisenler[preset_adi], dict):
+        p = degisenler[preset_adi]
+        inst.speed_pid.set_gains(kp=p.get('kp'), ki=p.get('ki'), kd=p.get('kd'))
+
+
+try:
+    from talos_common.canli_params import canli_parametre_izle
+    _canli_izleyici = canli_parametre_izle(
+        'control', globals(), degisiklik_cb=_canli_degisiklik,
+        sinirlar={
+            'MAX_SPEED_KMH':        (0.5, 15.0),
+            'LIMIT_SLOW':           (0.5, 10.0),
+            'ESTOP_CRAWL_KMH':      (0.0, 5.0),
+            'STEER_RATE_MAX_DEG_S': (30.0, 720.0),
+            'GERI_MAX_THROTTLE':    (0.0, 100.0),
+            'SLOWDOWN_BRAKE_MAX':   (0.0, 100.0),
+            # Bee1 mekanik limiti ~28.95°; yanlış YAML değeri süpürme-alanı
+            # geometrisini (R=L/tanδ) gerçek araçtan koparmasın (güvenlik
+            # incelemesi 2026-07-15 — tam_kilit_donus_riskli tüketicisi eklendi)
+            'MAX_STEER_ANGLE':      (20.0, 30.0),
+            'SMAN_DONUS_TAIL_M':    (2.0, 15.0),
+            'SMAN_DONUS_TEMIZ_S':   (0.1, 2.0),
+            'KONI_HAFIZA_TTL_S':    (0.5, 10.0),
+            # P0 kilit-kırıcı paket (inceleme 2026-07-16): DUR-kaçış bekleme
+            # süresi çok kısaltılırsa meşru dur'larda erken geri kaçış riski
+            'DUR_KACIS_TIME_S':          (5.0, 120.0),
+            'GERI_ESCAPE_ESKALASYON_M':  (2.0, 8.0),
+            # P1 №8 (E5-O1/O5): e-stop bırakma debounce'u + uzamsal histerezis
+            'ESTOP_RELEASE_S':           (0.2, 3.0),
+            'ESTOP_HISTEREZIS_M':        (0.0, 0.5),
+        })
+except Exception as _canli_e:
+    _canli_izleyici = None
+    print(f"[control.py] canli_params izleyicisi yok, statik parametreler: {_canli_e}",
+          file=sys.stderr, flush=True)
 
 # =============================================================================
 # GELİŞMİŞ PID CONTROLLER
@@ -552,31 +823,28 @@ class PIDController:
 # =============================================================================
 
 class PIDPresets:
-    """Farklı senaryolar için PID preset'leri"""
+    """Farklı senaryolar için PID preset'leri.
 
-    # Hız kontrolü preset'leri
-    SPEED_AGGRESSIVE = {'kp': 5.0, 'ki': 1.0, 'kd': 0.3}      # Hızlı tepki
-    SPEED_NORMAL = {'kp': 3.0, 'ki': 0.5, 'kd': 0.2}          # Dengeli
-    SPEED_SMOOTH = {'kp': 2.0, 'ki': 0.3, 'kd': 0.1}          # Yumuşak
+    Hız preset'leri ÜST PARAMETRE BLOĞUNDA yaşar (PID_SPEED_*, canlı ayar);
+    get_speed_preset her çağrıda modül sabitlerini okur → YAML override'ı
+    çalışırken de etkilidir.
+    """
 
-    # Direksiyon kontrolü preset'leri
+    # Direksiyon kontrolü preset'leri (Pure Pursuit'e geçildi — kullanılmıyor)
     STEER_AGGRESSIVE = {'kp': 50.0, 'ki': 0.5, 'kd': 8.0}     # Keskin dönüşler
     STEER_NORMAL = {'kp': 40.0, 'ki': 0.0, 'kd': 5.0}         # Dengeli
     STEER_SMOOTH = {'kp': 30.0, 'ki': 0.0, 'kd': 3.0}         # Yumuşak
-
-    # Düşük hızda (park/manevra)
-    SPEED_LOW_SPEED = {'kp': 4.0, 'ki': 0.8, 'kd': 0.2}
     STEER_LOW_SPEED = {'kp': 35.0, 'ki': 0.2, 'kd': 4.0}
 
     @staticmethod
     def get_speed_preset(mode='normal'):
         presets = {
-            'aggressive': PIDPresets.SPEED_AGGRESSIVE,
-            'normal': PIDPresets.SPEED_NORMAL,
-            'smooth': PIDPresets.SPEED_SMOOTH,
-            'low_speed': PIDPresets.SPEED_LOW_SPEED
+            'aggressive': PID_SPEED_AGGRESSIVE,
+            'normal': PID_SPEED_NORMAL,
+            'smooth': PID_SPEED_SMOOTH,
+            'low_speed': PID_SPEED_LOW_SPEED
         }
-        return presets.get(mode, PIDPresets.SPEED_NORMAL)
+        return presets.get(mode, PID_SPEED_NORMAL)
 
     @staticmethod
     def get_steer_preset(mode='normal'):
@@ -643,6 +911,10 @@ class CANWaypointFollower:
         self._sman_fwd_yaw = 0.0             # manevra başlangıç yön'ü (heading swing + nominal-çerçeve referansı)
         self._sman_phase_t = 0.0             # faz başlangıç zamanı (timeout)
         self._sman_pending = None            # (wp_x, wp_y, dir, t) — _hedef_callback'in tetik latch'i
+        self._sman_clear_since = None        # güvenli-dönüş kapısı: süpürme alanı temiz olduğundan beri (debounce)
+        self._sman_hold = False              # swing tavanında koni hâlâ riskli → DÜZ TUT alt-durumu
+        self._sman_koni_izlendi = False      # bu manevrada en az bir koni kanıtı görüldü mü (erken-dönüş yetkisi)
+        self._koni_hafiza = []               # [(wx, wy, t_son)] dünya-çerçevesi koni hafızası (_obstacle_lock altında)
         # H-B: /obstacles/poses tamponu (gövde çerçevesi) + tazelik + lock + e-stop latch
         self._obstacle_lock = threading.Lock()
         self._obstacle_points = []           # [(fwd, lat), ...] son PoseArray (gövde çerçevesi)
@@ -652,14 +924,34 @@ class CANWaypointFollower:
                                              #   False ise SOFT Ackermann-yay → emekle + S-manevra
         self._estop_clear_since = None       # koridor tazece temiz olduğu an (release debounce)
 
+        # --- GERİ SÜRÜŞ (breadcrumb retrace) state ---
+        self._breadcrumb = deque(maxlen=GERI_BREADCRUMB_MAXLEN)  # (steer_deg, throttle_pct) ileri iz; yalnız main-thread yazar
+        self._geri_cmd = False        # /geri_komut son değeri (callback yazar)
+        self._geri_prev_cmd = False   # rising-edge tespiti (doğal bitişte komut True kalsa da yeniden başlamasın)
+        self.geri_mode = False        # geri sürüş oynatımı aktif mi
+        self._geri_playback = None    # geri başlarken alınan iz snapshot'ı (liste)
+        self._geri_index = 0          # snapshot içinde geriye yürüyen indeks
+        self._geri_source = None      # 'manual' (/geri_komut, tam iz) | 'auto' (sıkışma kaçışı, mesafe-sınırlı)
+        self._geri_dist_limit = None  # m - geri sürüş mesafe tavanı (None=tam iz); auto kaçışta GERI_ESCAPE_DISTANCE_M
+        self._geri_start_xy = None    # geri sürüş başlangıç konumu (kat edilen mesafe ölçümü)
+        # --- SIKIŞMA KAÇIŞI (stuck → 1 m geri) state ---
+        self._stuck_since = None          # ilerlemeye çalışırken hareketsiz kalınan an (hız tabanlı)
+        self._stuck_cooldown_until = 0.0  # bir kaçıştan sonra yeniden tetiklemeyi bu ana kadar beklet (thrash önleme)
+        self._stuck_last_eval = None      # _stuck_check son değerlendirme anı (P0 №2 bayatlık koruması)
+        # --- ENGEL-DUR KİLİDİ KAÇIŞI (P0 №1) state ---
+        self.karar_reason = ""            # /karar_decision son reason (callback yazar; DUR-kaçış filtresi okur)
+        self._dur_kacis_since = None      # engel-DUR'da hareketsiz kalınan an
+        self._dur_kacis_last_eval = None  # DUR dalı son değerlendirme anı (flicker köprüsü / bayatlık)
+        # --- KAÇIŞ ESKALASYONU (P0 №4) state ---
+        self._geri_escape_last_xy = None  # son auto-kaçış tetik konumu
+        self._geri_escape_last_t = 0.0    # son auto-kaçış tetik anı
+
         # Araç durumu
         self.x = 0.0
         self.y = 0.0
         self.yaw = 0.0
-        self.yaw_rate = 0.0  # Açısal hız (dönüş hızı)
         self.speed_ms = 0.0
         self.speed_kmh = 0.0
-        self._last_odom_time = None  # yaw_rate'i GERÇEK dt ile hesaplamak için (eski sabit 0.02 + 2-adım gecikme bug'ı)
 
         # PID modu
         self.pid_mode = pid_mode
@@ -672,16 +964,16 @@ class CANWaypointFollower:
             kd=speed_preset['kd'],
             output_min=0.0,
             output_max=100.0,
-            integral_limit=10.0,
-            derivative_filter=0.3,
+            integral_limit=SPEED_PID_INTEGRAL_LIMIT,
+            derivative_filter=SPEED_PID_DERIV_FILTER,
             name="Speed"
         )
 
         # Direksiyon kontrolü artık Pure Pursuit (geometrik) — steer PID kaldırıldı.
 
-        # Adaptif PID ayarları
-        self.adaptive_pid_enabled = True
-        self.heading_error_threshold = math.radians(30)  # 30 derece
+        # Adaptif PID ayarları (üst blok; canlı değişiklik _canli_degisiklik ile yansır)
+        self.adaptive_pid_enabled = ADAPTIVE_PID_ENABLED
+        self.heading_error_threshold = math.radians(ADAPTIVE_HEADING_ESIK_DEG)
 
         # Durum
         self.is_running = True
@@ -692,6 +984,10 @@ class CANWaypointFollower:
         # manuel_baslat.sh bunu 1 yapar: başlatma-öncesi bus'a fren yazma, sustur.
         # Böylece direksiyon seti ile aynı anda açık durup buton 1'i (0x500=1) bekler.
         self.bus_release_on_start = os.environ.get("TALOS_BUS_RELEASE_ON_START", "0") == "1"
+
+        # Canlı parametre callback'i bu örneğe ulaşsın (PID kazançları, adaptif eşikler)
+        global _AKTIF_KONTROLCU
+        _AKTIF_KONTROLCU = self
 
         # ROS Subscriber - Odometri
         self.odom_sub = rospy.Subscriber(
@@ -712,10 +1008,25 @@ class CANWaypointFollower:
         # /karar subscriber - karar entegrasyonu
         self.karar_sub = rospy.Subscriber('/karar', String, self._karar_callback)
 
-        # C1: /obstacles/poses subscriber - control'ün İLK doğrudan engel kanalı.
-        # Kaçınma apeksini gerçek dubaya göre koymak için (kör 1.8m/5m değil).
+        # /karar_decision subscriber - karar'ın yapısal mesajı; yalnız reason
+        # alanı tüketilir (engel-DUR kaçış filtresi, P0 №1). cart_sim.msg import
+        # edilemediyse atlanır → kaçış devre dışı (fail-safe), sürüş etkilenmez.
+        if DecisionMsg is not None:
+            self.karar_decision_sub = rospy.Subscriber(
+                '/karar_decision', DecisionMsg, self._karar_decision_callback)
+        else:
+            rospy.logwarn("cart_sim.msg.Decision import edilemedi - reason görünmez, "
+                          "engel-DUR kaçışı (P0 №1) devre dışı")
+
+        # /obstacles/poses subscriber - control'ün doğrudan engel kanalı.
+        # İki tüketici: H-B e-stop güvenlik ağı (_update_estop) + S-manevra
+        # güvenli-dönüş kapısı (_donus_alani_engeli; koni hafızasını da besler).
         self.obstacle_sub = rospy.Subscriber(
             OBSTACLE_TOPIC, PoseArray, self._obstacles_callback, queue_size=5)
+
+        # /geri_komut subscriber - geri sürüş (breadcrumb retrace) tetiği.
+        # Tamamen control-içi (karar/planlayıcı gerektirmez): True → geldiği rotayı geri izle.
+        self.geri_sub = rospy.Subscriber('/geri_komut', Bool, self._geri_callback)
 
         # Şerit takip (Line Following)
         self.line_enabled = LINE_ENABLED
@@ -915,32 +1226,22 @@ class CANWaypointFollower:
 
         self.karar = new_karar
 
+    def _karar_decision_callback(self, msg):
+        """/karar_decision (cart_sim/Decision): yalnız reason alanı tüketilir —
+        DUR-kaçış reason filtresi (P0 №1). Karar string'inin kaynağı /karar
+        olmaya devam eder (iki topic aynı publish döngüsünden ~10 Hz gelir)."""
+        self.karar_reason = (msg.reason or "").strip()
+
     def _odom_callback(self, msg):
         """Odometri callback"""
         self.x = msg.pose.pose.position.x
         self.y = msg.pose.pose.position.y
 
         # Yaw açısı
+        # (Eski yaw_rate hesabı kaldırıldı — tek tüketicisi şerit-değiştirme
+        # pre-start guard'ıydı, o da H-A ile söküldü; ölü state tutulmuyor.)
         q = msg.pose.pose.orientation
         _, _, new_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-
-        # Yaw rate (dönüş hızı) — GERÇEK dt ile.
-        # Eski kod iki bug taşıyordu: (1) sabit 0.02'ye bölme (odom ~20-30 Hz →
-        # ~2.5× hata), (2) prev_yaw bir tick fazla geride → yaw_diff 2 örnek
-        # kapsayıp 1 örneğe bölünüyordu (×~2). Toplam birkaç kat şişikti ve
-        # şerit-değiştirme pre-start guard'ını (abs(yaw_rate)>0.3) aşırı hassas
-        # yapıyordu (gelistirme_plani §12.5; lane self-cancel teşhisi §11).
-        # dt için sim-time uyumlu olsun diye msg.header.stamp; yoksa wall-clock.
-        stamp = msg.header.stamp.to_sec()
-        now = stamp if stamp > 0.0 else time.time()
-        if self._last_odom_time is not None:
-            dt = now - self._last_odom_time
-            if dt > 1e-3:
-                yaw_diff = new_yaw - self.yaw   # bir önceki örneğe göre (1-adım, doğru)
-                while yaw_diff > math.pi:  yaw_diff -= 2 * math.pi
-                while yaw_diff < -math.pi: yaw_diff += 2 * math.pi
-                self.yaw_rate = yaw_diff / dt
-        self._last_odom_time = now
         self.yaw = new_yaw
 
         # Hız (odom'dan)
@@ -984,13 +1285,42 @@ class CANWaypointFollower:
     # =========================================================================
 
     def _obstacles_callback(self, msg):
-        """`/obstacles/poses` (PoseArray, gövde çerçevesi) → tampon + tazelik damgası.
+        """`/obstacles/poses` (PoseArray, lidar çerçevesi: x ileri / y sol) →
+        tampon + tazelik damgası + DÜNYA koni hafızası.
 
-        Boş array de geçerli (engel yok). E-stop kararını `_update_estop()` verir."""
-        pts = [(p.position.x, p.position.y) for p in msg.poses]  # (fwd, lat) gövde çerçevesi
+        Boş array de geçerli (engel yok). E-stop kararını `_update_estop()` verir.
+
+        DÜNYA KONİ HAFIZASI (güvenli-dönüş kapısı için): detektör kareyi
+        düşürünce koni tampondan kaybolur → kapı 'alan temiz' sanıp ERKEN dönüş
+        başlatabilir. Koniler statiktir: görülen merkezler dünya çerçevesinde
+        KONI_HAFIZA_TTL_S boyunca latch'lenir; aynı koninin yeni tespiti
+        (KONI_HAFIZA_ESLE_M içinde) kaydı tazeler, görünmeyenler TTL'de düşer."""
+        pts = [(p.position.x, p.position.y) for p in msg.poses]  # (fwd, lat) lidar çerçevesi
+        now = time.time()
+        # Pozu callback anında örnekle (lidar → base_link: +LIDAR_BASE ileri)
+        cx, cy_, cyaw = self.x, self.y, self.yaw
+        c, s = math.cos(cyaw), math.sin(cyaw)
+        lidar_base = LIDAR_ARKA_AKS_M - BASE_ARKA_AKS_M   # ≈0.9 m
+        # Hafızaya yalnız GÖVDE DIŞI noktalar girer (run 092553Z: detektör
+        # araç-üstü nokta basıyor → dünya hafızasında araçla yürüyen hayalet).
+        # _obstacle_points HAM kalır: e-stop kendi FWD_MIN filtresini uygular.
+        harici = govde_disi_filtre(
+            [(fwd + LIDAR_ARKA_AKS_M, lat) for fwd, lat in pts],
+            ARAC_ARKA_M, ARAC_BURUN_M, ARAC_GENISLIK_M / 2.0)
+        yeni = [(cx + c * (f_ra - BASE_ARKA_AKS_M) - s * lat,
+                 cy_ + s * (f_ra - BASE_ARKA_AKS_M) + c * lat, now)
+                for f_ra, lat in harici]
         with self._obstacle_lock:
             self._obstacle_points = pts
-            self._obstacle_time = time.time()
+            self._obstacle_time = now
+            for (wx, wy, t) in self._koni_hafiza:
+                if now - t > KONI_HAFIZA_TTL_S:
+                    continue   # süresi doldu
+                if any(math.hypot(wx - nx, wy - ny) < KONI_HAFIZA_ESLE_M
+                       for nx, ny, _ in yeni):
+                    continue   # aynı koni tazece görüldü (yeni kayıt zaten listede)
+                yeni.append((wx, wy, t))
+            self._koni_hafiza = yeni[:KONI_HAFIZA_MAX]
 
     def _update_estop(self):
         """H-B: doğrudan LATCHED + Ackermann-farkında e-stop güvenlik ağı.
@@ -999,9 +1329,10 @@ class CANWaypointFollower:
           (1) HARD FLOOR: çok yakın (ESTOP_HARD_M) + dar koridor → KOŞULSUZ fren
               (bu mesafede direksiyon kurtaramaz; son çare).
           (2) ACKERMANN: ESTOP_FWD_M içinde aday engel varsa, mevcut direksiyonun
-              yayı engele ESTOP_SAFE_RADIUS'tan yakınsa fren. Araç yeterince keskin
-              dönüyorsa (yay engeli kaçırıyorsa) DURMAZ → "dubaya çarpacak sanıp erken
-              durma" çözülür (kullanıcı isteği, CANLI run 185215).
+              2B SÜPÜRME BANDI (araç genişliği + koni yarıçapı, arka-aks referanslı
+              halka; bkz. ackermann_path_clears) engeli içine alıyorsa fren. Bandın
+              dışındaki koni DURDURMAZ → "dubaya çarpacak sanıp erken durma" çözülür
+              (kullanıcı isteği, CANLI run 185215 + 2026-07-04 genişlik/ofset revizyonu).
         Latched: tampon donarsa (stale) durum KORUNUR (plan §3.4). Bırakma: tazece
         ESTOP_RELEASE_S temiz kalınca. Döner: True ise bu tick TAM FREN."""
         now = time.time()
@@ -1029,7 +1360,8 @@ class CANWaypointFollower:
             # gölgeleme düzeltmesi — bkz. select_arc_blocking_obstacle docstring).
             cand = select_arc_blocking_obstacle(
                 pts, OBSTACLE_FWD_MIN, ESTOP_FWD_M, ESTOP_CHECK_CORRIDOR_M,
-                self._prev_cmd_steer, WHEELBASE, ESTOP_SAFE_RADIUS)
+                self._prev_cmd_steer, WHEELBASE, ESTOP_BANT_YARIM_M,
+                LIDAR_ARKA_AKS_M, ARAC_BURUN_M)
             if cand is not None:
                 reason = (f"Ackermann yay çarpıyor: engel {cand[0]:.1f}m "
                           f"(yanal {cand[1]:+.2f}m), steer {self._prev_cmd_steer:+.1f}°")
@@ -1043,7 +1375,17 @@ class CANWaypointFollower:
             self._estop_clear_since = None
         elif self._estop_active:
             # Yol açık (yay geçiyor / koridor temiz) — debounce sonra bırak.
-            if self._estop_clear_since is None:
+            # P1 №8 (E5-O1): bırakma, +ESTOP_HISTEREZIS_M genişletilmiş bandın da
+            # temiz olmasını ister — bant kenarındaki engelde jitter kaynaklı
+            # tetik↔bırak limit çevrimini keser (tetik yolu değişmedi).
+            cand_h = select_arc_blocking_obstacle(
+                pts, OBSTACLE_FWD_MIN, ESTOP_FWD_M, ESTOP_CHECK_CORRIDOR_M,
+                self._prev_cmd_steer, WHEELBASE,
+                ESTOP_BANT_YARIM_M + ESTOP_HISTEREZIS_M,
+                LIDAR_ARKA_AKS_M, ARAC_BURUN_M)
+            if cand_h is not None:
+                self._estop_clear_since = None   # histerezis bandında hâlâ engel
+            elif self._estop_clear_since is None:
                 self._estop_clear_since = now
             elif now - self._estop_clear_since >= ESTOP_RELEASE_S:
                 self._estop_active = False
@@ -1107,7 +1449,7 @@ class CANWaypointFollower:
                 self.completed_goreve.add(idx)
                 self.last_gorev_varildi_time[idx] = now
                 self.logger.log(f"GOREV DURAGI #{idx+1} VARILDI: ({gx:.1f}, {gy:.1f}) mesafe={dist:.1f}m")
-                # NOT: varildi mesaji buradan gonderilmez, sadece mikro-wp varildi (satir ~1008) gonderir.
+                # NOT: varildi mesaji buradan gonderilmez; yalnız run()'daki mikro-WP varış dalı gönderir.
                 # Cift varildi hedef_yoneticisi'nde durak atlama bugina neden oluyordu.
 
                 # Son durak mi?
@@ -1159,10 +1501,10 @@ class CANWaypointFollower:
         # === HIZ PID ADAPTASYONU ===
         if abs_heading_error > self.heading_error_threshold:
             # Büyük açı hatası - hızı biraz düşür ama durma (virajda hız lazım)
-            self.speed_pid.set_gains(kp=3.0, ki=0.5)
+            self.speed_pid.set_gains(kp=PID_ADAPT_VIRAJ.get('kp', 3.0), ki=PID_ADAPT_VIRAJ.get('ki', 0.5))
         elif distance < SLOWDOWN_DISTANCE:
             # Yaklaşıyoruz - hassas kontrol
-            self.speed_pid.set_gains(kp=4.0, ki=0.6)
+            self.speed_pid.set_gains(kp=PID_ADAPT_YAKIN.get('kp', 4.0), ki=PID_ADAPT_YAKIN.get('ki', 0.6))
         else:
             # Normal mod
             preset = PIDPresets.get_speed_preset(self.pid_mode)
@@ -1321,6 +1663,53 @@ class CANWaypointFollower:
         lat = -math.sin(self._sman_fwd_yaw) * dx + math.cos(self._sman_fwd_yaw) * dy
         return self._sman_dir * lat
 
+    def _sman_donus_yanal_kazanc(self, swing_deg):
+        """Tam-kilit dönüş (AWAY) heading'i ALIGN'a getirene dek kazanılacak EK
+        yanal sapma (m): ΔL = R·(cos(ALIGN) − cos(swing)). Dönüş boyunca heading
+        hep dış tarafa baktığından sapma ARTMAYA devam eder — koridor sınırı bu
+        kaçınılmaz kazancı ÖNGÖREREK dönüşü erken zorlar (şartname şerit ihlali)."""
+        R = WHEELBASE / math.tan(math.radians(MAX_STEER_ANGLE))
+        a = math.radians(SMANEUVER_ALIGN_DEG)
+        s = math.radians(max(swing_deg, SMANEUVER_ALIGN_DEG))
+        return R * (math.cos(a) - math.cos(s))
+
+    def _donus_alani_engeli(self, swing_deg, donus_yonu):
+        """GÜVENLİ DÖNÜŞ KAPISI: araç şimdi tam-kilit donus_yonu dönüşüne başlasa
+        süpüreceği alanda (yay + eski-şerit koridoru) engel var mı?
+
+        Kaynaklar: taze /obstacles/poses (lidar çerçevesi) + dünya koni hafızası
+        (dropout köprüsü); ikisi de ARKA AKS çerçevesine çevrilip
+        tam_kilit_donus_riskli'ye verilir. PARK/DURAK manevra dönüşleri de aynı
+        kapıyı kullanmalı (swing/yon parametrik — manevraya özgü değil).
+
+        Döner: (engel | None, gorgu). gorgu=True yalnız POZİTİF kanıt varken
+        (şu an en az bir nokta canlıda/hafızada). "Tampon taze ama BOŞ" gorgu
+        DEĞİLDİR — canlı-ama-kör detektör (koni var, hiç tespit yok) "yol kesin
+        temiz" diye yorumlanmasın (güvenlik incelemesi 2026-07-15: yokluk
+        kanıtı ≠ kanıt yokluğu); erken-dönüş yetkisini çağıran, manevra
+        boyunca en az bir kez gorgu görmüş olmaya bağlar."""
+        now = time.time()
+        with self._obstacle_lock:
+            taze = (now - self._obstacle_time) <= OBSTACLE_TIMEOUT
+            pts = list(self._obstacle_points) if taze else []
+            hafiza = [(wx, wy) for (wx, wy, t) in self._koni_hafiza
+                      if now - t <= KONI_HAFIZA_TTL_S]
+        points_ra = [(fwd + LIDAR_ARKA_AKS_M, lat) for fwd, lat in pts]
+        for wx, wy in hafiza:
+            bf, bl = self._body_frame(wx, wy)
+            points_ra.append((bf + BASE_ARKA_AKS_M, bl))
+        # Kendi gövde noktalarını ele (run 092553Z: detektör araç-üstü nokta
+        # basıyor → alan hiç temizlenmiyordu; bkz. govde_disi_filtre docstring)
+        points_ra = govde_disi_filtre(points_ra, ARAC_ARKA_M, ARAC_BURUN_M,
+                                      ARAC_GENISLIK_M / 2.0)
+        if not points_ra:
+            return None, False
+        engel = tam_kilit_donus_riskli(
+            points_ra, swing_deg, donus_yonu, MAX_STEER_ANGLE, WHEELBASE,
+            ESTOP_BANT_YARIM_M + SMAN_DONUS_KLIRENS_M, ARAC_BURUN_M,
+            ARAC_ARKA_M, SMAN_DONUS_TAIL_M)
+        return engel, True
+
     def _sman_update(self):
         """KESKİN S-MANEVRA durum makinesi (§18). Aktifse direksiyon (derece)
         döner ve steering'i SAHİPLENİR (pursuit/​/line/sharp-gate bypass); IDLE
@@ -1329,11 +1718,18 @@ class CANWaypointFollower:
 
         Akış (kullanıcı tarifi + golf-cart geometri düzeltmesi):
           IDLE   → reroute WP tetiği taze + manevra kapalı → TAM SOL (TOWARD)
-          TOWARD → steer = dir·MAX (TAM SOL); direksiyon TOPLANMAZ. Araç sol-WP'nin
-                   YANAL hizasına gelince (yanal ilerleme ≥ WP yanal offset'i) VEYA
-                   heading swing'i SWING_DEG'i aşınca → AWAY. (Swing kapısı ŞART:
-                   yavaş golf-cart full-lock'ta "2.2m WP'ye kadar" ~73° dönüp
-                   DÖNGÜye giriyordu — offline sim kanıtı; swing kapısı keser.)
+          TOWARD → steer = dir·MAX (TAM SOL); direksiyon TOPLANMAZ. Çıkış
+                   önceliği (şartname s.8, run 092553Z eleme dersi):
+                   (1) KORİDOR SINIRI — yanal sapma + dönüş yayının ek kazancı
+                       WP hizası + SMAN_KORIDOR_ASIM_M'i aşacaksa koni ne olursa
+                       olsun → AWAY (yoldan çıkma/şerit ihlali > koni klirensi;
+                       e-stop emekleme çarpmayı önler).
+                   (2) GÜVENLİ DÖNÜŞ KAPISI — koni, tam-kilit ters dönüşün
+                       süpürme alanından çıkıp SMAN_DONUS_TEMIZ_S temiz kalınca
+                       → AWAY (erken, koni-farkında dönüş).
+                   (3) Swing SWING_DEG tavanı: koni riskli değilse → AWAY;
+                       riskliyse koridor içinde DÜZ TUT (steer 0; sapma dönerek
+                       artmaz, koni geçilir; sınıra dayanınca (1) devralır).
           AWAY   → steer = −dir·MAX (TAM SAĞ, ikinci keskin dönüş); heading
                    başlangıç-yönüne ALIGN_DEG'e dönünce → IDLE (pursuit devralır)
         Her fazda TIMEOUT güvenliği. Latched WP + nominal çerçeve sayesinde hedef
@@ -1353,6 +1749,9 @@ class CANWaypointFollower:
                 self._sman_fwd_yaw = self.yaw            # başlangıç yönü (dönmeden ÖNCE)
                 self._sman_phase = 'TOWARD'
                 self._sman_phase_t = now
+                self._sman_clear_since = None            # güvenli-dönüş kapısı debounce sıfırı
+                self._sman_hold = False                  # düz-tut alt-durumu sıfırı
+                self._sman_koni_izlendi = False          # koni-kanıtı bayrağı sıfırı
                 yon = "SOL" if p[2] > 0 else "SAĞ"
                 self.logger.log(f"S-MANEVRA BAŞLADI: TAM {yon} (reroute WP "
                                 f"({p[0]:.1f},{p[1]:.1f}), yanal hiza={self._sman_wp_lateral():.1f}m'e "
@@ -1365,25 +1764,108 @@ class CANWaypointFollower:
             self.logger.log(f"S-MANEVRA İPTAL: {self._sman_phase} timeout "
                             f"({SMANEUVER_TIMEOUT:.0f}s) → pursuit")
             self._sman_phase = 'IDLE'
+            self._sman_hold = False
             return None
 
         if self._sman_phase == 'TOWARD':
-            reached_wp = self._sman_lateral_progress() >= self._sman_wp_lateral()
-            swing_capped = self._sman_swing_deg() >= SMANEUVER_MAX_SWING_DEG
-            if reached_wp or swing_capped:
+            # ── GÜVENLİ DÖNÜŞ KAPISI + KORİDOR SINIRI (2026-07-15) ──────────
+            # Öncelik sırası (şartname s.8 — yoldan çıkma/şerit ihlali > koni):
+            #   1) KORİDOR SINIRI: yanal sapma + dönüş yayının kaçınılmaz ek
+            #      kazancı WP hizası + ASIM'ı aşacaksa → koni ne olursa olsun
+            #      DÖNÜŞ ZORLANIR (e-stop emekleme çarpmayı önler). Run 092553Z
+            #      dersi: sınırsız bekletme aracı yoldan çıkardı → ELEME.
+            #   2) Kapı: koni süpürme alanından çıktıysa (debounce) erken dön.
+            #   3) Swing tavanı: koni riskli DEĞİLSE dön; riskliyse koridor
+            #      içinde kaldığı sürece DÜZ TUT (sapma artmaz, koni geçilir).
+            swing = self._sman_swing_deg()
+            swing_capped = swing >= SMANEUVER_MAX_SWING_DEG
+            koridor_siniri = (self._sman_lateral_progress()
+                              + self._sman_donus_yanal_kazanc(swing)
+                              >= self._sman_wp_lateral() + SMAN_KORIDOR_ASIM_M)
+            donus_hazir = False
+            neden = None
+            if SMAN_DONUS_KAPISI_AKTIF:
+                engel, gorgu = self._donus_alani_engeli(swing, -self._sman_dir)
+            else:
+                engel, gorgu = None, False
+            if gorgu:
+                self._sman_koni_izlendi = True   # bu manevrada pozitif koni kanıtı var
+            koni_riskli = False
+            if engel is not None:
+                koni_riskli = True
+                self._sman_clear_since = None
+                rospy.loginfo_throttle(
+                    1.0, f"[S-MANEVRA] dönüş bekletiliyor: koni tam-kilit "
+                         f"süpürme alanında (ileri {engel[0]:.1f}m, "
+                         f"yanal {engel[1]:+.1f}m)")
+            elif self._sman_koni_izlendi:
+                # Alan temiz VE elimizde koni kanıtı var(dı) → debounce sonrası dön.
+                if self._sman_clear_since is None:
+                    self._sman_clear_since = now
+                if now - self._sman_clear_since >= SMAN_DONUS_TEMIZ_S:
+                    donus_hazir = True
+                    neden = "koni süpürme alanından çıktı"
+            if koridor_siniri or donus_hazir or (swing_capped and not koni_riskli):
                 self._sman_phase = 'AWAY'
                 self._sman_phase_t = now
+                self._sman_hold = False
                 yon = "SAĞ" if self._sman_dir > 0 else "SOL"
-                neden = "sol-WP hizası" if reached_wp else f"swing {SMANEUVER_MAX_SWING_DEG:.0f}°"
+                if koridor_siniri:
+                    neden = ("koridor sınırı — WP hizası aşılmadan dönüş "
+                             "(şerit ihlali önleme)"
+                             + (" [koni hâlâ süpürmede, e-stop korur]"
+                                if koni_riskli else ""))
+                elif not donus_hazir:
+                    neden = f"swing {SMANEUVER_MAX_SWING_DEG:.0f}° (backstop)"
                 self.logger.log(f"S-MANEVRA: {neden} → TAM {yon} (dönüş)")
                 return -self._sman_dir * MAX_STEER_ANGLE
+            if swing_capped and koni_riskli:
+                # DÜZ TUT: sapmayı döndürerek artırma (döngü-önleme) ama koni
+                # süpürme alanından çıkmadan da DÖNME — heading sabit ilerle.
+                # KORİDOR SINIRLI: yanal sapma yukarıdaki sınıra dayanınca bu
+                # dal artık seçilmez (dönüş zorlanır). phase_t bir kez tazelenir
+                # (toplam backstop ≤ 2×SMANEUVER_TIMEOUT, sonrası pursuit).
+                if not self._sman_hold:
+                    self._sman_hold = True
+                    self._sman_phase_t = now
+                    self.logger.log(
+                        f"S-MANEVRA: swing {SMANEUVER_MAX_SWING_DEG:.0f}° tavanı "
+                        f"+ koni süpürmede → DÜZ TUT (koridor sınırına kadar)")
+                return 0.0
             return self._sman_dir * MAX_STEER_ANGLE
 
         # AWAY (TAM SAĞ): heading başlangıç-yönüne düzelince pursuit'e bırak
         if self._sman_swing_deg() <= SMANEUVER_ALIGN_DEG:
             self.logger.log("S-MANEVRA BİTTİ: heading düzeldi → pursuit devraldı")
             self._sman_phase = 'IDLE'
+            self._sman_hold = False
             return None
+        # Geçiş sonrası KÖR OLMA (algoritma incelemesi 2026-07-15): kalan dönüş
+        # süpürmesi her tick denetlenir — yeni/yeniden görünen koni kalan yaya
+        # girerse dönüşü DURAKLAT (düz tut; hız run()'da LIMIT_SLOW'a iner),
+        # temizlenince sür. AWAY phase_t TAZELENMEZ → 6s timeout'u strict kalır.
+        # KORİDOR SINIRLI: duraklama da yanal sapmayı büyütür — sınıra dayanınca
+        # duraklamak YASAK, dönüş sürer (şerit ihlali > koni; e-stop korur).
+        if SMAN_DONUS_KAPISI_AKTIF:
+            away_swing = max(0.0, self._sman_swing_deg())
+            koridor_izni = (self._sman_lateral_progress()
+                            + self._sman_donus_yanal_kazanc(away_swing)
+                            < self._sman_wp_lateral() + SMAN_KORIDOR_ASIM_M)
+            engel, _ = self._donus_alani_engeli(away_swing, -self._sman_dir)
+            if engel is not None and koridor_izni:
+                if not self._sman_hold:
+                    self._sman_hold = True
+                    self.logger.log("S-MANEVRA: AWAY duraklatıldı — koni kalan "
+                                    "dönüş süpürmesinde (düz tut)")
+                rospy.loginfo_throttle(
+                    1.0, f"[S-MANEVRA] AWAY beklemede: koni süpürmede "
+                         f"(ileri {engel[0]:.1f}m, yanal {engel[1]:+.1f}m)")
+                return 0.0
+            if self._sman_hold:
+                self._sman_hold = False
+                self.logger.log("S-MANEVRA: AWAY sürüyor — "
+                                + ("süpürme temizlendi" if engel is None
+                                   else "koridor sınırı (bekleme yasak, e-stop korur)"))
         return -self._sman_dir * MAX_STEER_ANGLE
 
     def _pure_pursuit_steer(self, primary, secondary):
@@ -1446,6 +1928,82 @@ class CANWaypointFollower:
         except can.CanError as e:
             rospy.logwarn(f"El freni CAN hatası: {e}")
 
+    def _geri_callback(self, msg):
+        """/geri_komut (std_msgs/Bool): True → geri sürüş (breadcrumb retrace) iste.
+        Yalnız bool'u set eder; breadcrumb'a DOKUNMAZ — snapshot main-thread'de
+        run() içinde alınır (deque'e ileri sürüş de yazdığı için thread güvenliği)."""
+        self._geri_cmd = bool(msg.data)
+
+    def _geri_replay_step(self):
+        """Geri sürüş: kaydedilen ileri izini ters sırayla bir adım ilerlet.
+        Dönüş: (steer_deg, throttle_pct, done). İz bittiğinde (0.0, 0.0, True)."""
+        if not self._geri_playback or self._geri_index <= 0:
+            return 0.0, 0.0, True
+        self._geri_index -= 1
+        steer_deg, throttle_pct = self._geri_playback[self._geri_index]
+        # Vites REVERSE'te aynı gaz → aynı hız profili geri (retrace sadakati).
+        # Güvenlik tavanı: düşürmek geri sürüşü yavaşlatır ama gaz-vs-tick
+        # eşleşmesini bozacağından retrace'i hafif saptırır (TUNABLE).
+        throttle_pct = float(min(throttle_pct, GERI_MAX_THROTTLE))
+        # Direksiyon İŞARETİ AYNI — negatifleme YOK (aynı yay geri çizilir).
+        return steer_deg, throttle_pct, False
+
+    def _start_geri(self, dist_limit, source):
+        """Geri sürüşü başlat. Breadcrumb snapshot'ı + mesafe ölçüm referansı burada
+        (main-thread) alınır. dist_limit=None → tam iz (manuel); değer → o kadar metre
+        geri (sıkışma kaçışı). Kayıt sürer ama biz donmuş kopyayı yürütürüz."""
+        self._geri_playback = list(self._breadcrumb)
+        self._geri_index = len(self._geri_playback)
+        self._geri_dist_limit = dist_limit
+        self._geri_start_xy = (self.x, self.y)
+        self._geri_source = source
+        self.geri_mode = True
+        limit_str = "tam iz" if dist_limit is None else f"{dist_limit:.1f} m"
+        self.logger.log(f"[GERİ] BAŞLADI ({source}) - {self._geri_index} örnek, hedef: {limit_str}")
+
+    def _kacis_mesafesi(self):
+        """Auto kaçışın geri mesafesi (P0 №4, E6-O2): önceki tetik yakın zamanda
+        ve aynı noktadaysa 2→4 m eskalasyon — 2 m'lik kaçış aynı izi geri oynatıp
+        aynı dar köşeye döndüğünden deterministik takılma döngüsü kuruyordu.
+        Çağrı tetik konumunu günceller (bir sonraki kıyasın referansı)."""
+        now = time.time()
+        dist = GERI_ESCAPE_DISTANCE_M
+        if (self._geri_escape_last_xy is not None
+                and now - self._geri_escape_last_t < GERI_ESCAPE_ESKALASYON_PENCERE_S
+                and math.hypot(self.x - self._geri_escape_last_xy[0],
+                               self.y - self._geri_escape_last_xy[1]) < GERI_ESCAPE_AYNI_NOKTA_M):
+            dist = GERI_ESCAPE_ESKALASYON_M
+        self._geri_escape_last_xy = (self.x, self.y)
+        self._geri_escape_last_t = now
+        return dist
+
+    def _stuck_check(self, target_speed_kmh, current_speed_kmh):
+        """Sıkışma kaçışı tetiği: araç ilerlemeye ÇALIŞIRKEN (hedef hız var)
+        STUCK_ESCAPE_TIME_S boyunca hareketsiz kalırsa True döner. Yalnız gerçek
+        sürüş bağlamında (bu metod drive bölümünde çağrılır) değerlendirilir; DUR/
+        e-stop hard/durak dalları buraya ulaşmadan continue eder. Herhangi bir
+        hareket veya 'ilerleme beklenmiyor' durumu sayacı sıfırlar (bayat referans yok)."""
+        now = time.time()
+        # P0 №2 (E1-O2/E4-O2): bu metod sürüş dalı dışında hiç çağrılmadığından
+        # sayaç, DUR kilidi öncesindeki tek-tick'lik bir cruise-flicker'ından
+        # DONUK kalabiliyordu → 209 s sonra ikinci flicker'da bayat ateşleme
+        # (20260716T181851Z kanıtı). Değerlendirme boşluğu görülürse sayaç bayattır.
+        if self._stuck_last_eval is not None and (now - self._stuck_last_eval) > STUCK_EVAL_GAP_S:
+            self._stuck_since = None
+        self._stuck_last_eval = now
+        trying = target_speed_kmh > 0.5
+        moving = current_speed_kmh > STUCK_ESCAPE_SPEED_KMH
+        if (not trying) or moving or (now < self._stuck_cooldown_until):
+            self._stuck_since = None
+            return False
+        if self._stuck_since is None:
+            self._stuck_since = now
+            return False
+        if now - self._stuck_since > STUCK_ESCAPE_TIME_S:
+            self._stuck_since = None
+            return True
+        return False
+
     def run(self):
         """Ana kontrol döngüsü"""
         rate = rospy.Rate(50)  # 50 Hz
@@ -1467,6 +2025,69 @@ class CANWaypointFollower:
             # çakışması olmasın. 0x500=1 gelince devam edilir.
             if self.autonomous_paused:
                 rospy.loginfo_throttle(2.0, "[MANUEL] Direksiyon seti devraldı - otonom duraklatıldı")
+                rate.sleep()
+                continue
+
+            # ========== GERİ SÜRÜŞ (breadcrumb retrace) ==========
+            # /geri_komut True: ileri sürüşte kaydedilen (direksiyon, gaz) izini TERS
+            # sırayla oynat + vites REVERSE → araç geldiği rotayı geri izler.
+            # Snapshot/başlatma yalnız burada (main-thread) yapılır; callback yalnız
+            # bool set eder → deque'e tek thread yazar. Rising-edge tetik: doğal
+            # bitişte komut True kalsa bile yeniden başlamaz. İleri-bakan soft e-stop
+            # geri sürüşte ATLANIR (geri giderken öndeki engel çarpma yolu değil);
+            # ACIL_DURUS tam fren yetkisini KORUR (arka sensör YOK).
+            # Manuel /geri_komut: rising-edge'de tam-iz geri sürüş başlat; False iptal
+            # eder — ancak YALNIZ manuel kaynaklı geri sürüşü (auto sıkışma kaçışını
+            # /geri_komut=False iptal etmez, o mesafe/iz ile kendi biter).
+            cmd = self._geri_cmd
+            if cmd and not self._geri_prev_cmd and not self.geri_mode:
+                self._start_geri(dist_limit=None, source='manual')
+            elif not cmd and self.geri_mode and self._geri_source == 'manual':
+                self.geri_mode = False
+                self._geri_playback = None
+                self.logger.log("[GERİ] İPTAL (komut False)")
+            self._geri_prev_cmd = cmd
+
+            if self.geri_mode:
+                if self.karar == Karar.ACIL_DURUS:
+                    self._send_can_command(throttle_pct=0, brake_pct=100, steer_deg=0, gear=GEAR_NEUTRAL)
+                    rospy.loginfo_throttle(1.0, "[GERİ] ACIL_DURUS - tam fren")
+                    rate.sleep()
+                    continue
+                steer_deg, throttle_pct, done = self._geri_replay_step()
+                # Mesafe tavanı (auto sıkışma kaçışı = 1 m): kat edilen geri mesafe
+                # limite ulaşınca dur — iz tükenmese bile.
+                reason = "iz tükendi"
+                if not done and self._geri_dist_limit is not None:
+                    traveled = math.hypot(self.x - self._geri_start_xy[0],
+                                          self.y - self._geri_start_xy[1])
+                    if traveled >= self._geri_dist_limit:
+                        done = True
+                        reason = f"{traveled:.2f} m geri gidildi"
+                if done:
+                    if self._geri_source == 'auto':
+                        # Kaçış bitti → thrash önlemek için cooldown başlat
+                        self._stuck_cooldown_until = time.time() + STUCK_ESCAPE_COOLDOWN_S
+                    self.geri_mode = False
+                    self._geri_playback = None
+                    self._geri_source = None
+                    self._geri_dist_limit = None
+                    self._send_can_command(throttle_pct=0, brake_pct=80, steer_deg=0, gear=GEAR_NEUTRAL)
+                    self.logger.log(f"[GERİ] Geri sürüş tamam ({reason}), DUR")
+                    rate.sleep()
+                    continue
+                # Slew-rate + direksiyon limitleri (sürüş dalıyla birebir; CAN süreksizliği olmasın)
+                max_delta = STEER_RATE_MAX_DEG_S * LOOP_DT
+                steer_deg = float(np.clip(steer_deg,
+                                          self._prev_cmd_steer - max_delta,
+                                          self._prev_cmd_steer + max_delta))
+                steer_deg = float(np.clip(steer_deg, -MAX_STEER_ANGLE, MAX_STEER_ANGLE))
+                self._send_can_command(throttle_pct=throttle_pct, brake_pct=0,
+                                       steer_deg=steer_deg, gear=GEAR_REVERSE)
+                self.logger.csv(self.x, self.y, self.yaw, self.speed_ms * 3.6,
+                                self.karar, self.x, self.y, throttle_pct, 0.0, steer_deg, 'R')
+                rospy.loginfo_throttle(0.5,
+                    f"[GERİ] kalan={self._geri_index} | Dir: {steer_deg:+.1f} | Gaz: {throttle_pct:.0f}")
                 rate.sleep()
                 continue
 
@@ -1507,7 +2128,12 @@ class CANWaypointFollower:
                 continue
 
             # ========== KARAR: ACIL DURUS ==========
+            # Geri kaçış bu dala bilerek KONMADI (güvenlik: acildurus = koşulsuz
+            # hareketsizlik). Statik engelde kilitten çıkış yolu: karar mührü
+            # statik-durumda kararı 'dur'a indirir (P0 №3) → aşağıdaki DUR dalı
+            # kaçışı devralır.
             if self.karar == Karar.ACIL_DURUS:
+                self._stuck_since = None   # P0 №2: sürüş sıkışma sayacı ACİL'de bayatlamasın
                 self._send_can_command(throttle_pct=0, brake_pct=100, steer_deg=0, gear=GEAR_NEUTRAL)
                 rospy.loginfo_throttle(1.0, "[ACIL DURUS] Tam fren, vites N")
                 rate.sleep()
@@ -1515,6 +2141,33 @@ class CANWaypointFollower:
 
             # ========== KARAR: DUR ==========
             if self.karar == Karar.DUR:
+                self._stuck_since = None   # P0 №2: sürüş sıkışma sayacı DUR'da bayatlamasın
+                # P0 №1 (E1-O1/E8-R2): engel-kaynaklı DUR kilidi kaçışı. Yalnız
+                # reason engel blokajıysa (DUR_KACIS_REASONS — levha/yaya/ışık
+                # dur'ları HARİÇ) ve araç DUR_KACIS_TIME_S boyunca hareketsizse
+                # mevcut breadcrumb kaçışı tetiklenir (yeni mekanizma yok).
+                # Sayaç, DUR dalı DUR_KACIS_EVAL_GAP_S'ten uzun ziyaret edilmeyince
+                # sıfırlanır: karar churn'ünün tek-tick flicker'ları birikimi
+                # bozmaz ama gerçek sürüşe dönüş sayacı temizler (bayat ateşleme yok).
+                now = time.time()
+                if (self._dur_kacis_last_eval is not None
+                        and now - self._dur_kacis_last_eval > DUR_KACIS_EVAL_GAP_S):
+                    self._dur_kacis_since = None
+                self._dur_kacis_last_eval = now
+                hareketsiz = (self.speed_ms * 3.6) < STUCK_ESCAPE_SPEED_KMH
+                if (self.karar_reason in DUR_KACIS_REASONS and hareketsiz
+                        and now >= self._stuck_cooldown_until):
+                    if self._dur_kacis_since is None:
+                        self._dur_kacis_since = now
+                    elif now - self._dur_kacis_since > DUR_KACIS_TIME_S:
+                        self._dur_kacis_since = None
+                        kacis_m = self._kacis_mesafesi()
+                        self._start_geri(dist_limit=kacis_m, source='auto')
+                        self.logger.log(
+                            f"[SIKIŞMA] DUR({self.karar_reason}) "
+                            f"{DUR_KACIS_TIME_S:.0f}s hareketsiz → {kacis_m:.1f} m geri kaçış")
+                else:
+                    self._dur_kacis_since = None
                 self._send_can_command(throttle_pct=0, brake_pct=80, steer_deg=0, gear=GEAR_FORWARD)
                 rospy.loginfo_throttle(2.0, "[DUR] Karar: dur")
                 rate.sleep()
@@ -1654,9 +2307,32 @@ class CANWaypointFollower:
             if estop_active:
                 target_speed_kmh = min(target_speed_kmh, ESTOP_CRAWL_KMH)
 
+            # DÜZ TUT (S-manevra bekletmesi, TOWARD veya AWAY) aktif: heading
+            # sapmışken şerit farkındalığı olmadan ilerleniyor → hızı LIMIT_SLOW'a
+            # sınırla ki bekletme penceresindeki yol-dışı sapma küçük kalsın
+            # (güvenlik incelemesi 2026-07-15; karar zaten slow diyorsa fark etmez).
+            if self._sman_hold and self._sman_phase != 'IDLE':
+                target_speed_kmh = min(target_speed_kmh, LIMIT_SLOW)
+
             # Hız hatası
             current_speed_kmh = self.speed_ms * 3.6
             speed_error = target_speed_kmh - current_speed_kmh
+
+            # ── SIKIŞMA KAÇIŞI (stuck → 1 m geri) ────────────────────
+            # Buraya yalnız gerçek sürüş bağlamı düşer (DUR/e-stop-hard/durak/hedef-yok
+            # zaten yukarıda continue etti). İlerlemeye çalışırken (hedef hız var)
+            # STUCK_ESCAPE_TIME_S boyunca hareketsiz kalındıysa = kurtulamayacağı engele
+            # saplanmış → izi GERI_ESCAPE_DISTANCE_M (1 m) kadar geri izle, sonra normale dön.
+            if self._stuck_check(target_speed_kmh, current_speed_kmh):
+                kacis_m = self._kacis_mesafesi()   # P0 №4: aynı noktada 2. tetikte 2→4 m
+                self._start_geri(dist_limit=kacis_m, source='auto')
+                self.logger.log(
+                    f"[SIKIŞMA] {STUCK_ESCAPE_TIME_S:.0f}s hareketsiz "
+                    f"(hedef {target_speed_kmh:.1f} km/h, gerçek {current_speed_kmh:.2f}) "
+                    f"→ {kacis_m:.1f} m geri kaçış")
+                self._send_can_command(throttle_pct=0, brake_pct=60, steer_deg=0, gear=GEAR_NEUTRAL)
+                rate.sleep()
+                continue
 
             # PID çıkışı
             throttle = self.speed_pid.compute(speed_error, measurement=current_speed_kmh)
@@ -1774,6 +2450,14 @@ class CANWaypointFollower:
                 self.karar, target_x, target_y,
                 throttle_pct, brake_pct, steer_deg, 'D'
             )
+
+            # ── GERİ SÜRÜŞ İZ KAYDI ────────────────────────────────
+            # Gönderilen (direksiyon, gaz) çiftini kaydet; /geri_komut gelince bu iz
+            # TERS sırayla + vites REVERSE ile oynatılır → geldiği rota geri izlenir.
+            # Yalnız GERÇEKTEN ilerlerken kaydet (dur/emekle tick'leri izi şişirmesin →
+            # retrace'in mesafe-vs-tick sadakati korunur).
+            if current_speed_kmh > GERI_RECORD_MIN_KMH:
+                self._breadcrumb.append((steer_deg, throttle_pct))
 
             # Debug çıktısı
             line_str = f"L:{self.line_angle:+.1f}" if self._is_line_data_fresh() else "L:--"
