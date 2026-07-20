@@ -1,0 +1,231 @@
+# =============================================================================
+#  TALOS CANLI PARAMETRELER — docker restart GEREKTİRMEZ
+# =============================================================================
+#  KULLANIM
+#    1. İstediğin satırın başındaki '#' işaretini kaldır, değeri yaz, KAYDET.
+#    2. ~1 sn içinde ilgili servis uygular ve logunda görürsün:
+#         [canli_params][control] MAX_SPEED_KMH: 5.0 → 3.0
+#    3. Satırı tekrar yoruma alınca kod içindeki VARSAYILANA geri döner.
+#
+#  KURALLAR
+#    - Buradaki adlar, servis dosyasının üst "AYARLANABİLİR PARAMETRELER"
+#      bloğundaki adlarla BİREBİR aynıdır (bilinmeyen ad yok sayılır + uyarı).
+#    - Varsayılan değerler HER ZAMAN kodda yaşar; bu dosya boşken davranış
+#      birebir eskisi gibidir. Dosya bozuksa eski değerler korunur.
+#    - (RESTART) işaretli parametreler başlangıçta bir kez okunur/graf-kuruluma
+#      gömülür — canlı değişmez, o servisi `docker compose restart <servis>` et.
+#    - karar-node İSTİSNADIR: parametreleri karar/config/params.yaml'da ve BT
+#      kurulumuna gömülür → düzenle + `docker compose restart karar-node` (~2 sn).
+#
+#  Koşu kaydı: baslat.sh bu dosyanın başlangıç/bitiş kopyasını
+#  logs/$RUN_ID/system/ altına arşivler (hangi ayarla sürüldüğü kaybolmaz).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# talos-controller  (control/control.py)
+# ---------------------------------------------------------------------------
+control:
+  # --- Hız ---
+  # MAX_SPEED_KMH: 5.0            # maksimum hız (km/h) — güvenlik kelepçesi [0.5, 15]
+  # LIMIT_SLOW: 2.5               # 'slow' kararında hız limiti (km/h)
+  # TURN_MIN_SPEED: 1.5           # virajda minimum hedef hız (km/h)
+  # TURN_SLOWDOWN_THRESHOLD: 10.0 # derece — sonraki WP'ye heading hatası bunu aşınca yavaşla
+  # TURN_SLOWDOWN_GAIN: 2.5       # viraj yavaşlama eğrisinin dikliği
+  # --- Aktif fren ---
+  # SLOWDOWN_BRAKE_MARGIN: 0.4    # km/h — hedefin bu kadar üstünde frene başla
+  # SLOWDOWN_BRAKE_GAIN: 20.0     # fren% / (km/h aşım)
+  # SLOWDOWN_BRAKE_MAX: 45.0      # % — yavaşlama freni tavanı
+  # --- Direksiyon / Pure Pursuit ---
+  # STEER_RATE_MAX_DEG_S: 200.0   # direksiyon slew-rate limiti (°/s)
+  # LOOKAHEAD_K: 1.0              # Ld = K*v + B
+  # LOOKAHEAD_B: 2.5              # m
+  # LOOKAHEAD_MIN: 1.5            # m
+  # LOOKAHEAD_MAX: 6.0            # m
+  # SHARP_TURN_DEG: 15.0          # derece — bunun üstünde kısa lookahead
+  # SHARP_LOOKAHEAD: 2.0          # m — keskin dönüş lookahead tavanı
+  # --- /line şerit düzeltmesi ---
+  # LINE_ENABLED: true
+  # LINE_WEIGHT: 0.9
+  # LINE_GATE_MAX_HEADING: 12.0   # derece — /line yalnız bu heading hatası altında
+  # LINE_MAX_ANGLE: 25.0          # derece — güvenilir maksimum /line açısı
+  # LINE_SUPPRESS_TTL: 2.0        # s — engel bağlamından sonra /line susuk kalır
+  # --- E-stop güvenlik ağı ---
+  # ESTOP_HARD_M: 1.0             # m — koşulsuz tam fren mesafesi
+  # ESTOP_FWD_M: 2.5              # m — Ackermann-yay kontrol menzili
+  # ESTOP_CORRIDOR_M: 0.7         # m — hard-floor dar koridoru
+  # ESTOP_CHECK_CORRIDOR_M: 1.5   # m — Ackermann aday koridoru
+  # ESTOP_CRAWL_KMH: 1.5          # km/h — SOFT e-stop emekleme hızı
+  # ESTOP_RELEASE_S: 0.5          # s — release debounce
+  # ARAC_GENISLIK_M: 1.2          # m — süpürme bandı buna göre türetilir
+  # ENGEL_YARICAP_M: 0.15         # m — duba yarıçapı (banda eklenir)
+  # ARAC_BURUN_M: 2.3             # m — arka aks → ön tampon
+  # LIDAR_ARKA_AKS_M: 1.76        # m — lidar → arka aks (sahada kalibre edilecek)
+  # --- Waypoint / görev ---
+  # ARRIVAL_THRESHOLD: 3.0        # m — WP varış eşiği
+  # SLOWDOWN_DISTANCE: 4.0        # m — yavaşlamaya başlama
+  # STOP_DISTANCE: 1.2            # m — tam durma
+  # WP_NEAR_DISTANCE: 1.5         # m — WP1 yakınken WP2'ye geç (karar params.yaml control_wp_near_m ile senkron tut!)
+  # GOREV_THRESHOLD: 3.0          # m — durağa varış eşiği
+  # DUR_WAIT_TIME: 17.0           # s — durakta bekleme
+  # KARAR_TIMEOUT: 1.0            # s — /karar watchdog
+  # --- S-manevra (slalom) ---
+  # SMANEUVER_ENABLED: true
+  # SMANEUVER_REROUTE_LATERAL_M: 1.8
+  # SMANEUVER_MAX_SWING_DEG: 45.0
+  # SMANEUVER_ALIGN_DEG: 8.0
+  # SMANEUVER_TIMEOUT: 6.0
+  # SMANEUVER_CTX_TTL: 3.0
+  # --- Güvenli dönüş kapısı (tam-kilit süpürme alanı, 2026-07-15) ---
+  # SMAN_DONUS_KAPISI_AKTIF: true # koni süpürme alanından çıkmadan şeride dönme
+  # SMAN_KORIDOR_ASIM_M: 0.3     # m — WP hizası üstü izinli yanal aşım (şerit ihlali sınırı)
+  # SMAN_DONUS_TAIL_M: 8.0        # m — dönüş sonrası denetlenen düz koridor
+  # SMAN_DONUS_KLIRENS_M: 0.15    # m — süpürme bandına ek pay
+  # SMAN_DONUS_TEMIZ_S: 0.3       # s — alan bu süre kesintisiz temiz kalmalı
+  # KONI_HAFIZA_TTL_S: 3.0        # s — dünya koni hafızası (dropout köprüsü)
+  # KONI_HAFIZA_ESLE_M: 0.5       # m — aynı-koni eşleştirme yarıçapı
+  # --- Geri sürüş / sıkışma kaçışı ---
+  # GERI_MAX_THROTTLE: 100.0      # % — geri sürüş gaz tavanı
+  # STUCK_ESCAPE_TIME_S: 3.0      # s — hareketsizlik eşiği
+  # STUCK_ESCAPE_SPEED_KMH: 0.3   # km/h — "hareketsiz" tanımı
+  # GERI_ESCAPE_DISTANCE_M: 2.0   # m — kaçışta geri mesafe
+  # STUCK_ESCAPE_COOLDOWN_S: 5.0  # s
+  # --- Hız PID (canlı: aktif PID'e anında uygulanır) ---
+  # PID_SPEED_NORMAL:     {kp: 3.0, ki: 0.5, kd: 0.2}
+  # PID_SPEED_AGGRESSIVE: {kp: 5.0, ki: 1.0, kd: 0.3}
+  # PID_SPEED_SMOOTH:     {kp: 2.0, ki: 0.3, kd: 0.1}
+  # PID_ADAPT_VIRAJ:      {kp: 3.0, ki: 0.5}   # büyük heading hatasında
+  # PID_ADAPT_YAKIN:      {kp: 4.0, ki: 0.6}   # hedefe yaklaşırken
+  # ADAPTIVE_PID_ENABLED: true
+  # ADAPTIVE_HEADING_ESIK_DEG: 30.0
+  # --- (RESTART) başlangıçta okunur ---
+  # LOOP_RATE_HZ: 50              # (RESTART) ana döngü frekansı
+  # WHEELBASE: 1.86               # (RESTART önerilir) araç geometrisi
+
+# ---------------------------------------------------------------------------
+# hedef-teslimi  (hedef/hedef_yoneticisi.py)
+#   NOT: Graf-kuruluma gömülen parametreler (CEZA_*, IKI_YONLU_DURAK_AKTIF,
+#   R_DURAK_M, ENABLE_GUI) RESTART ister. Arama/reroute-anı parametreleri canlıdır.
+# ---------------------------------------------------------------------------
+hedef:
+  # --- Sapma / reroute (canlı) ---
+  # ILERI_MESAFE_M: 2.0           # m — start burun projeksiyonu
+  # ILERI_MESAFE_BLOK_M: 0.0      # m — blok aktifken projeksiyon
+  # SAPMA_ESIK_METRE: 2.5         # m — reroute eşiği
+  # SAPMA_TEMIZ_METRE: 1.5        # m — histerezis alt bandı
+  # SAPMA_DEBOUNCE_SURE: 1.5      # s — kesintisiz sapma süresi
+  # GOREV_YAKINLIK_M: 2.0         # m — görev tamam sayma mesafesi
+  # --- Map-matching (canlı) ---
+  # MATCH_PENCERE: 6              # WP — ileri snap penceresi
+  # MATCH_KORIDOR_M: 4.5          # m — snap koridoru
+  # --- Turn-aware arama (arama anında okunur → canlı) ---
+  # TURN_AWARE_AKTIF: true
+  # DONUS_CEZA_AGIRLIK: 1.5
+  # DONUS_CEZA_MAX: 4.0
+  # --- Karşı-şerit reroute cezası (reroute anında okunur → CANLI) ---
+  # KALMA=0 iken sol-metre = sağ-metre → araç engeli geçince de solda kalıyordu.
+  # >0: engeli geçince ilk GÜVENLİ çıkış crossing'inde sağ şeride erken döner.
+  # (2026-07-15 kullanıcı: "hedef gereğinden fazla sol şeritte çiziyor")
+  CEZA_TERS_KALMA: 20             # 0(bedava)→20(1.8x); solda kalmayı fazladan pahalı yap
+  # CEZA_TERS_CIKIS: 90           # ters şeride ÇIKMA (4.6x, pahalı) — genelde dokunma
+  # --- (RESTART) graf kuruluma gömülür ---
+  # CEZA_DUZ_SERIT: 0             # (RESTART)
+  # CEZA_BAGLANTI: 8              # (RESTART)
+  # R_DURAK_M: 7.0                # (RESTART)
+  # ENABLE_GUI: true              # (RESTART)
+
+# ---------------------------------------------------------------------------
+# engel-node  (lidar/engel_node_fixed.py)
+# ---------------------------------------------------------------------------
+engel:
+  # ENGEL_MESAFE_LIMITI_M: 3.0    # m — merkez sektörde engel var/yok eşiği
+  # SCAN_HALF_FOV_DEG: 15.0       # derece — toplam tarama yarı-açısı
+  # MERKEZ_HALF_FOV_DEG: 5.0      # derece — fren kararı merkez sektörü
+  # MIN_RANGE_M: 0.3              # m — bundan yakın okumalar yok sayılır
+  # STEER_SCALE: 0.5              # direksiyonla tarama merkezi kaydırma oranı
+
+# ---------------------------------------------------------------------------
+# engel-node 2. proses  (lidar/pointcloud_obstacle_publisher.py)
+# ---------------------------------------------------------------------------
+pointcloud:
+  # CLUSTER_DIST_THRESHOLD_M: 1.0 # m — kümeleme komşuluk eşiği
+  # MIN_CLUSTER_SIZE: 10          # nokta — küme alt sınırı
+  # MAX_DISTANCE_M: 12.0          # m — bu menzilin ötesi atılır
+  # MIN_DISTANCE_M: 0.3           # m
+  # 2026-07-15: golf.urdf 2026-07-04 hizalamasında lidar 10 cm indi (z 0.92→0.82;
+  # sensör yerden ≈0.91 m). Zemin velodyne çerçevesinde artık z≈−0.91'de, yani
+  # kod default'u −1.0'ın ÜSTÜNDE → zemin noktaları filtreyi GEÇİYOR ve
+  # /obstacle_positions zemin kümeleriyle doluyordu (+ boşuna CPU). −0.7 =
+  # zemin +0.21 m (ground_filter/laserscan marjlarıyla tutarlı). Koni >0.3 m → korunur.
+  MIN_HEIGHT_M: -0.7              # m — z alt eşiği (kod default −1.0 ESKİ lidar içindi)
+  # MAX_HEIGHT_M: 2.0             # m — z üst eşiği
+  # CLOUD_TOPIC: "/cart/center_laser/scan"   # (RESTART) abonelik başlangıçta kurulur
+
+# ---------------------------------------------------------------------------
+# ground_filter  (lidar/ground_filter.py — baslat.sh HOST node'u)
+# ---------------------------------------------------------------------------
+ground_filter:
+  # Z_MIN_M: -0.8                 # m — bunun altı zemin sayılır
+  # Z_MAX_M: 5.0                  # m — yüksek artefakt eşiği
+  # R_MIN_M: 0.5                  # m — araç gövdesi öz-yansıma yarıçapı
+  # IN_TOPIC: "/cart/center_laser/scan"      # (RESTART)
+  # OUT_TOPIC: "/cart/points_noground"       # (RESTART)
+
+# ---------------------------------------------------------------------------
+# can-bridge  (control/can_to_talos_cart.py)
+#   Env öncelik sırası: kod varsayılanı < TALOS_* env (başlangıç) < bu dosya (canlı)
+# ---------------------------------------------------------------------------
+can_bridge:
+  # POWER_LIMIT: 1.0              # 0-1 — manuel mod gaz ölçeği (kelepçe [0,1])
+  # POWER_LIMIT_AUTO: 1.0         # 0-1 — otonom mod gaz ölçeği (kelepçe [0,1])
+  # THROTTLE_RAMP_UP: 0.02        # tick başına gaz artışı
+  # THROTTLE_RAMP_DOWN: 0.05      # tick başına gaz azalışı
+  # MAX_STEERING_ANGLE_DEG: 28.95 # derece — direksiyon normalizasyon tavanı
+
+# ---------------------------------------------------------------------------
+# konum-server  (konum/konum.py)
+# ---------------------------------------------------------------------------
+konum:
+  # VARIS_TOLERANS_M: 1.2         # m — WP1'e varış toleransı ("varildi" eşiği)
+
+# ---------------------------------------------------------------------------
+# lane-follower  (algi/serit/lane_follow_node_fixed.py)
+# ---------------------------------------------------------------------------
+serit:
+  # KP: 0.12                      # piksel offset → direksiyon açısı kazancı
+  # MODEL_CONF: 0.6               # YOLO tespit güven eşiği
+  # STEER_CLAMP_DEG: 30.0         # /line çıkış açısı kelepçesi (±)
+  # CONF_VIRAJ_ESIK: 0.3          # bu güvenin altında viraj analizi yapılmaz
+  # CONF_CURVE_ESIK: 0.6          # bu güvenin altı "curve" sayılır
+  # TURN_COOLDOWN_FRAMES: 20      # viraj tespiti sonrası bekleme (kare)
+  # NO_DETECT_CURVE_FRAMES: 10    # bu kadar kare tespitsiz → "curve"
+  # SLOPE_SPREAD_MIN_PX: 50       # 90° viraj için çizgi yayılım eşiği (piksel)
+
+# ---------------------------------------------------------------------------
+# traffic-node  (algi/levha/yolov8_ros_node_fixed.py)
+# ---------------------------------------------------------------------------
+levha:
+  # CONF_ESIK: 0.5                # YOLO levha güven eşiği
+  # MESAFE_K: 1280.0              # bbox yüksekliği → mesafe kalibrasyonu
+  # LATERAL_SCALE: 3.0            # yatay offset metre ölçeği
+
+# ---------------------------------------------------------------------------
+# yaya-gecidi-node  (algi/yaya_gecidi/yaya_gecidi_node.py)
+# ---------------------------------------------------------------------------
+yaya_gecidi:
+  # CONF_ESIK: 0.30               # crosswalk güven eşiği (sim: 0.40-0.70 bandı)
+  # MESAFE_K: 1280.0
+  # LATERAL_SCALE: 3.0
+
+# ---------------------------------------------------------------------------
+# park-durak-node  (algi/park_durak/park_durak_node.py)
+#   HSV eşikleri 3 elemanlı liste olarak yazılır: [H, S, V]
+# ---------------------------------------------------------------------------
+park_durak:
+  # PARK_LOWER: [90, 100, 100]
+  # PARK_UPPER: [130, 255, 255]
+  # PARK_MIN_AREA: 2000           # piksel²
+  # DURAK_LOWER: [90, 80, 80]
+  # DURAK_UPPER: [130, 255, 255]
+  # DURAK_MIN_AREA: 1000          # piksel²
+  # MESAFE_K: 1280.0
+  # LATERAL_SCALE: 3.0

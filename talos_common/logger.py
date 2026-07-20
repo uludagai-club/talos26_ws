@@ -160,6 +160,17 @@ class TalosLogger:
                 with open(self.csv_path, "w", newline="") as f:
                     csv.writer(f).writerow(header)
                 self._csv_initialized = True
+            elif self.schema and "ts_wall_iso" not in self.schema:
+                # Var olan dosyaya devam (container restart, aynı RUN_ID): header'ı
+                # dosyadan yükle; yoksa restart sonrası satırlar ts_* kolonsuz
+                # yazılıyordu (health.csv ile aynı kalıp).
+                try:
+                    with open(self.csv_path, "r", newline="") as f:
+                        hdr = next(csv.reader(f), None)
+                except OSError:
+                    hdr = None
+                self.schema = hdr if hdr else (
+                    ["ts_wall_iso", "ts_ros_sec", "ts_mono_ns"] + list(self.schema))
 
             ordered = [str(row.get(k, "")) for k in self.schema]
             try:
