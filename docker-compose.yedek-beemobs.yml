@@ -1,0 +1,34 @@
+# TALOS YEDEK + BEEMOBS (Bee1 gerçek araç) override — docker-compose.yedek.yml ÜSTÜNE
+# ====================================================================================
+# can-bridge  : can_to_talos_cart.py -> beemobs_bridge.py (CAN 0x100/0x102/0x201 -> /beemobs/*)
+# state-bridge: Bee1 Gazebo EMÜLATÖRÜ — !!! GERÇEK ARAÇTA BAŞLATMA !!! (yalnız sim provası)
+#
+# Kullanım (gerçek araç — state-bridge listeden ÇIKARILIR):
+#   docker compose -f docker-compose.yedek.yml -f docker-compose.yedek-beemobs.yml \
+#     --profile gui up -d $(docker compose -f docker-compose.yedek.yml -f docker-compose.yedek-beemobs.yml --profile gui config --services | grep -v '^state-bridge$')
+#
+# Kod imaj içinden (/talos-kod) kopyalanır — host'ta kod ağacı gerekmez.
+
+services:
+
+  can-bridge:
+    command: -c "cp /talos-kod/control/beemobs_bridge.py /talos-kod/control/can_decoder.py /talos-kod/control/ackermann.py /app/ && cp -a /talos-kod/talos_common /talos-kod/config /app/ && source /opt/ros/noetic/setup.bash && export PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app && python3 -u /app/beemobs_bridge.py"
+    environment:
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
+      - RUN_ID=${RUN_ID:-yedek}
+      - TALOS_LOG_ROOT=/app/logs
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
+      - CAN_INTERFACE=${CAN_INTERFACE:-vcan0}
+      - BEEMOBS_MSG_PAKETI=${BEEMOBS_MSG_PAKETI:-smart_can_msgs}
+
+  # SADECE SİM PROVASI — gerçek araçta bu servisi listeye EKLEME (gerçek ECU
+  # feedback'iyle aynı /beemobs/FB_* topic'lerine sahte veri basar).
+  state-bridge:
+    command: -c "cp /talos-kod/control/beemobs_gazebo_emulatoru.py /talos-kod/control/can_decoder.py /talos-kod/control/ackermann.py /app/ && cp -a /talos-kod/talos_common /app/ && source /opt/ros/noetic/setup.bash && export PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app && python3 -u /app/beemobs_gazebo_emulatoru.py"
+    environment:
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
+      - RUN_ID=${RUN_ID:-yedek}
+      - TALOS_LOG_ROOT=/app/logs
+      - PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:/talos-devel/lib/python3/dist-packages:/app
+      - CAN_INTERFACE=${CAN_INTERFACE:-vcan0}
+      - BEEMOBS_MSG_PAKETI=${BEEMOBS_MSG_PAKETI:-smart_can_msgs}
