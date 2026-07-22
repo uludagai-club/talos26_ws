@@ -22,14 +22,14 @@ from py_trees.composites import Selector, Sequence
 from bb import Blackboard
 from behaviors.conditions import (
     YayaFresh, LevhaFresh, EngelFresh,
-    YayaVarMi, YayaCokYakin, YayaYakin, YayaOrtaMesafe,
+    YayaVarMi, YayaCokYakin,
     EngelCokYakin, EngelMerkezBlokaj,
     LevhaIs, LevhaIcindeMesafe,
     LaneChangeCooldownOk, LaneChangeInProgress,
 )
 from behaviors.actions import (
     SetKarar, LatchEmergency, ReleaseEmergencyIfClear,
-    DurLevhasiFSM, LaneChangeStamp, RerouteKarar, HoldLaneChange,
+    DurLevhasiFSM, YayaGecidiFSM, LaneChangeStamp, RerouteKarar, HoldLaneChange,
 )
 from behaviors.decorators import Debounce
 
@@ -133,33 +133,26 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     ])
 
     # ============================================================
-    # 2. Yaya geçidi (acil değil)
+    # 2. Yaya geçidi FSM (acil değil) — 2026-07-22
+    #    Adanmış model yalnız GEÇİT ÇİZGİSİNİ ('crosswalk') veriyor, yayayı değil.
+    #    Bu yüzden geçit görülünce MİNİMAL zorunlu duruş → lidar engel ile "geçitte
+    #    yaya var mı" → varsa (max'a dek) bekle, yoksa min dolunca DEVAM. Eski
+    #    YayaDur/YayaSlow (mesafe eşiği) geçidin üstünde ~0.6m'de donup sonsuz 'dur'
+    #    yapıyordu → FSM zaman/engel tabanlı release ile kilidi keser.
     # ============================================================
-    pedestrian = Sequence("Pedestrian", memory=False, children=[
+    yg = p.get("yaya_gecidi", {}) or {}
+    pedestrian = Sequence("YayaGecidi", memory=False, children=[
         YayaFresh(bb, fresh["yaya_max_age_s"]),
         YayaVarMi(bb),
-        Selector("YayaAksiyon", memory=False, children=[
-            Sequence("YayaDur", memory=False, children=[
-                Debounce("YayaYakinDeb",
-                         YayaYakin(bb, dist["yaya_dur_m"],
-                                   gain_s=_gain("yaya_dur_gain_s"),
-                                   max_extra_m=sa_max_extra, odom_max_age_s=odom_age),
-                         bb, key="yaya_yakin",
-                         min_consecutive=deb["yaya_min_consecutive"]),
-                SetKarar("Karar=DUR(yaya)", bb, karar="dur",
-                         reason="yaya_dur", phase="driving"),
-            ]),
-            Sequence("YayaSlow", memory=False, children=[
-                Debounce("YayaOrtaDeb",
-                         YayaOrtaMesafe(bb, dist["yaya_yavas_m"],
-                                        gain_s=_gain("yaya_yavas_gain_s"),
-                                        max_extra_m=sa_max_extra, odom_max_age_s=odom_age),
-                         bb, key="yaya_orta",
-                         min_consecutive=deb["yaya_min_consecutive"]),
-                SetKarar("Karar=SLOW(yaya)", bb, karar="slow",
-                         reason="yaya_yavas", phase="driving"),
-            ]),
-        ]),
+        YayaGecidiFSM(
+            bb,
+            dur_esik_m=dist["yaya_dur_m"],
+            yavas_esik_m=dist["yaya_yavas_m"],
+            min_bekleme_s=float(yg.get("min_bekleme_s", 3.0)),
+            max_bekleme_s=float(yg.get("max_bekleme_s", 20.0)),
+            engel_bekle_m=float(yg.get("engel_bekle_m", 8.0)),
+            release_grace_s=float(yg.get("release_grace_s", 8.0)),
+        ),
     ])
 
     # ============================================================

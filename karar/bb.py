@@ -99,6 +99,12 @@ class StatePersist:
     stop_sign_hold_start_s: float = 0.0
     stop_sign_released_s: float = 0.0   # son release zamanı — release_grace_s ile çift duruşu önler
 
+    # Yaya geçidi FSM: "idle" | "holding" | "released" (min zorunlu duruş + lidar
+    # engel ile yaya-bekleme köprüsü; adanmış model yalnız 'crosswalk' verdiği için).
+    yaya_gecidi_phase: str = "idle"
+    yaya_gecidi_hold_start_s: float = 0.0
+    yaya_gecidi_released_s: float = 0.0   # son release — release_grace_s ile çift duruşu önler
+
     # Lane change cooldown + manevra kilidi (control.py edge-tetiklemeli, manevrayı
     # kendi LANE_CHANGE_DURATION süresince sürdürür → BT aynı yönü o pencere boyunca
     # tutmalı; aksi halde "dur"/"normal" manevrayı keser).

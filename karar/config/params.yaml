@@ -177,6 +177,19 @@ timers:
   # DUR yalnız gerçekten yeni engelde. (debounce.engel_blokaj_hold_ticks ile eş.)
   engel_reroute_reset_gap_s: 3.0
 
+# Yaya geçidi FSM (2026-07-22) — YayaGecidiFSM okur.
+# Adanmış model yalnız GEÇİT ÇİZGİSİNİ ('crosswalk') veriyor, yayanın kendisini
+# ('object') değil → geçit görülünce yaya olsun olmasın MİNİMAL zorunlu duruş;
+# sonra "geçitte yaya var mı" LİDAR engeliyle yanıtlanır (engel varsa max'a dek
+# bekle, yoksa min dolunca devam). Görüntü-işleme 'object' sınıfını çözünce burası
+# gerçek yaya tespitine daraltılır (engel_bekle_m kalkar). Duruş/yavaş eşikleri
+# distances.yaya_dur_m / yaya_yavas_m'den gelir.
+yaya_gecidi:
+  min_bekleme_s:   3.0    # geçitte ZORUNLU minimal duruş (yaya olsun olmasın)
+  max_bekleme_s:  20.0    # engel(yaya) sürerse üst sınır → kalıcı kilit keser (fail-safe)
+  engel_bekle_m:   8.0    # merkez lidar engeli bu mesafe içindeyse "geçitte yaya var" say
+  release_grace_s: 8.0    # devam sonrası: aynı geçidi (araç hâlâ üstündeyken) yeniden tetikleme
+
 # Debounce — flicker önleme (tick cinsinden, 10Hz @ 0.1s/tick varsayar)
 debounce:
   yaya_min_consecutive:     2

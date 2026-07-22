@@ -291,6 +291,131 @@ class DurLevhasiFSM(py_trees.behaviour.Behaviour):
 
 
 # ============================================================
+# Yaya geçidi FSM (min zorunlu duruş + lidar engel ile yaya-bekleme)
+# ============================================================
+class YayaGecidiFSM(py_trees.behaviour.Behaviour):
+    """Yaya geçidi kararı — adanmış crosswalk modeli sinyaliyle (GEÇİCİ köprü).
+
+    Adanmış model YALNIZ geçit ÇİZGİSİNİ tespit ediyor ('crosswalk'), yayanın
+    kendisini ('object') değil (algi/yaya_gecidi_node.py). Bu yüzden yaya olsun
+    olmasın geçitte MİNİMAL zorunlu duruş yapılır; sonra "geçitte yaya var mı"
+    sorusu LİDAR engel verisiyle yanıtlanır: engel (yaya) varsa geçene kadar
+    (bir üst sınıra dek) beklenir, yoksa min bekleme dolunca DEVAM edilir.
+    (Görüntü-işleme ekibi 'object' sınıfını çözene dek — sonra bu FSM engel
+    yerine gerçek yaya tespitini okuyacak şekilde daraltılır.)
+
+    Fazlar (DurLevhasiFSM kalıbı):
+      - APPROACH (yavas_esik ≥ mesafe > dur_esik): "slow"
+      - HOLDING (mesafe < dur_esik): "dur"
+          • gecen < min_bekleme_s                    → zorunlu duruş
+          • min doldu + lidar engel (yaya) var       → max_bekleme_s'e dek bekle
+          • temiz VEYA max doldu                      → RELEASED
+      - RELEASED: FAILURE (üst selector ilerlesin). Geçit görüşten çıkınca idle.
+
+    Kilitlenme önlemi (eski bug): mesafe geçidin ÜSTÜNDE ~0.6m'de donuyor ve hiç
+    büyümüyordu → sonsuz 'dur'. Çözüm: (a) RELEASED mesafeyle değil zamanla/engelle
+    verilir, (b) yeniden silahlanma yalnız `yaya_present`e bakar (yakında mesafe
+    0.6↔17.2 zıpladığı için mesafe eşiği güvenilmez), (c) max_bekleme_s üst sınırı
+    statik/yanlış engelde bile kalıcı kilidi keser. Erken release olsa da alttaki
+    obstacle_avoidance + üstteki emergency dalları güvenlik ağı olarak kalır.
+    """
+
+    def __init__(self, bb: Blackboard, dur_esik_m: float, yavas_esik_m: float,
+                 min_bekleme_s: float, max_bekleme_s: float, engel_bekle_m: float,
+                 release_grace_s: float):
+        super().__init__("YayaGecidiFSM")
+        self.bb = bb
+        self.dur_esik_m = dur_esik_m
+        self.yavas_esik_m = yavas_esik_m
+        self.min_bekleme_s = min_bekleme_s
+        self.max_bekleme_s = max_bekleme_s
+        self.engel_bekle_m = engel_bekle_m
+        self.release_grace_s = release_grace_s
+
+    def _yaya_engeli_var(self) -> bool:
+        """Geçit bölgesinde lidar engeli (yaya proxy'si) var mı? Merkez sektörde
+        engel_bekle_m içinde engel → 'yaya geçiyor' say. (Görüntü-işleme 'object'
+        sınıfını verince burası gerçek yaya tespitiyle değişir.)
+
+        KONİ ÇAKIŞMASI (2026-07-22 canlı): lidar koni ile yayayı ayıramaz. Bir koni
+        geçidin yanındaysa engel_present=True olur ve geçit FSM'i onu "yaya" sanıp
+        beklerdi → reroute'la çakışıp salınım + acildurus (araç takılır). RerouteManager
+        o koniyi zaten izliyorsa (overtake_active) engel KONİDİR, yaya değil → yaya
+        sayma; min duruştan sonra bırak, koniyi obstacle_avoidance/reroute geçsin.
+        Gerçek yaya (ortada izlenen koni yokken) hâlâ beklenir; çok yakın yaya için
+        emergency/obstacle dalları güvenlik ağı olarak kalır."""
+        o = self.bb.obs
+        if not o.engel_present:
+            return False
+        if self.bb.state.overtake_active:   # engel izlenen bir koni → yaya değil
+            return False
+        d = o.engel_d_center
+        return d is not None and math.isfinite(d) and 0.0 < d < self.engel_bekle_m
+
+    def update(self):
+        o = self.bb.obs
+        s = self.bb.state
+
+        # Yeniden silahlanma: geçit görünmüyorsa idle. Yalnız present sinyali —
+        # mesafe yakında güvenilmez (0.6↔17.2 flip); mesafe eşiği KULLANILMAZ.
+        if (not o.yaya_present) or (o.yaya_distance < 0):
+            if s.yaya_gecidi_phase != "idle":
+                s.yaya_gecidi_phase = "idle"
+            return Status.FAILURE
+
+        d = o.yaya_distance
+
+        # APPROACH / tetik
+        if s.yaya_gecidi_phase == "idle":
+            # Release grace: yeni geçilen geçidin çift tetiklenmesini önle
+            if (self.release_grace_s > 0.0 and s.yaya_gecidi_released_s > 0.0
+                    and (time.time() - s.yaya_gecidi_released_s) < self.release_grace_s):
+                return Status.FAILURE
+            if d < self.dur_esik_m:
+                s.yaya_gecidi_phase = "holding"
+                s.yaya_gecidi_hold_start_s = time.time()
+            elif d <= self.yavas_esik_m:
+                self.bb.last_decision = {
+                    "karar": "slow",
+                    "reason": "yaya_gecidi_yaklasma",
+                    "phase": "approach",
+                    "wait_remaining_s": 0.0,
+                }
+                return Status.SUCCESS
+            else:
+                return Status.FAILURE
+
+        # HOLDING
+        if s.yaya_gecidi_phase == "holding":
+            gecen = time.time() - s.yaya_gecidi_hold_start_s
+            # 1) Minimal zorunlu duruş (yaya olsun olmasın)
+            if gecen < self.min_bekleme_s:
+                self.bb.last_decision = {
+                    "karar": "dur",
+                    "reason": "yaya_gecidi_min_dur",
+                    "phase": "waiting_at_crosswalk",
+                    "wait_remaining_s": max(0.0, self.min_bekleme_s - gecen),
+                }
+                return Status.SUCCESS
+            # 2) Min doldu — geçitte yaya (lidar engel) varsa max'a kadar bekle
+            if self._yaya_engeli_var() and gecen < self.max_bekleme_s:
+                self.bb.last_decision = {
+                    "karar": "dur",
+                    "reason": "yaya_gecidi_yaya_bekle",
+                    "phase": "waiting_at_crosswalk",
+                    "wait_remaining_s": max(0.0, self.max_bekleme_s - gecen),
+                }
+                return Status.SUCCESS
+            # 3) Temiz veya max doldu → devam et
+            s.yaya_gecidi_phase = "released"
+            s.yaya_gecidi_released_s = time.time()
+
+        # RELEASED: bu tick karar üretme; üst selector ilerlesin (geçit görüşten
+        # çıkınca yukarıdaki present kapısı idle'a sıfırlar).
+        return Status.FAILURE
+
+
+# ============================================================
 # Şerit değiştirme bildirimi (cooldown güncelle)
 # ============================================================
 class LaneChangeStamp(py_trees.behaviour.Behaviour):
