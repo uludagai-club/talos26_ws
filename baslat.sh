@@ -68,6 +68,9 @@ cleanup() {
     [ -n "${STATE_PID:-}"  ]  && kill "$STATE_PID"   2>/dev/null
     [ -n "${VIS_PID:-}"    ]  && kill "$VIS_PID"     2>/dev/null
 
+    # Karar panosu (host GUI, salt-görsel)
+    [ -n "${PANEL_PID:-}"  ]  && kill "$PANEL_PID"   2>/dev/null
+
     # candump — yumusak kapat
     if [ -n "${CANDUMP_PID:-}" ]; then
         kill "$CANDUMP_PID" 2>/dev/null
@@ -356,6 +359,29 @@ GOZCU_PID=$!
 echo -e "${GREEN}[+] Oto-restart gözcüsü aktif (PID=$GOZCU_PID) — restart:on-failure:5, log: $RUN_DIR/system/watchdog.log${NC}"
 
 # =============================================================
+# 5b) KARAR PANOSU (host GUI) — /karar + /karar_bt/snapshot canlı izleme
+# Salt-görsel matplotlib penceresi (karar_panel.py); hiçbir topic'e YAZMAZ, karar
+# davranışını etkilemez. karar-node ayağa kalktıktan (compose up) sonra açılır ki
+# ilk tick'te dolu gelsin. GUI olduğu için DISPLAY şart — headless/SSH oturumunda
+# (DISPLAY boş) sessizce atlanır, baslat.sh akışı bozulmaz. Container değil host
+# python3'ü kullanır (ground_filter/obstacle_detector ile aynı desen).
+# Kapatmak: KARAR_PANEL=off ./baslat.sh   ·   Hız: KARAR_PANEL_HZ=5 (bkz. panel)
+# =============================================================
+KARAR_PANEL="${KARAR_PANEL:-auto}"
+if [ "$KARAR_PANEL" != "off" ] && [ -n "${DISPLAY:-}" ] && [ -f "$SCRIPT_DIR/karar/karar_panel.py" ]; then
+    MPLBACKEND="${MPLBACKEND:-TkAgg}" nohup python3 "$SCRIPT_DIR/karar/karar_panel.py" \
+        > "$RUN_DIR/system/karar_panel.log" 2>&1 &
+    PANEL_PID=$!
+    echo -e "${GREEN}[+] Karar panosu açıldı (PID=$PANEL_PID) — /karar + snapshot canlı (log: $RUN_DIR/system/karar_panel.log)${NC}"
+elif [ "$KARAR_PANEL" = "off" ]; then
+    echo -e "${YELLOW}[!] KARAR_PANEL=off — karar panosu atlandı${NC}"
+elif [ -z "${DISPLAY:-}" ]; then
+    echo -e "${YELLOW}[!] DISPLAY yok — karar panosu atlandı (headless/SSH). Ekran başında çalıştır ya da elle: python3 karar/karar_panel.py${NC}"
+else
+    echo -e "${YELLOW}[!] karar_panel.py bulunamadı — pano atlandı${NC}"
+fi
+
+# =============================================================
 # 6) DURUM
 # =============================================================
 echo ""
@@ -375,6 +401,7 @@ echo -e "${CYAN}  can-bridge         => CAN -> Gazebo${NC}"
 echo -e "${CYAN}  state-bridge       => Gazebo -> CAN${NC}"
 echo -e "${CYAN}  talos-controller   => Ana kontrolcu${NC}"
 echo -e "${CYAN}  can-visualizer     => CAN GUI${NC}"
+echo -e "${CYAN}  karar-panosu       => /karar + snapshot (salt-görsel GUI)${NC}"
 echo -e "${CYAN}------------------------------------------------------${NC}"
 echo -e "${YELLOW}  Loglar: $RUN_DIR${NC}"
 echo -e "${YELLOW}  CANLI PARAMETRE: config/canli_params.yaml duzenle => RESTART'SIZ uygulanir (~1 sn)${NC}"
