@@ -173,18 +173,31 @@ class EngelCokYakin(_Cond):
 
 
 class EngelMerkezBlokaj(_Cond):
-    """Merkez sektörde sürüş engelleyici mesafede engel var mı? (hıza-duyarlı)"""
+    """Sürüş engelleyici mesafede engel var mı? (hıza-duyarlı, YAY-KAPISI-FARKINDA)
+
+    2026-07-23: eskiden yalnız `engel_d_center` (düz-ileri koridor) okuyordu →
+    araç DÖNERKEN (kıvrımlı yol/reroute takibi) koni düz-eksende olmadığından
+    d_center=inf oluyor, yavasla/reroute bandı HİÇ tetiklenmiyordu; araç koniye
+    dalıp control'ün hard-floor e-stop'una (~1m) girip KİLİTLENİYORDU (canlı
+    20260722T194924Z, ~35,-19: steer 28.9° maks dönüşte d_center=inf, d_arc
+    37→1.78m ama d_arc yalnız ACİL bandını besliyordu). Çözüm: düz-ileri (d_center)
+    VEYA aracın bisiklet-modeli süpürme yayında (d_arc) en yakın engeli al →
+    min(d_center, d_arc). d_arc, direksiyon bayat / yay-kapısı kapalıyken d_center'a
+    düşer (ros_bridge fail-safe) → DÜZ sürüşte davranış AYNI (min = d_center)."""
     def __init__(self, bb, esik_m, gain_s=0.0, max_extra_m=0.0, odom_max_age_s=0.5):
-        super().__init__(f"EngelMerkezBlokaj(<{esik_m}m+v)?", bb)
+        super().__init__(f"EngelMerkezBlokaj(<{esik_m}m+v,yay)?", bb)
         self.esik_m = esik_m
         self.gain_s = gain_s
         self.max_extra_m = max_extra_m
         self.odom_max_age_s = odom_max_age_s
 
     def update(self):
-        d = self.bb.obs.engel_d_center
-        if d is None or not math.isfinite(d):
+        o = self.bb.obs
+        cand = [x for x in (o.engel_d_center, o.engel_d_arc)
+                if x is not None and math.isfinite(x)]
+        if not cand:
             return Status.FAILURE
+        d = min(cand)
         esik = _adaptive_esik(self.esik_m, self.bb, self.gain_s, self.max_extra_m, self.odom_max_age_s)
         return Status.SUCCESS if d < esik else Status.FAILURE
 
