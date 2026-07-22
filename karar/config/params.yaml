@@ -160,12 +160,26 @@ timers:
   # (planlayıcı replan yapsın), sonra 'slow' ile reroute takibi. 0 → duraklamasız
   # (eski davranış: doğrudan slow+reroute). Sahada tune edilebilir.
   engel_dur_reroute_pause_s: 1.5
+  # TEK-SEFERLİK DUR (2026-07-22 karar-kararsızlığı fix): RerouteKarar fazı bu
+  # süreden UZUN boşlukta sıfırlanır (= yeni karşılaşma → tekrar DUR). Eski 0.5s
+  # değeri tünel duvarı/duba detektör titremesinde her titreşimi "yeni karşılaşma"
+  # sayıp tekrarlı 1.5s DUR bastırıyordu (canlı 160358Z: 382 engel_dur_reroute →
+  # araç kilitli). 3s: kısa boşluk fazı KORUR, engel dönünce doğrudan 'slow' takip;
+  # DUR yalnız gerçekten yeni engelde. (debounce.engel_blokaj_hold_ticks ile eş.)
+  engel_reroute_reset_gap_s: 3.0
 
 # Debounce — flicker önleme (tick cinsinden, 10Hz @ 0.1s/tick varsayar)
 debounce:
   yaya_min_consecutive:     2
   engel_min_consecutive:    2
   levha_min_consecutive:    2
+  # YAPIŞKAN ENGEL-KAPISI / çıkış histerezisi (2026-07-22 karar-kararsızlığı fix):
+  # engel merkez bandda bir kez angaje olunca, kısa algı boşluklarında (detektör
+  # titremesi, /obstacles/poses bir tick boş) engel dalı DÜŞMESİN → karar 'normal'e
+  # flip-flop yapmasın. Angaje kararı bu kadar tick (10Hz'de 15 ≈ 1.5s) tutar; her
+  # gerçek algı tutmayı tazeler. 0 → eski davranış (histerezis yok). Güvenli yön:
+  # yalnız temkinli 'slow'/'dur'u UZATIR; dur/acildurus zaten üst dallardan gelir.
+  engel_blokaj_hold_ticks:  15
   # P1 №6 (E3-O2): yayın-öncesi ASİMETRİK çıkış-debounce. Yükselen karar
   # (slow→dur, →acildurus) ANINDA geçer; alçalan karar (dur→normal) ancak bu
   # kadar tick üst üste istikrarlıysa geçer (0 = kapalı). bkz. cikis_debounce.py

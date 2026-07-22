@@ -205,13 +205,22 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     #    düz takip eder (H-A). acildurus/dur safety-net üstte+RerouteKarar içinde.
     # ============================================================
     engel_reroute_pause_s = float(timer.get("engel_dur_reroute_pause_s", 1.5))
+    # TEK-SEFERLİK DUR: kısa algı boşlukları fazı sıfırlamasın (eski 0.5s → tekrarlı
+    # DUR/kilit). Titreşim süresinden büyük tutulur; yapışkan kapı (hold_ticks) ile
+    # birlikte kararı stabil kılar.
+    engel_reroute_reset_gap_s = float(timer.get("engel_reroute_reset_gap_s", 3.0))
     road_reroute = Sequence("RoadReroute", memory=False, children=[
         EngelMerkezBlokaj(bb, engel_block_m),                 # commit (reroute) bandında mı?
-        RerouteKarar(bb, pause_s=engel_reroute_pause_s),      # DUR(pause) → reroute → slow-takip
+        RerouteKarar(bb, pause_s=engel_reroute_pause_s,       # DUR(pause) → reroute → slow-takip
+                     reset_gap_s=engel_reroute_reset_gap_s),
     ])
     engel_yavasla = SetKarar("Karar=SLOW(engel)", bb, karar="slow",
                              reason="engel_yavasla", phase="approach")
 
+    # YAPIŞKAN ENGEL-KAPISI (çıkış histerezisi): engel bir kez angaje olunca kısa
+    # detektör boşluklarında dal düşmesin → karar 'normal'e flip-flop yapmasın.
+    # hold_ticks = engel_blokaj_hold_ticks (tick; 10Hz'de 15 ≈ 1.5s). 0 → eski.
+    engel_hold_ticks = int(deb.get("engel_blokaj_hold_ticks", 15))
     obstacle_avoidance = Sequence("ObstacleAvoidance", memory=False, children=[
         EngelFresh(bb, fresh["engel_max_age_s"]),
         Debounce("EngelTepkiDeb",
@@ -219,7 +228,8 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
                                    gain_s=_gain("engel_block_gain_s"),
                                    max_extra_m=sa_max_extra, odom_max_age_s=odom_age),
                  bb, key="engel_blokaj",
-                 min_consecutive=deb["engel_min_consecutive"]),
+                 min_consecutive=deb["engel_min_consecutive"],
+                 hold_ticks=engel_hold_ticks),
         Selector("EngelTepki", memory=False, children=[
             road_reroute,       # commit bandı → slow + kenar_blok reroute (≤dur → dur)
             engel_yavasla,      # block↔yavasla arası → slow

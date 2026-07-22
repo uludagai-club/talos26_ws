@@ -740,13 +740,77 @@ def run_scenarios():
     bb.state.reroute_stop_start_s = time.time() - (cfg["timers"]["engel_dur_reroute_pause_s"] + 0.5)
     fresh_now(bb); bb.obs.hedef_last_seen = time.time(); tree.tick()
     assert_karar("S36b (bekleme doldu → SLOW takip)", "slow")
-    # 3) Engel banttan çıkar (rerouteu takip edip geçtik) → NORMAL
+    # 3) Engel banttan çıkar (rerouteu takip edip geçtik) → NORMAL.
+    #    YAPIŞKAN KAPI: temizlikten sonra karar hold_ticks (~1.5s) 'slow' TUTAR,
+    #    sonra cikis-debounce (slow→normal) tamamlanınca 'normal'. Bu gecikme
+    #    kasıtlı (flicker→normal flip-flop'unu keser). Hold + cikis + pay kadar
+    #    tikleyip nihai 'normal'i doğrula.
     bb.obs.engel_present = False
     bb.obs.engel_d_center = float("inf")
     bb.obs.engel_d_overall = float("inf")
-    for _ in range(n_engel + 1):
+    hold_ticks = int(cfg["debounce"].get("engel_blokaj_hold_ticks", 15))
+    cikis = int(cfg["debounce"].get("cikis_debounce_ticks", 3))
+    for _ in range(hold_ticks + cikis + 3):
         fresh_now(bb); tree.tick()
     assert_karar("S36c (engel temiz → NORMAL)", "normal")
+
+    # -----------------------------------------------------------------
+    # S37: FLICKER — engel angaje (SLOW takip) iken 1 tick detektör boşluğu
+    #      (engel_present=0). Yapışkan kapı sayesinde karar 'normal'e DÜŞMEZ;
+    #      'slow' korunur. (2026-07-22 karar-kararsızlığı fix: normal↔slow flip yok.)
+    # -----------------------------------------------------------------
+    print("\nS37: SLOW takip iken 1-tick engel boşluğu → 'normal'e düşme (yapışkan kapı)")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 3.5
+    bb.obs.engel_d_overall = 3.5
+    bb.obs.engel_angle_deg = 5.0
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    # bekleme dolur → SLOW takip
+    bb.state.reroute_stop_start_s = time.time() - (cfg["timers"]["engel_dur_reroute_pause_s"] + 0.5)
+    fresh_now(bb); tree.tick()
+    assert_karar("S37a (angaje → SLOW)", "slow")
+    # 1-tick boşluk: engel yok ama pose/tazelik taze (detektör titremesi)
+    bb.obs.engel_present = False
+    bb.obs.engel_d_center = float("inf")
+    bb.obs.engel_d_overall = float("inf")
+    fresh_now(bb); tree.tick()
+    assert_karar("S37b (1-tick boşluk → hâlâ SLOW, normal DEĞİL)", "slow")
+
+    # -----------------------------------------------------------------
+    # S38: TEK-SEFERLİK DUR — engel angaje + DUR yapıldı; kısa (<reset_gap) boşluk
+    #      sonrası engel geri gelince YENİDEN DUR YAPMAZ, doğrudan 'slow' takip.
+    #      (canlı 160358Z: 382 tekrarlı engel_dur_reroute kilidi bu senaryo.)
+    # -----------------------------------------------------------------
+    print("\nS38: DUR sonrası kısa boşluk → engel dönünce YENİDEN DUR YOK (tek-seferlik)")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 3.5
+    bb.obs.engel_d_overall = 3.5
+    bb.obs.engel_angle_deg = 5.0
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S38a (ilk giriş → DUR)", "dur")
+    # bekleme dolar → SLOW (follow fazına geç)
+    bb.state.reroute_stop_start_s = time.time() - (cfg["timers"]["engel_dur_reroute_pause_s"] + 0.5)
+    fresh_now(bb); tree.tick()
+    assert_karar("S38b (bekleme doldu → SLOW)", "slow")
+    # kısa boşluk (reset_gap içinde): engel kaybol, birkaç tick (yapışkan pencere içinde)
+    bb.obs.engel_present = False
+    bb.obs.engel_d_center = float("inf")
+    bb.obs.engel_d_overall = float("inf")
+    for _ in range(2):
+        fresh_now(bb); tree.tick()
+    # engel geri gelir → faz KORUNDU (reset_gap büyük) → FOLLOW ('slow'), DUR DEĞİL
+    bb.obs.engel_present = True
+    bb.obs.engel_d_center = 3.5
+    bb.obs.engel_d_overall = 3.5
+    for _ in range(n_engel):
+        fresh_now(bb); tree.tick()
+    assert_karar("S38c (engel döndü → SLOW takip, YENİDEN DUR YOK)", "slow")
 
     print("\n" + "=" * 50)
     if failures:

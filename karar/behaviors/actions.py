@@ -363,15 +363,24 @@ class RerouteKarar(py_trees.behaviour.Behaviour):
     Dormant reset: branch `reset_gap_s` boyunca çalışmazsa (engel banttan çıktı)
     faz "" ye döner → SONRAKİ engelde yeniden tam bir DUR yapılır.
 
+    TEK-SEFERLİK DUR (2026-07-22 karar-kararsızlığı fix): reset_gap KISA olunca
+    (eski 0.5s) tünel duvarı / duba detektör titremesi her >0.5s boşlukta fazı
+    sıfırlıyor → araç DURDUKTAN sonra bile her titreşimde YENİDEN 1.5s 'dur'
+    basılıyordu (canlı 160358Z: 382 tekrarlı engel_dur_reroute, araç kilitli).
+    Çözüm: reset_gap büyütülür (~3s) → kısa boşluklar fazı KORUR; engel dönünce
+    doğrudan FOLLOW ('slow'), yeni DUR yok. DUR yalnızca gerçekten yeni bir
+    karşılaşmada (engel reset_gap'ten uzun süre banttan çıkıp geri gelince) tekrar
+    yapılır. Yapışkan engel-kapısı (Debounce hold_ticks, main_tree) ile birlikte
+    çalışır: boşlukta dal düşmez, 'slow' tutulur.
+
     Her zaman SUCCESS (commit bandındaki engele daima bir tepki üretilir).
     """
 
-    RESET_GAP_S = 0.5   # branch bu kadar sessiz kalırsa → yeni karşılaşma (faz sıfırla)
-
-    def __init__(self, bb: Blackboard, pause_s: float):
+    def __init__(self, bb: Blackboard, pause_s: float, reset_gap_s: float = 0.5):
         super().__init__("RerouteKarar")
         self.bb = bb
         self.pause_s = max(0.0, float(pause_s))
+        self.reset_gap_s = max(0.0, float(reset_gap_s))
 
     def update(self):
         o = self.bb.obs
@@ -396,8 +405,11 @@ class RerouteKarar(py_trees.behaviour.Behaviour):
         s.kacis_engel_dunya = (ox, oy)   # trace log sürekliliği (eski alan)
 
         now = time.time()
-        # Dormant reset: engel banttan çıkıp geri geldiyse yeni karşılaşma say
-        if s.reroute_last_tick_s <= 0.0 or (now - s.reroute_last_tick_s) > self.RESET_GAP_S:
+        # Dormant reset: engel banttan çıkıp geri geldiyse yeni karşılaşma say.
+        # reset_gap_s KISA olursa titreşim = "yeni karşılaşma" sanılır → tekrarlı
+        # DUR (kilit). Büyük gap → kısa boşluk fazı korur; yalnız uzun temizlikte
+        # yeni DUR (tek-seferlik DUR fix).
+        if s.reroute_last_tick_s <= 0.0 or (now - s.reroute_last_tick_s) > self.reset_gap_s:
             s.reroute_phase = ""
         s.reroute_last_tick_s = now
 
