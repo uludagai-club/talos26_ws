@@ -342,24 +342,36 @@ class KacisKarar(py_trees.behaviour.Behaviour):
 
 
 class RerouteKarar(py_trees.behaviour.Behaviour):
-    """Cone-case kararı: sol/sag YERİNE 'slow' + hedef'e kenar_blok reroute talebi.
+    """Engel (cone/lidar) blokajı kararı: DUR → yeniden planla → devam.
 
-    Yeni mimari (gelistirme_plani §16, E-A/E-B): cone control'ün açık-döngü
-    offset'iyle (kaldırıldı, §12.13 H-A) DEĞİL, planlayıcının rotayı dubanın
-    etrafından çizmesiyle geçilir. Bu action:
-      - cone'un DÜNYA konumunu hesaplar (robot pozu + engel menzili/açısı; hedef
-        tazeliğine bağlı DEĞİL) ve bb.state'e yazar → node RerouteManager ile
-        /hedef_komut: kenar_blok yollar (E-A).
-      - /karar'a 'slow' basar (sol/sag YOK → control offset tetiklenmez, E-B).
-      - Cone dur eşiğinden yakınsa (reroute saptıramadı / çok yakın) güvenlik-ağı
-        'dur' (blok talebi KORUNUR — cone hâlâ orada). acildurus üst dalda zaten.
-    Her zaman SUCCESS (commit bandındaki cone'a bir tepki daima üretilir).
+    Kullanıcı gereksinimi: "önümüze engel girdisi gelince DURMAK, ardından
+    yeniden rota planlayıp DEVAM etmek." Bunu §16 mimarisiyle (control offset
+    YOK — H-A; planlayıcı rotayı dubanın etrafından çizer) kilitlenmeden kurar:
+
+      1) STOP fazı — engel commit bandına ilk girdiğinde `pause_s` boyunca
+         GERÇEK 'dur' basar ve her tick reroute talebini (kenar_blok) yeniler.
+         Böylece araç durur, planlayıcı (hedef) yeni rotayı bu duraklamada çizer.
+      2) FOLLOW fazı — bekleme dolunca 'slow'a geçer (talep sürüyor). control
+         yeni rotayı düşük hızda takip eder → dubanın etrafından kıvrılır →
+         engel banttan çıkınca ağaç bu dala uğramaz → default 'normal'.
+
+    KİLİTLENME NOTU: sürekli 'dur' verilseydi control hareket etmez, rerouteu
+    TAKİP edemez, engel merkezde kalır, sonsuza 'dur' olurduk. Bu yüzden 'dur'
+    SINIRLIDIR; sonrası 'slow' ile reroute takibi. En yakında (d_arc<acil)
+    acildurus üst dalda mutlak güvenlik ağıdır (reroute gerçekten başarısızsa).
+
+    Dormant reset: branch `reset_gap_s` boyunca çalışmazsa (engel banttan çıktı)
+    faz "" ye döner → SONRAKİ engelde yeniden tam bir DUR yapılır.
+
+    Her zaman SUCCESS (commit bandındaki engele daima bir tepki üretilir).
     """
 
-    def __init__(self, bb: Blackboard, dur_esik_m: float):
+    RESET_GAP_S = 0.5   # branch bu kadar sessiz kalırsa → yeni karşılaşma (faz sıfırla)
+
+    def __init__(self, bb: Blackboard, pause_s: float):
         super().__init__("RerouteKarar")
         self.bb = bb
-        self.dur_esik_m = float(dur_esik_m)
+        self.pause_s = max(0.0, float(pause_s))
 
     def update(self):
         o = self.bb.obs
@@ -371,6 +383,7 @@ class RerouteKarar(py_trees.behaviour.Behaviour):
         if rng is None or not math.isfinite(rng):
             # Konum yok → reroute talebi AÇMA (yanlış (0,0) blok riski); güvenli slow.
             s.reroute_request = False
+            s.reroute_phase = ""
             self.bb.last_decision = {
                 "karar": "slow", "reason": "engel_reroute_nopos",
                 "phase": "approach", "wait_remaining_s": 0.0,
@@ -382,18 +395,31 @@ class RerouteKarar(py_trees.behaviour.Behaviour):
         s.reroute_cone_world = (ox, oy)
         s.kacis_engel_dunya = (ox, oy)   # trace log sürekliliği (eski alan)
 
-        d = o.engel_d_center
-        if d is not None and math.isfinite(d) and d < self.dur_esik_m:
-            # Güvenlik ağı: reroute saptıramadı veya cone çok yakın → tam dur (blok korunur)
-            self.bb.last_decision = {
-                "karar": "dur", "reason": "engel_blokaj_reroute",
-                "phase": "driving", "wait_remaining_s": 0.0,
-            }
-        else:
-            self.bb.last_decision = {
-                "karar": "slow", "reason": "engel_reroute",
-                "phase": "approach", "wait_remaining_s": 0.0,
-            }
+        now = time.time()
+        # Dormant reset: engel banttan çıkıp geri geldiyse yeni karşılaşma say
+        if s.reroute_last_tick_s <= 0.0 or (now - s.reroute_last_tick_s) > self.RESET_GAP_S:
+            s.reroute_phase = ""
+        s.reroute_last_tick_s = now
+
+        # STOP fazı — ilk girişte başlat, pause_s dolana kadar gerçek dur
+        if s.reroute_phase == "":
+            s.reroute_phase = "stop"
+            s.reroute_stop_start_s = now
+        if s.reroute_phase == "stop":
+            kalan = self.pause_s - (now - s.reroute_stop_start_s)
+            if kalan > 0.0:
+                self.bb.last_decision = {
+                    "karar": "dur", "reason": "engel_dur_reroute",
+                    "phase": "reroute_stop", "wait_remaining_s": kalan,
+                }
+                return Status.SUCCESS
+            s.reroute_phase = "follow"
+
+        # FOLLOW fazı — reroute'u düşük hızda takip et (control yeni rotayı sürer)
+        self.bb.last_decision = {
+            "karar": "slow", "reason": "engel_reroute_follow",
+            "phase": "reroute_follow", "wait_remaining_s": 0.0,
+        }
         return Status.SUCCESS
 
 

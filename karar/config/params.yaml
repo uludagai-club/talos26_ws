@@ -156,6 +156,10 @@ traffic_light:
 timers:
   dur_levhasi_bekleme_s:    3.0
   dur_levhasi_release_grace_s: 1.5  # bekleme bitti, levha hâlâ yakın → bu süre içinde release
+  # Engel DUR→REROUTE→DEVAM: engel commit bandına girince bu kadar sn GERÇEK 'dur'
+  # (planlayıcı replan yapsın), sonra 'slow' ile reroute takibi. 0 → duraklamasız
+  # (eski davranış: doğrudan slow+reroute). Sahada tune edilebilir.
+  engel_dur_reroute_pause_s: 1.5
 
 # Debounce — flicker önleme (tick cinsinden, 10Hz @ 0.1s/tick varsayar)
 debounce:

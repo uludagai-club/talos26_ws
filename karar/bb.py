@@ -115,6 +115,15 @@ class StatePersist:
     reroute_request: bool = False           # bu tick bloklu cone var mı (reroute talebi); node tüketince sıfırlar
     reroute_cone_world: tuple = (0.0, 0.0)  # bloklu cone'un dünya konumu (/hedef_komut kenar_blok için)
 
+    # Engel DUR→REROUTE→DEVAM fazı (RerouteKarar yürütür): engel yolu bloklayınca
+    # önce sınırlı süre gerçek DUR (planlayıcı replan yapsın), sonra reroute'u
+    # takip için SLOW'a geç. "" = boş/yeni karşılaşma | "stop" = duraklama sürüyor
+    # | "follow" = reroute takibi (slow). Branch birkaç tick sessiz kalınca (engel
+    # banttan çıktı) reset_gap ile "" ye döner → sonraki engelde yeniden durulur.
+    reroute_phase: str = ""
+    reroute_stop_start_s: float = 0.0       # "stop" fazının başlangıcı (bekleme ölçümü)
+    reroute_last_tick_s: float = 0.0        # RerouteKarar'ın en son çalıştığı tick (dormant reset)
+
     # Sollama/reroute aynası (yalnız snapshot/log için)
     overtake_active: bool = False
     overtake_return_dist_m: float = 0.0
@@ -166,6 +175,7 @@ class Blackboard:
             "levha": {"isim": o.levha_isim, "d": o.levha_distance, "age_s": _age(o.levha_last_seen)},
             "engel": {
                 "present": o.engel_present,
+                "d_arc":    _fin(o.engel_d_arc),     # ACİL tetiği bunu okur (yay-kapısı)
                 "d_center": _fin(o.engel_d_center),
                 "d_left":   _fin(o.engel_d_left),
                 "d_right":  _fin(o.engel_d_right),

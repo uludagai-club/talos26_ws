@@ -42,10 +42,12 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     # Tüm engel tepki bantları control.py WP_NEAR_DISTANCE referansından
     # ± delta ile türetilir. Bir mesafeyi değiştirmek için: config/params.yaml
     # içindeki ilgili anahtarı düzenle (yoksa buradaki default geçerli).
-    # Bant sırası (yakın → uzak):  acil < dur < block(reroute) < yavasla
+    # Bant sırası (yakın → uzak):  acil < block(reroute) < yavasla
     #   acil    ≈ 1.2 m  → acil durus (emniyetli son çare; e-stop control'de de var)
-    #   dur     ≈ 2.0 m  → reroute saptıramadı/cone çok yakın → tam dur (güvenlik ağı)
-    #   block   ≈ 6.0 m  → cone REROUTE tetiği: 'slow' + hedef'e kenar_blok (§16 E-A/E-B)
+    #   block   ≈ 6.0 m  → cone REROUTE tetiği (§16 E-A/E-B): RerouteKarar DUR→takip
+    #                      FSM'i → önce GERÇEK 'dur' (engel_dur_reroute_pause_s;
+    #                      planlayıcı replan yapsın) + hedef'e kenar_blok, sonra
+    #                      'slow' ile reroute takibi. (Kullanıcı: dur→planla→devam.)
     #   yavasla ≈ 9.0 m  → en dış: tepki başlar, yavaşla (reroute talebi yok, sadece yaklaş)
     # MİMARİ (§16/§12.13): cone artık sol/sag direksiyon manevrasıyla DEĞİL,
     #   planlayıcının (hedef) rotayı dubanın etrafından çizmesiyle geçilir. Karar
@@ -60,7 +62,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     wp_near        = float(wp.get("control_wp_near_m",     1.5))   # = control.py WP_NEAR_DISTANCE (senkron tut!)
 
     engel_acil_m      = max(0.3, wp_near + float(wp.get("engel_acil_delta_m",    -0.3)))  # acil durus
-    engel_dur_m       =          wp_near + float(wp.get("engel_dur_delta_m",      0.5))   # reroute saptıramazsa dur (güvenlik ağı)
+    engel_dur_m       =          wp_near + float(wp.get("engel_dur_delta_m",      0.5))   # (bilgi amaçlı: DUR artık mesafe eşiğiyle değil RerouteKarar bekleme fazıyla)
     engel_block_m     =          wp_near + float(wp.get("engel_block_delta_m",    4.5))   # cone REROUTE commit (§12.12: →6.0m)
     engel_yavasla_m   =          wp_near + float(wp.get("engel_yavasla_delta_m",  7.5))   # en dış: yavasla (→9.0m)
     # NOT: kacis_deadband/varsayilan_yon/wp_hyst/engel_yan_clear_m artık kullanılmıyor
@@ -202,9 +204,10 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     #    rerouteu ile geçiliyor → karar yalnız 'slow'/'dur'; control rerouted rotayı
     #    düz takip eder (H-A). acildurus/dur safety-net üstte+RerouteKarar içinde.
     # ============================================================
+    engel_reroute_pause_s = float(timer.get("engel_dur_reroute_pause_s", 1.5))
     road_reroute = Sequence("RoadReroute", memory=False, children=[
         EngelMerkezBlokaj(bb, engel_block_m),                 # commit (reroute) bandında mı?
-        RerouteKarar(bb, dur_esik_m=engel_dur_m),             # slow + kenar_blok talebi (≤dur → dur)
+        RerouteKarar(bb, pause_s=engel_reroute_pause_s),      # DUR(pause) → reroute → slow-takip
     ])
     engel_yavasla = SetKarar("Karar=SLOW(engel)", bb, karar="slow",
                              reason="engel_yavasla", phase="approach")
