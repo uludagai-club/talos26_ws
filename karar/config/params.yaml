@@ -104,7 +104,16 @@ wp_planlama:
 #  direksiyonla değil rotayla geçiliyor, §12.13 H-A.)
 reroute:
   enabled:             true
-  block_radius_m:      1.0    # hedef'e bildirilen cone blok yarıçapı (m)
+  block_radius_m:      1.5    # hedef'e bildirilen cone blok yarıçapı (m).
+                             # 2026-07-22: 1.0 → 1.5. hedef bunu max(r, BLOK_YARICAP_M=1.0)
+                             # ile kullanır → merkez-çizgiden ~1.5m yanaldaki koni de
+                             # "rota üstünde" sayılıp bloklanır+reroute edilir. 1.0'da
+                             # 1–1.6m yanal koni "rota dışı" sanılıp HİÇ bloklanmıyordu
+                             # (hedef bloklu_kenar=0) → araç koniye ~1m dayanıp acil-duruş
+                             # + statik-dur flip-flop (canlı 20260722T194924Z: 92 recalc'ın
+                             # 67'si). Koridor payı = araç gövde yarı-gen ~0.75m'e yakın;
+                             # karşı şerit (~2m) hâlâ ayrımda. Büyütürsen daha erken reroute
+                             # ama yoğun koni kümesinde fazla kenar silip fallback riski artar.
   max_s:              15.0    # reroute zaman aşımı → fallback kenar_serbest (susmasın)
   refresh_s:           1.0    # aktif kenar_blok'u bu periyotla tazele (geç abone yakalasın)
   release_clear_ticks: 5      # cone N tick (~0.5s @10Hz) bloklamıyorsa → kenar_serbest
