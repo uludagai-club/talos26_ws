@@ -438,10 +438,11 @@ def run_scenarios():
     assert_reroute("S18")
 
     # -----------------------------------------------------------------
-    # S19: Yüksek hızda yaya 5m → hız eşiği genişler → erken DUR
-    #      (taban dur eşiği 4.0m; 5m normalde 'slow' olurdu)
+    # S19: yaya 5m → minimal dur. FSM hız-adaptif DEĞİL; 5m < yaya_dur_m(7) →
+    #      holding → yaya_gecidi_min_dur (kapı levha ile açık). (2026-07-23:
+    #      yaya_dur_m 4→7 saha fix'iyle 5m artık dur bandında.)
     # -----------------------------------------------------------------
-    print("\nS19: 30km/h'de yaya 5m → erken dur")
+    print("\nS19: yaya 5m (<dur 7m) → minimal dur")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     arm_yaya_levha(bb)
@@ -453,10 +454,11 @@ def run_scenarios():
     assert_karar("S19", "dur")
 
     # -----------------------------------------------------------------
-    # S20: Aynı 5m ama ODOM BAYAT → hız 0 sayılır → taban eşik → slow
-    #      (güvenli fallback: hızı bilmiyorsak eşik büyütme)
+    # S20: yaya 5m, ODOM BAYAT → FSM mesafe-tabanlı (hız/odom'a bakmaz) → yine
+    #      5m < yaya_dur_m(7) → dur. Eski hız-adaptif "taban eşik→slow" davranışı
+    #      FSM'e geçişte kalktı; artık odom tazeliği yaya duruşunu etkilemez.
     # -----------------------------------------------------------------
-    print("\nS20: yaya 5m ama odom bayat → taban eşik → slow")
+    print("\nS20: yaya 5m, odom bayat → FSM mesafe-tabanlı → dur")
     bb.obs.__init__(); bb.state.__init__()
     bb.obs.yaya_present = True
     bb.obs.yaya_distance = 5.0
@@ -466,7 +468,7 @@ def run_scenarios():
         arm_yaya_levha(bb)                          # levha taze → kapı açık (odom bayat olsa da silahlanır)
         bb.obs.odom_last_seen = time.time() - 5.0  # odom bayat
         tree.tick()
-    assert_karar("S20", "slow")
+    assert_karar("S20", "dur")
 
     # -----------------------------------------------------------------
     # S21: YENI detektör (PoseArray) — cone commit bandına ilk giriş → DUR + reroute

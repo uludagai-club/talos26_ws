@@ -59,9 +59,15 @@ freshness:
 # Mesafe eşikleri (metre) — eski karar.py ile uyumlu başlangıç.
 # NOT: Yaya ve engel için ayrı acil eşik; eski karar.py yalnız yayaya bakıyordu.
 distances:
-  yaya_acil_durus_m: 2.0   # eski MESAFE_ACIL_DURUS
-  yaya_dur_m:        4.0
-  yaya_yavas_m:     12.0
+  yaya_acil_durus_m: 2.0   # eski MESAFE_ACIL_DURUS (acil dalı; FSM'den AYRI)
+  # Geçit çizgisi DURUŞ (holding→min_bekleme) eşiği — YayaGecidiFSM okur.
+  # 2026-07-23 saha bulgusu: crosswalk çizgi modeli bbox-proxy ile geçidi ~6.5m'de
+  # okuyor ve tam geçitte tespiti düşüyor; eski 4m'ye HİÇ inmiyordu → minimal zorunlu
+  # duruş tetiklenmiyordu. 7m: çizgi ~6.5m'de görülünce holding'e girip min duruşu yapar
+  # (isik_oku_m / tabela arm 45m ile aynı proxy-gerçekçi mantık). Bedeli: geçidin biraz
+  # önünde durur (proxy zaten <4m ölçemiyor). Gerçek çözüm ZED derinliği/çizgi recall.
+  yaya_dur_m:        7.0
+  yaya_yavas_m:     12.0    # yaklaşma (slow) üst bandı; dur(7)↔yavas(12) arası slow
   engel_acil_m:      0.7   # (ARTIK wp_planlama'dan türetiliyor — geri uyum için duruyor)
   engel_block_m:     2.0   # (ARTIK wp_planlama'dan türetiliyor — geri uyum için duruyor)
   engel_yan_clear_m: 3.0   # yan sektörde bu kadar boşluk varsa lane change makul
