@@ -522,8 +522,13 @@ class YayaLevhaKapisi(py_trees.behaviour.Behaviour):
     geçidi tabelası) görülünce kapı AÇILIR; kapı kapalıyken çizgi modeli TÜMDEN
     yok sayılır (bu node FAILURE döner → pedestrian sequence düşer).
 
+    `arm_menzil_m` GENİŞ tutulur (~45m): geçit tabelası geçidi UZAKTAN duyurur (saha
+    2026-07-23: tabela 41–49m'de görülüyordu; dar 10m yüzünden kapı açılmıyor, araç
+    gerçek zebradan geçiyordu). DURUŞ mesafesini çizgi FSM'i (yaya_dur_m/yaya_yavas_m)
+    belirler; bu değer yalnız "geçit duyuruldu → çizgiye güven" kapısını açar.
+
     Kapı YAŞAM DÖNGÜSÜ (kullanıcı: "release olunca kapansın, levhayı geçince de"):
-      • AÇ   — levha taze + `arm_menzil_m` içinde görülünce. Yeni epizot: çizgi
+      • AÇ   — tabela taze + `arm_menzil_m` içinde görülünce. Yeni epizot: çizgi
                FSM'i sıfırlanır (takılı 'released' fazı yeni geçidi bloklamasın).
       • KAPAN— (a) çizgi FSM 'released' oldu (geçit işlendi), VEYA
                (b) levha geçildi (dünya-çapası `pass_behind_m` gerisinde), VEYA

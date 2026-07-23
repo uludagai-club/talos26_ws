@@ -92,6 +92,15 @@ kapi = make_kapi(); bb = kapi.bb
 set_levha(bb, d=15.0); set_odom(bb)
 check("menzil dışı → FAILURE", kapi.update() == Status.FAILURE)
 
+print("== UZAK TABELA: 42m, arm_menzil=45 → açılır (saha fix); dar 10 kapı → açılmaz ==")
+_clock.t = 1230.0
+kapi = make_kapi(arm_menzil_m=45.0); bb = kapi.bb   # yaya_gecidi.levha_arm_menzil_m
+set_levha(bb, d=42.0); set_odom(bb)
+check("42m < 45m → arm (geçit duyuruldu)", kapi.update() == Status.SUCCESS and bb.state.yaya_kapi_armed)
+kapi2 = make_kapi(arm_menzil_m=10.0); bb2 = kapi2.bb
+set_levha(bb2, d=42.0); set_odom(bb2)
+check("42m > 10m dar kapı → açılmaz", kapi2.update() == Status.FAILURE and not bb2.state.yaya_kapi_armed)
+
 print("== levha bayat → açılmaz ==")
 _clock.t = 1300.0
 kapi = make_kapi(); bb = kapi.bb
