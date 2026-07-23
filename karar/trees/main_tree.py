@@ -155,10 +155,11 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         arm_max_s=float(yg.get("levha_arm_max_s", 30.0)),
         grace_s=float(yg.get("levha_kapi_grace_s", 5.0)),
     )
+    # NOT: YayaFresh/YayaVarMi sequence'ten ÇIKARILDI — minimal duruş (holding)
+    # çizgi 1-tick düşse de sürmeli (SUSTAIN-HOLDING). Çizgi tazelik/present artık
+    # FSM İÇİNDE (yaya_max_age_s); kapı armed olduğu sürece FSM ticklenir.
     pedestrian = Sequence("YayaGecidi", memory=False, children=[
-        yaya_levha_kapisi,   # levha görülmedikçe çizgi modeli dinlenmez
-        YayaFresh(bb, fresh["yaya_max_age_s"]),
-        YayaVarMi(bb),
+        yaya_levha_kapisi,   # levha görülmedikçe çizgi modeli dinlenmez (kapı)
         YayaGecidiFSM(
             bb,
             dur_esik_m=dist["yaya_dur_m"],
@@ -167,6 +168,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
             max_bekleme_s=float(yg.get("max_bekleme_s", 20.0)),
             engel_bekle_m=float(yg.get("engel_bekle_m", 8.0)),
             release_grace_s=float(yg.get("release_grace_s", 8.0)),
+            yaya_max_age_s=fresh["yaya_max_age_s"],
         ),
     ])
 

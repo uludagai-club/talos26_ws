@@ -399,13 +399,23 @@ class YayaGecidiFSM(py_trees.behaviour.Behaviour):
     (Görüntü-işleme ekibi 'object' sınıfını çözene dek — sonra bu FSM engel
     yerine gerçek yaya tespitini okuyacak şekilde daraltılır.)
 
-    Fazlar (DurLevhasiFSM kalıbı):
-      - APPROACH (yavas_esik ≥ mesafe > dur_esik): "slow"
-      - HOLDING (mesafe < dur_esik): "dur"
+    SUSTAIN-HOLDING (2026-07-23, kullanıcı isteği): minimal zorunlu duruş bir kez
+    başlayınca ÇİZGİ DÜŞSE DE `min_bekleme_s` tamamlanır — crosswalk modeli tam
+    geçitte tespiti düşürdüğü için (cizgi:none flicker) eski yapıda 1-tick sonra
+    duruş kesiliyordu. Bunun için bu dal artık sequence'te YayaFresh/YayaVarMi'ye
+    bağlı DEĞİL; çizgi tazelik/present kontrolü FSM İÇİNDE (yaya_max_age_s) ve yalnız
+    idle→tetik + approach için kullanılır. Kapı (YayaLevhaKapisi) armed olduğu sürece
+    FSM her tick ticklenir; holding zamanlayıcıyla sürer.
+
+    Fazlar:
+      - IDLE→tetik: çizgi taze+present ise; mesafe < dur_esik → HOLDING, dur_esik ≤
+        mesafe ≤ yavas_esik → "slow" (approach). Çizgi yoksa FAILURE (cruise).
+      - HOLDING (çizgiden bağımsız sürer): "dur"
           • gecen < min_bekleme_s                    → zorunlu duruş
           • min doldu + lidar engel (yaya) var       → max_bekleme_s'e dek bekle
           • temiz VEYA max doldu                      → RELEASED
-      - RELEASED: FAILURE (üst selector ilerlesin). Geçit görüşten çıkınca idle.
+      - RELEASED: FAILURE. Kapı-enable ise gate kapanır (yeni tabelada idle reset);
+        kapı-disable ise çizgi gidince idle'a döner (yeniden silahlanma).
 
     Kilitlenme önlemi (eski bug): mesafe geçidin ÜSTÜNDE ~0.6m'de donuyor ve hiç
     büyümüyordu → sonsuz 'dur'. Çözüm: (a) RELEASED mesafeyle değil zamanla/engelle
@@ -417,7 +427,7 @@ class YayaGecidiFSM(py_trees.behaviour.Behaviour):
 
     def __init__(self, bb: Blackboard, dur_esik_m: float, yavas_esik_m: float,
                  min_bekleme_s: float, max_bekleme_s: float, engel_bekle_m: float,
-                 release_grace_s: float):
+                 release_grace_s: float, yaya_max_age_s: float = 0.6):
         super().__init__("YayaGecidiFSM")
         self.bb = bb
         self.dur_esik_m = dur_esik_m
@@ -426,6 +436,11 @@ class YayaGecidiFSM(py_trees.behaviour.Behaviour):
         self.max_bekleme_s = max_bekleme_s
         self.engel_bekle_m = engel_bekle_m
         self.release_grace_s = release_grace_s
+        self.yaya_max_age_s = float(yaya_max_age_s)
+
+    @staticmethod
+    def _fresh(last_seen: float, max_age_s: float) -> bool:
+        return last_seen > 0.0 and (time.time() - last_seen) <= max_age_s
 
     def _yaya_engeli_var(self) -> bool:
         """Geçit bölgesinde lidar engeli (yaya proxy'si) var mı? Merkez sektörde
@@ -450,63 +465,70 @@ class YayaGecidiFSM(py_trees.behaviour.Behaviour):
     def update(self):
         o = self.bb.obs
         s = self.bb.state
-
-        # Yeniden silahlanma: geçit görünmüyorsa idle. Yalnız present sinyali —
-        # mesafe yakında güvenilmez (0.6↔17.2 flip); mesafe eşiği KULLANILMAZ.
-        if (not o.yaya_present) or (o.yaya_distance < 0):
-            if s.yaya_gecidi_phase != "idle":
-                s.yaya_gecidi_phase = "idle"
-            return Status.FAILURE
-
+        now = time.time()
         d = o.yaya_distance
+        # Çizgi (crosswalk LINE) taze + present mi (freshness FSM içinde — bu dal
+        # artık sequence'te YayaFresh/YayaVarMi'ye bağlı DEĞİL, çünkü holding çizgi
+        # düşse de sürmeli). Kapı (YayaLevhaKapisi) armed olduğu sürece FSM ticklenir.
+        line = (o.yaya_present and d is not None and d > 0
+                and self._fresh(o.yaya_last_seen, self.yaya_max_age_s))
 
-        # APPROACH / tetik
-        if s.yaya_gecidi_phase == "idle":
-            # Release grace: yeni geçilen geçidin çift tetiklenmesini önle
-            if (self.release_grace_s > 0.0 and s.yaya_gecidi_released_s > 0.0
-                    and (time.time() - s.yaya_gecidi_released_s) < self.release_grace_s):
-                return Status.FAILURE
-            if d < self.dur_esik_m:
-                s.yaya_gecidi_phase = "holding"
-                s.yaya_gecidi_hold_start_s = time.time()
-            elif d <= self.yavas_esik_m:
-                self.bb.last_decision = {
-                    "karar": "slow",
-                    "reason": "yaya_gecidi_yaklasma",
-                    "phase": "approach",
-                    "wait_remaining_s": 0.0,
-                }
-                return Status.SUCCESS
-            else:
-                return Status.FAILURE
-
-        # HOLDING
+        # ============================================================
+        # HOLDING — minimal duruş ÇİZGİDEN BAĞIMSIZ sürer. Kullanıcı isteği:
+        # "geçit varken engel olmasa bile minimal dur." Çizgi 1-tick flicker'ı
+        # (crosswalk modeli tam geçitte tespiti düşürüyor) 3s duruşu BÖLMEZ; duruş
+        # kapı-armed + zamanlayıcıyla sürer. Araç durunca kapı da armed kalır
+        # (tabela çapası geçilmez, FSM release olmaz).
+        # ============================================================
         if s.yaya_gecidi_phase == "holding":
-            gecen = time.time() - s.yaya_gecidi_hold_start_s
-            # 1) Minimal zorunlu duruş (yaya olsun olmasın)
-            if gecen < self.min_bekleme_s:
+            gecen = now - s.yaya_gecidi_hold_start_s
+            if gecen < self.min_bekleme_s:                     # 1) zorunlu min duruş
                 self.bb.last_decision = {
-                    "karar": "dur",
-                    "reason": "yaya_gecidi_min_dur",
+                    "karar": "dur", "reason": "yaya_gecidi_min_dur",
                     "phase": "waiting_at_crosswalk",
                     "wait_remaining_s": max(0.0, self.min_bekleme_s - gecen),
                 }
                 return Status.SUCCESS
-            # 2) Min doldu — geçitte yaya (lidar engel) varsa max'a kadar bekle
-            if self._yaya_engeli_var() and gecen < self.max_bekleme_s:
+            if self._yaya_engeli_var() and gecen < self.max_bekleme_s:  # 2) yaya (lidar) → bekle
                 self.bb.last_decision = {
-                    "karar": "dur",
-                    "reason": "yaya_gecidi_yaya_bekle",
+                    "karar": "dur", "reason": "yaya_gecidi_yaya_bekle",
                     "phase": "waiting_at_crosswalk",
                     "wait_remaining_s": max(0.0, self.max_bekleme_s - gecen),
                 }
                 return Status.SUCCESS
-            # 3) Temiz veya max doldu → devam et
-            s.yaya_gecidi_phase = "released"
-            s.yaya_gecidi_released_s = time.time()
+            s.yaya_gecidi_phase = "released"                   # 3) temiz/max → devam
+            s.yaya_gecidi_released_s = now
+            return Status.FAILURE
 
-        # RELEASED: bu tick karar üretme; üst selector ilerlesin (geçit görüşten
-        # çıkınca yukarıdaki present kapısı idle'a sıfırlar).
+        # RELEASED — bu tick karar yok. Kapı ENABLE ise gate release'i görüp kapanır
+        # (yeni tabelada idle'a resetler). Kapı DEVRE DIŞI (pass-through) ise çizgi
+        # gidince burada idle'a döneriz (yeniden silahlanma).
+        if s.yaya_gecidi_phase == "released":
+            if not line:
+                s.yaya_gecidi_phase = "idle"
+            return Status.FAILURE
+
+        # IDLE — çizgi ile tetik
+        if (self.release_grace_s > 0.0 and s.yaya_gecidi_released_s > 0.0
+                and (now - s.yaya_gecidi_released_s) < self.release_grace_s):
+            return Status.FAILURE
+        if not line:
+            return Status.FAILURE   # kapı açık ama çizgi henüz yok → cruise
+        if d < self.dur_esik_m:
+            s.yaya_gecidi_phase = "holding"
+            s.yaya_gecidi_hold_start_s = now
+            self.bb.last_decision = {
+                "karar": "dur", "reason": "yaya_gecidi_min_dur",
+                "phase": "waiting_at_crosswalk",
+                "wait_remaining_s": self.min_bekleme_s,
+            }
+            return Status.SUCCESS
+        if d <= self.yavas_esik_m:
+            self.bb.last_decision = {
+                "karar": "slow", "reason": "yaya_gecidi_yaklasma",
+                "phase": "approach", "wait_remaining_s": 0.0,
+            }
+            return Status.SUCCESS
         return Status.FAILURE
 
 

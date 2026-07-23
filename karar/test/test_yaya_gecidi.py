@@ -54,13 +54,14 @@ def make_fsm():
     return YayaGecidiFSM(
         Blackboard(), dur_esik_m=4.0, yavas_esik_m=12.0,
         min_bekleme_s=3.0, max_bekleme_s=20.0, engel_bekle_m=8.0,
-        release_grace_s=8.0,
+        release_grace_s=8.0, yaya_max_age_s=0.6,
     )
 
 
 def set_gecit(bb, present=True, d=3.0):
     bb.obs.yaya_present = present
     bb.obs.yaya_distance = d
+    bb.obs.yaya_last_seen = _clock.t if present else 0.0   # çizgi tazeliği (FSM içi)
 
 
 def set_engel(bb, present=False, d=99.0):
@@ -175,6 +176,26 @@ check("present yok → idle", bb.state.yaya_gecidi_phase == "idle")
 set_gecit(bb, d=3.0); set_engel(bb, present=False)  # YENİ geçit
 st = fsm.update()
 check("yeni geçit → yeniden holding", bb.state.yaya_gecidi_phase == "holding" and st == Status.SUCCESS)
+
+
+print("== SUSTAIN: holding'de ÇİZGİ DÜŞSE DE min duruş sürer (engelsiz garanti) ==")
+_clock.t = 5000.0
+fsm = make_fsm(); bb = fsm.bb
+set_gecit(bb, d=3.0); set_engel(bb, present=False)
+fsm.update()                          # idle→holding → dur
+check("holding başladı", bb.state.yaya_gecidi_phase == "holding")
+_clock.ilerle(1.0)
+set_gecit(bb, present=False)          # ÇİZGİ DÜŞTÜ (crosswalk tespiti gitti)
+st = fsm.update()
+check("çizgi yok ama hâlâ dur", st == Status.SUCCESS
+      and bb.last_decision["karar"] == "dur"
+      and bb.last_decision["reason"] == "yaya_gecidi_min_dur", bb.last_decision)
+check("holding korundu (çizgi flicker'ı bölmedi)", bb.state.yaya_gecidi_phase == "holding")
+_clock.ilerle(2.5)                    # toplam 3.5s > min(3); çizgi yok, engel yok
+set_gecit(bb, present=False); set_engel(bb, present=False)
+st = fsm.update()
+check("min doldu (çizgi yokken) → released", st == Status.FAILURE
+      and bb.state.yaya_gecidi_phase == "released")
 
 
 if failures:
