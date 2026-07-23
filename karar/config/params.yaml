@@ -161,6 +161,14 @@ traffic_light:
   # KTR §7.5.5 "kırmızı veya sarı → tam dur" için "dur" yapılabilir. NOT: kırmızıdan
   # SONRA görülen sarı bundan BAĞIMSIZDIR → her zaman 'slow' (yeşile yavaştan hazırlan).
   yellow_action: slow
+  # IŞIK TEPKİ MESAFESİ (2026-07-23 saha bulgusu): trafik ışığı FSM'i bu mesafe
+  # içinde çalışır. AYRI tutulur çünkü ışık, DUR/yön levhalarından ÇOK daha uzakta
+  # aksiyon ister: saha ZED2 kaydında gerçek kırmızı ışık bbox-proxy ile 33–40 m'de
+  # görülüyordu; eski değer (levha_oku_m=10 m) yüzünden ışık FSM'i HİÇ tetiklenmiyordu
+  # (araç kırmızıya tepki vermeden geçerdi). 40 m: kırmızıya ~35 m'de 'dur' başlar,
+  # yeşilde bırakır. UYARI: monoküler MESAFE_K/bbox_h proxy'si yakını ölçemiyor
+  # (~14–33 m'de doyuyor) → gerçek çözüm ZED derinliği; bu değer köprü. Sahada tune et.
+  isik_oku_m: 40.0
   # Işık release grace'i (2026-07-23): KIRMIZI → YEŞİLE kadar 'dur' (zaman-sınırı
   # yok); SARI → 'slow'. Son aksiyon-alan ışık bu süre boyunca TUTULUR → kısa algı
   # flicker'ı (levha 1-tick NONE) kararı bozmaz (kırmızıda öne seğirme / sarıda gaz

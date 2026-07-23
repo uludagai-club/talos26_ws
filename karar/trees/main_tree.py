@@ -191,12 +191,15 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     # SARI → 'slow' (kırmızıdan sonra = yeşile YAVAŞTAN HAZIRLAN; yaklaşırken =
     # yellow_action politikası); YEŞİL/ışık yok → geç. Son ışık release_grace_s
     # tutulur → kısa algı flicker'ında öne seğirmez / gaz kesmez. §7.5.5.
+    # oku_esik = isik_oku_m (AYRI, ~40m): ışık levhalardan çok daha uzakta aksiyon
+    # ister; saha bulgusu (2026-07-23) kırmızıyı 33–40m'de gördü, eski 10m hiç
+    # tetiklemiyordu. Diğer levhalar hâlâ dar levha_oku_m'de.
     _tl = p.get("traffic_light", {}) or {}
     traffic_light = Sequence("TrafficLight", memory=False, children=[
         LevhaFresh(bb, fresh["levha_max_age_s"]),
         TrafikIsigiFSM(
             bb,
-            oku_esik_m=dist["levha_oku_m"],
+            oku_esik_m=float(_tl.get("isik_oku_m", 40.0)),
             release_grace_s=float(_tl.get("kirmizi_release_grace_s", 2.0)),
             yellow_action=str(_tl.get("yellow_action", "slow")),
         ),

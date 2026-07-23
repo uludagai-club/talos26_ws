@@ -82,6 +82,16 @@ fsm = make_fsm(oku_esik_m=10.0); bb = fsm.bb
 set_levha(bb, "KIRMIZI", 15.0)
 check("menzil dışı → FAILURE", fsm.update() == Status.FAILURE)
 
+print("== IŞIK TEPKİ MESAFESİ: kırmızı 35m, isik_oku_m=40 → dur (saha fix) ==")
+_clock.t = 1250.0
+fsm = make_fsm(oku_esik_m=40.0); bb = fsm.bb   # traffic_light.isik_oku_m
+set_levha(bb, "KIRMIZI", 35.0)
+st = fsm.update()
+check("35m < 40m kapı → dur", st == Status.SUCCESS and karar(bb) == ("dur", "trafik_kirmizi"), bb.last_decision)
+fsm2 = make_fsm(oku_esik_m=10.0); bb2 = fsm2.bb   # dar levha kapısı → ışık tetiklemez
+set_levha(bb2, "KIRMIZI", 35.0)
+check("35m > 10m dar kapı → FAILURE", fsm2.update() == Status.FAILURE)
+
 print("== KIRMIZI → YEŞİL → anında geç ==")
 _clock.t = 1300.0
 fsm = make_fsm(); bb = fsm.bb

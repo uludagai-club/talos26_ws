@@ -302,6 +302,10 @@ class TrafikIsigiFSM(py_trees.behaviour.Behaviour):
     (kırmızıda geçme). 2026-07-23: algı lamba_kirmizi→KIRMIZI, lamba_sari→YAVAS,
     lamba_yesil→YESIL verir; bu FSM üçünü tek yerde sürer.
 
+    `oku_esik_m` = IŞIK tepki mesafesi (traffic_light.isik_oku_m, ~40m) — DUR/yön
+    levhalarının dar `levha_oku_m`'inden AYRI ve GENİŞ: ışık çok daha uzakta aksiyon
+    ister (saha 2026-07-23: kırmızı 33–40m'de görülüyor, 10m hiç tetiklemiyordu).
+
     Renkler (algı okuma menzili `oku_esik_m` içinde):
       • KIRMIZI → 'dur' (yeşile kadar; zaman-sınırlı DEĞİL)
       • YAVAS (sarı) → 'slow':
