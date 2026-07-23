@@ -291,6 +291,97 @@ class DurLevhasiFSM(py_trees.behaviour.Behaviour):
 
 
 # ============================================================
+# Trafik ışığı FSM (KIRMIZI → yeşile kadar DUR; DUR levhasından AYRI)
+# ============================================================
+class TrafikIsigiFSM(py_trees.behaviour.Behaviour):
+    """Trafik ışığı kararı — KIRMIZI/SARI/YEŞİL birleşik, DUR levhasından AYRI.
+
+    DUR levhası (DurLevhasiFSM) zaman-sınırlı bir duruştur: 3 sn bekle → devam.
+    Trafik ışığı KOŞULLUDUR: renk döngüsüne göre sürülür. Eskiden algı kırmızıyı
+    'DUR'a mapliyordu → kırmızı DUR levhası FSM'ine düşüp 3 sn sonra KALKIYORDU
+    (kırmızıda geçme). 2026-07-23: algı lamba_kirmizi→KIRMIZI, lamba_sari→YAVAS,
+    lamba_yesil→YESIL verir; bu FSM üçünü tek yerde sürer.
+
+    Renkler (algı okuma menzili `oku_esik_m` içinde):
+      • KIRMIZI → 'dur' (yeşile kadar; zaman-sınırlı DEĞİL)
+      • YAVAS (sarı) → 'slow':
+          - kırmızıdan SONRA görülen sarı → yeşile YAVAŞTAN HAZIRLAN (her zaman
+            slow; kullanıcı isteği 2026-07-23) → reason 'trafik_sari_hazir'
+          - yaklaşırken (kırmızısız) sarı → `yellow_action` (slow|dur, KTR §7.5.5)
+            → reason 'trafik_sari'
+      • YESIL / ışık yok → FAILURE (geç; üst selector alt dallara iner)
+
+    Son aksiyon-alan ışık (KIRMIZI/YAVAS) `release_grace_s` boyunca TUTULUR → kısa
+    algı flicker'ı (levha 1-tick NONE) kararı bozmaz (kırmızıda öne seğirme /
+    sarıda gaz kesme yok). Model YEŞİL sınıfı vermiyorsa: ışık grace boyunca hiç
+    görülmeyince 'geçildi' sayılıp geçilir (süre-fallback).
+
+    Güvenlik: emergency/yaya geçidi/DUR levhası bu dalın ÜSTÜNDE → onlar önceliklidir.
+    Perception ölürse (LevhaFresh FAIL) dal düşer; alt dallar + emergency güvenlik ağı.
+    """
+
+    def __init__(self, bb: Blackboard, oku_esik_m: float, release_grace_s: float,
+                 yellow_action: str = "slow"):
+        super().__init__("TrafikIsigiFSM")
+        self.bb = bb
+        self.oku_esik_m = float(oku_esik_m)
+        self.release_grace_s = float(release_grace_s)
+        ya = str(yellow_action).lower()
+        self.yellow_action = ya if ya in ("slow", "dur") else "slow"
+
+    def update(self):
+        o = self.bb.obs
+        s = self.bb.state
+        now = time.time()
+        isim = o.levha_isim
+        in_range = (o.levha_distance is not None
+                    and 0.0 < o.levha_distance <= self.oku_esik_m)
+
+        # YEŞİL pozitif → ışık bitti, geç (anında; üst selector ilerlesin)
+        if isim == "YESIL":
+            s.trafik_isik_last_light = ""
+            s.trafik_isik_hazir = False
+            return Status.FAILURE
+
+        if isim in ("KIRMIZI", "YAVAS") and in_range:
+            prev = s.trafik_isik_last_light
+            if isim == "YAVAS" and prev == "KIRMIZI":
+                s.trafik_isik_hazir = True    # kırmızı→sarı → yeşile hazırlan
+            elif isim == "KIRMIZI":
+                s.trafik_isik_hazir = False
+            s.trafik_isik_last_light = isim
+            s.trafik_isik_last_s = now
+        elif s.trafik_isik_last_light:
+            # Aksiyon-alan ışık şu an görünmüyor → grace içinde TUT, sonra temizle
+            if (now - s.trafik_isik_last_s) >= self.release_grace_s:
+                s.trafik_isik_last_light = ""
+                s.trafik_isik_hazir = False
+
+        if s.trafik_isik_last_light == "KIRMIZI":
+            self.bb.last_decision = {
+                "karar": "dur",
+                "reason": "trafik_kirmizi",
+                "phase": "waiting_red_light",
+                "wait_remaining_s": 0.0,
+            }
+            return Status.SUCCESS
+        if s.trafik_isik_last_light == "YAVAS":
+            if s.trafik_isik_hazir:
+                karar, reason = "slow", "trafik_sari_hazir"   # yeşile yavaştan hazırlan
+            else:
+                karar, reason = self.yellow_action, "trafik_sari"
+            self.bb.last_decision = {
+                "karar": karar,
+                "reason": reason,
+                "phase": "approach",
+                "wait_remaining_s": 0.0,
+            }
+            return Status.SUCCESS
+
+        return Status.FAILURE   # ışık yok / yeşil → üst selector diğer dallara
+
+
+# ============================================================
 # Yaya geçidi FSM (min zorunlu duruş + lidar engel ile yaya-bekleme)
 # ============================================================
 class YayaGecidiFSM(py_trees.behaviour.Behaviour):
@@ -413,6 +504,112 @@ class YayaGecidiFSM(py_trees.behaviour.Behaviour):
         # RELEASED: bu tick karar üretme; üst selector ilerlesin (geçit görüşten
         # çıkınca yukarıdaki present kapısı idle'a sıfırlar).
         return Status.FAILURE
+
+
+# ============================================================
+# Yaya geçidi LEVHA-KAPISI (çizgi modeline yalnız levha görülünce güven)
+# ============================================================
+class YayaLevhaKapisi(py_trees.behaviour.Behaviour):
+    """Yaya geçidi kararı için ÖN-KAPI: adanmış çizgi modeline (/yaya_gecidi/model)
+    yalnız yaya geçidi LEVHASI (/yaya_gecidi, levha modeli) görülmüşse güvenilir.
+
+    NEDEN: Çizgi modeli geçit çizgisini ŞERİT çizgisiyle karıştırabiliyor →
+    levhasız sahte 'crosswalk' → gereksiz duruş. Levha (yol kenarındaki yaya
+    geçidi tabelası) görülünce kapı AÇILIR; kapı kapalıyken çizgi modeli TÜMDEN
+    yok sayılır (bu node FAILURE döner → pedestrian sequence düşer).
+
+    Kapı YAŞAM DÖNGÜSÜ (kullanıcı: "release olunca kapansın, levhayı geçince de"):
+      • AÇ   — levha taze + `arm_menzil_m` içinde görülünce. Yeni epizot: çizgi
+               FSM'i sıfırlanır (takılı 'released' fazı yeni geçidi bloklamasın).
+      • KAPAN— (a) çizgi FSM 'released' oldu (geçit işlendi), VEYA
+               (b) levha geçildi (dünya-çapası `pass_behind_m` gerisinde), VEYA
+               (c) fail-safe: kapı `arm_max_s`'ten uzun açık kaldı.
+      • grace— kapandıktan sonra `grace_s` boyunca yeniden silahlanmaz (aynı
+               levhanın algı titremesiyle kapıyı flip-flop yapmasını önler).
+
+    `enabled=False` → pass-through (daima SUCCESS): eski davranış (çizgiye hep güven).
+    Dünya-çapası/geçildi tespiti taze odom ister; odom yoksa kapı yalnız release
+    ve fail-safe TTL ile kapanır (geçit işleyişi odomdan bağımsız sürer).
+    """
+
+    def __init__(self, bb: Blackboard, enabled: bool, levha_max_age_s: float,
+                 odom_max_age_s: float, arm_menzil_m: float, pass_behind_m: float,
+                 arm_max_s: float, grace_s: float):
+        super().__init__("YayaLevhaKapisi")
+        self.bb = bb
+        self.enabled = bool(enabled)
+        self.levha_max_age_s = float(levha_max_age_s)
+        self.odom_max_age_s = float(odom_max_age_s)
+        self.arm_menzil_m = float(arm_menzil_m)
+        self.pass_behind_m = float(pass_behind_m)
+        self.arm_max_s = float(arm_max_s)
+        self.grace_s = float(grace_s)
+
+    @staticmethod
+    def _fresh(last_seen: float, max_age_s: float) -> bool:
+        return last_seen > 0.0 and (time.time() - last_seen) <= max_age_s
+
+    def _kapat(self, s):
+        s.yaya_kapi_armed = False
+        s.yaya_kapi_anchored = False
+        s.yaya_kapi_released_s = time.time()
+
+    def update(self):
+        # Devre dışı → pass-through: çizgi modeline eskisi gibi hep güven.
+        if not self.enabled:
+            return Status.SUCCESS
+
+        o = self.bb.obs
+        s = self.bb.state
+        now = time.time()
+
+        levha_taze = self._fresh(o.yaya_levha_last_seen, self.levha_max_age_s)
+        odom_taze = self._fresh(o.odom_last_seen, self.odom_max_age_s)
+        grace_ic = (self.grace_s > 0.0 and s.yaya_kapi_released_s > 0.0
+                    and (now - s.yaya_kapi_released_s) < self.grace_s)
+
+        # --- Silahlanma: levha taze + menzil içinde (grace dışında) ---
+        if (levha_taze and o.yaya_levha_present
+                and o.yaya_levha_distance is not None
+                and 0.0 < o.yaya_levha_distance <= self.arm_menzil_m
+                and not grace_ic):
+            if not s.yaya_kapi_armed:
+                # Yeni epizot: kapıyı aç + çizgi FSM'ini sıfırdan başlat.
+                s.yaya_kapi_armed = True
+                s.yaya_kapi_arm_s = now
+                s.yaya_kapi_anchored = False
+                s.yaya_gecidi_phase = "idle"
+                s.yaya_gecidi_released_s = 0.0
+            if odom_taze:
+                # Çapayı en taze levha konumuna çek (geçildi tespiti için)
+                s.yaya_kapi_anchor = (
+                    o.x + math.cos(o.yaw) * o.yaya_levha_distance,
+                    o.y + math.sin(o.yaw) * o.yaya_levha_distance,
+                )
+                s.yaya_kapi_anchored = True
+
+        if not s.yaya_kapi_armed:
+            return Status.FAILURE   # kapı kapalı → çizgi modeli tümden yok sayılır
+
+        # --- Kapatma koşulları ---
+        # (a) çizgi FSM release oldu → geçit işlendi
+        if s.yaya_gecidi_phase == "released":
+            self._kapat(s)
+            return Status.FAILURE
+        # (b) levhayı geçtik → çapa pass_behind_m gerisinde (odom + geçerli çapa şart)
+        if odom_taze and s.yaya_kapi_anchored:
+            dx = s.yaya_kapi_anchor[0] - o.x
+            dy = s.yaya_kapi_anchor[1] - o.y
+            ileri = math.cos(o.yaw) * dx + math.sin(o.yaw) * dy
+            if ileri < -self.pass_behind_m:
+                self._kapat(s)
+                return Status.FAILURE
+        # (c) fail-safe: kapı çok uzun açık kaldı (release/geçildi gelmedi)
+        if self.arm_max_s > 0.0 and (now - s.yaya_kapi_arm_s) > self.arm_max_s:
+            self._kapat(s)
+            return Status.FAILURE
+
+        return Status.SUCCESS   # kapı açık → alt dallar (YayaFresh→FSM) çalışsın
 
 
 # ============================================================

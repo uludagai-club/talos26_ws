@@ -3,9 +3,9 @@
 Öncelik (yukarıdan aşağı):
   0. Emergency latch / yeniden silahlanma (Safety)
   1. Emergency tetik (yaya/engel çok yakın → mührü kilitle)
-  2. Yaya geçidi (yakın → dur, orta → slow)
+  2. Yaya geçidi (ÖN-KAPI: levha görülmeden çizgi modeli dinlenmez; yakın → dur, orta → slow)
   3. DUR levhası (approach → slow, hold → dur 3s, released → cruise'a düşer)
-  4. Trafik ışığı (KIRMIZI/YAVAS)
+  4. Trafik ışığı (birleşik FSM: KIRMIZI→dur, SARI→slow[yeşile hazırlan], YEŞİL→geç)
   5a. Şerit değişimi kilidi (devam eden manevrayı control.py senkronuyla tut)
   5. Engelden kaçınma (lane change varsa, yoksa dur)
   6. Yön levhası (SAG/SOL)
@@ -29,7 +29,8 @@ from behaviors.conditions import (
 )
 from behaviors.actions import (
     SetKarar, LatchEmergency, ReleaseEmergencyIfClear,
-    DurLevhasiFSM, YayaGecidiFSM, LaneChangeStamp, RerouteKarar, HoldLaneChange,
+    DurLevhasiFSM, TrafikIsigiFSM, YayaGecidiFSM, YayaLevhaKapisi,
+    LaneChangeStamp, RerouteKarar, HoldLaneChange,
 )
 from behaviors.decorators import Debounce
 
@@ -141,7 +142,21 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     #    yapıyordu → FSM zaman/engel tabanlı release ile kilidi keser.
     # ============================================================
     yg = p.get("yaya_gecidi", {}) or {}
+    # ÖN-KAPI (2026-07-23): çizgi modeline yalnız yaya geçidi LEVHASI görülünce
+    # güven. Kapı kapalıyken (levha yok) sequence düşer → çizgi modeli yok sayılır
+    # (şerit-karışması false-positive'i biter). enabled=False → eski davranış.
+    yaya_levha_kapisi = YayaLevhaKapisi(
+        bb,
+        enabled=bool(yg.get("levha_kapisi_enabled", True)),
+        levha_max_age_s=float(yg.get("levha_max_age_s", fresh["levha_max_age_s"])),
+        odom_max_age_s=odom_age,
+        arm_menzil_m=float(yg.get("levha_arm_menzil_m", 10.0)),
+        pass_behind_m=float(yg.get("levha_pass_behind_m", 3.0)),
+        arm_max_s=float(yg.get("levha_arm_max_s", 30.0)),
+        grace_s=float(yg.get("levha_kapi_grace_s", 5.0)),
+    )
     pedestrian = Sequence("YayaGecidi", memory=False, children=[
+        yaya_levha_kapisi,   # levha görülmedikçe çizgi modeli dinlenmez
         YayaFresh(bb, fresh["yaya_max_age_s"]),
         YayaVarMi(bb),
         YayaGecidiFSM(
@@ -170,20 +185,21 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     ])
 
     # ============================================================
-    # 4. Trafik ışığı
+    # 4. Trafik ışığı (KIRMIZI / SARI / YEŞİL — birleşik FSM)
     # ============================================================
-    traffic_light_red = Sequence("TrafficLightRed", memory=False, children=[
+    # DUR levhasından AYRI: KIRMIZI → yeşile kadar 'dur' (zaman-sınırlı DEĞİL);
+    # SARI → 'slow' (kırmızıdan sonra = yeşile YAVAŞTAN HAZIRLAN; yaklaşırken =
+    # yellow_action politikası); YEŞİL/ışık yok → geç. Son ışık release_grace_s
+    # tutulur → kısa algı flicker'ında öne seğirmez / gaz kesmez. §7.5.5.
+    _tl = p.get("traffic_light", {}) or {}
+    traffic_light = Sequence("TrafficLight", memory=False, children=[
         LevhaFresh(bb, fresh["levha_max_age_s"]),
-        LevhaIs(bb, ("KIRMIZI",), max_mesafe_m=dist["levha_oku_m"]),
-        SetKarar("Karar=DUR(kirmizi)", bb, karar="dur", reason="trafik_kirmizi"),
-    ])
-    # Sarı (YAVAS) ışık aksiyonu paramla seçilir: "slow" (varsayılan) | "dur".
-    _yellow = str(p.get("traffic_light", {}).get("yellow_action", "slow")).lower()
-    _yellow = _yellow if _yellow in ("slow", "dur") else "slow"
-    traffic_light_yellow = Sequence("TrafficLightYellow", memory=False, children=[
-        LevhaFresh(bb, fresh["levha_max_age_s"]),
-        LevhaIs(bb, ("YAVAS",), max_mesafe_m=dist["levha_oku_m"]),
-        SetKarar(f"Karar={_yellow.upper()}(sari)", bb, karar=_yellow, reason="trafik_sari"),
+        TrafikIsigiFSM(
+            bb,
+            oku_esik_m=dist["levha_oku_m"],
+            release_grace_s=float(_tl.get("kirmizi_release_grace_s", 2.0)),
+            yellow_action=str(_tl.get("yellow_action", "slow")),
+        ),
     ])
 
     # ============================================================
@@ -281,8 +297,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         emergency_trigger,
         pedestrian,
         stop_sign,
-        traffic_light_red,
-        traffic_light_yellow,
+        traffic_light,         # KIRMIZI/SARI/YEŞİL birleşik FSM
         lane_change_hold,      # devam eden manevrayı tut (control.py senkronu)
         obstacle_avoidance,
         direction_right,

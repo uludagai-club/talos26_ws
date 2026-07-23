@@ -24,10 +24,15 @@ from cv_bridge import CvBridge
 from ultralytics import YOLO
 
 # Sinif -> karar_node format eslestirmesi
+# NOT (2026-07-23): kirmizi lamba artik 'DUR' DEGIL 'KIRMIZI' — karar tarafinda
+# trafik isigi DUR levhasindan AYRI ele alinir (yesile kadar bekler; DUR levhasi
+# ise zaman-sinirli 3s durustur). Yesil eklendi: karar kirmizi beklemesini serbest
+# birakir (model 'lamba_yesil' sinifini veriyorsa; vermiyorsa karar sure-fallback'i).
 SINIF_ESLESTIRME = {
     'dur':                      'DUR',
-    'lamba_kirmizi':            'DUR',
+    'lamba_kirmizi':            'KIRMIZI',
     'lamba_sari':               'YAVAS',
+    'lamba_yesil':              'YESIL',
     'saga_mecburi_yon':         'SAG',
     'ileriden_saga_mecburi_yon':'SAG',
     'sola_mecburi_yon':         'SOL',

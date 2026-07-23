@@ -86,6 +86,13 @@ class RosBridge:
         # Adanmis 2-sinifli yaya gecidi modeli (yaya_gecidi_node). Bare /yaya_gecidi
         # levha modelinin 26-sinif icindeki zayif yaya tespiti; adanmis model esas alinir.
         rospy.Subscriber("/yaya_gecidi/model", String, self._on_yaya, queue_size=10)
+        # Yaya gecidi LEVHASI (levha modelinin yaya_gecidi sinifi → /yaya_gecidi).
+        # Cizgi modeli sertitle karisabildigi icin karar ona yalniz bu levha
+        # gorulunce guvenir (YayaLevhaKapisi). Adanmis /yaya_gecidi/model'DEN ayri topic.
+        yg = params.get("yaya_gecidi", {}) or {}
+        self._yaya_levha_topic = str(yg.get("levha_topic", "/yaya_gecidi"))
+        if bool(yg.get("levha_kapisi_enabled", True)):
+            rospy.Subscriber(self._yaya_levha_topic, String, self._on_yaya_levha, queue_size=10)
 
         # YENI engel arayüzü: talos_obstacle_detector → /obstacles/poses (PoseArray)
         if self._obs_source in ("auto", "poses"):
@@ -184,6 +191,26 @@ class RosBridge:
             )
         except Exception:
             rospy.logwarn_throttle(5.0, f"[karar_bt] yaya parse hatası: {raw!r}")
+
+    def _on_yaya_levha(self, msg: String):
+        """Yaya geçidi LEVHASI (/yaya_gecidi, levha modeli) — "mesafe,offset".
+
+        Yalnız KAPI için: bu levha görülünce çizgi modeline güvenilir. Karar
+        çıktısı üretmez; YayaLevhaKapisi latch'ini besler.
+        """
+        raw = (msg.data or "").strip()
+        if not raw or raw.lower() == "none":
+            self.bb.write(yaya_levha_present=False, yaya_levha_distance=-1.0)
+            return
+        try:
+            d = float(raw.split(",")[0])   # ileri mesafe (m); offset kapı için gereksiz
+            self.bb.write(
+                yaya_levha_present=True,
+                yaya_levha_distance=d,
+                yaya_levha_last_seen=time.time(),
+            )
+        except Exception:
+            rospy.logwarn_throttle(5.0, f"[karar_bt] yaya_levha parse hatası: {raw!r}")
 
     # --- YENI engel kaynağı: /obstacles/poses (talos_obstacle_detector) ---
     def _on_obstacles_poses(self, msg: PoseArray):

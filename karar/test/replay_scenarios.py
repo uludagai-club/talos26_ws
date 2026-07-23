@@ -61,6 +61,17 @@ def tick_n(tree, n: int):
         tree.tick()
 
 
+def arm_yaya_levha(bb: Blackboard, d: float = 6.0):
+    """Yaya geçidi LEVHASINI taze + menzilde set et → YayaLevhaKapisi'ni SİLAHLAR.
+
+    2026-07-23 ÖN-KAPI: çizgi modeline (yaya_present) yalnız yaya geçidi LEVHASI
+    görülünce güvenilir. Levhasız senaryolar kapıdan geçemez (çizgi yok sayılır).
+    """
+    bb.obs.yaya_levha_present = True
+    bb.obs.yaya_levha_distance = d
+    bb.obs.yaya_levha_last_seen = time.time()
+
+
 def mirror_bridge_derived(bb: Blackboard):
     """ros_bridge'in TÜRETTİĞİ alanları harness'ta doldur (her tick'ten önce).
 
@@ -143,25 +154,39 @@ def run_scenarios():
     # -----------------------------------------------------------------
     # S3: Yaya 3m → dur
     # -----------------------------------------------------------------
-    print("\nS3: Yaya 3m")
+    print("\nS3: Yaya 3m (levha görülmüş → kapı açık)")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
+    arm_yaya_levha(bb)                 # ön-kapı: levha görülmeden çizgi dinlenmez
     bb.obs.yaya_present = True
     bb.obs.yaya_distance = 3.0
     for _ in range(n_yaya):
-        fresh_now(bb); tree.tick()
+        fresh_now(bb); arm_yaya_levha(bb); tree.tick()
     assert_karar("S3", "dur")
+
+    # -----------------------------------------------------------------
+    # S3b: ÖN-KAPI — çizgi VAR ama LEVHA YOK → çizgi modeli yok sayılır → cruise
+    # -----------------------------------------------------------------
+    print("\nS3b: Yaya(çizgi) 3m ama LEVHA YOK → kapı kapalı → normal")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.yaya_present = True         # çizgi modeli 'crosswalk' diyor (levha yok)
+    bb.obs.yaya_distance = 3.0
+    for _ in range(n_yaya):
+        fresh_now(bb); tree.tick()
+    assert_karar("S3b", "normal")
 
     # -----------------------------------------------------------------
     # S4: Yaya 8m → slow
     # -----------------------------------------------------------------
-    print("\nS4: Yaya 8m")
+    print("\nS4: Yaya 8m (levha görülmüş → kapı açık)")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
+    arm_yaya_levha(bb)
     bb.obs.yaya_present = True
     bb.obs.yaya_distance = 8.0
     for _ in range(n_yaya):
-        fresh_now(bb); tree.tick()
+        fresh_now(bb); arm_yaya_levha(bb); tree.tick()
     assert_karar("S4", "slow")
 
     # -----------------------------------------------------------------
@@ -307,6 +332,58 @@ def run_scenarios():
     assert_karar("S15", "dur")
 
     # -----------------------------------------------------------------
+    # S15b: KIRMIZI holding → YEŞİL görülünce → DEVAM (DUR levhasından ayrı;
+    #       zaman-sınırı yok, yeşile kadar bekler)
+    # -----------------------------------------------------------------
+    print("\nS15b: KIRMIZI holding → YEŞİL → normal")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.levha_isim = "KIRMIZI"; bb.obs.levha_distance = 6.0
+    tick_n(tree, 1)
+    assert_karar("S15b-hold", "dur")
+    fresh_now(bb)
+    bb.obs.levha_isim = "YESIL"; bb.obs.levha_distance = 6.0
+    tick_n(tree, 1)
+    assert_karar("S15b", "normal")
+
+    # -----------------------------------------------------------------
+    # S15c: KIRMIZI holding → 1-tick algı boşluğu (NONE, grace içi) → HÂLÂ dur
+    #       (kırmızıda öne seğirme yok — flicker duruşu bozmaz)
+    # -----------------------------------------------------------------
+    print("\nS15c: KIRMIZI holding → 1-tick flicker → hâlâ dur")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.levha_isim = "KIRMIZI"; bb.obs.levha_distance = 6.0
+    tick_n(tree, 1)
+    fresh_now(bb)
+    bb.obs.levha_isim = "NONE"; bb.obs.levha_distance = -1.0
+    tick_n(tree, 1)
+    assert_karar("S15c", "dur")
+
+    # -----------------------------------------------------------------
+    # S15d: TAM DÖNGÜ — KIRMIZI(dur) → SARI(yeşile hazırlan: slow) → YEŞİL(geç)
+    # -----------------------------------------------------------------
+    print("\nS15d: KIRMIZI → SARI(hazırlan) → YEŞİL")
+    bb.obs.__init__(); bb.state.__init__()
+    fresh_now(bb)
+    bb.obs.levha_isim = "KIRMIZI"; bb.obs.levha_distance = 6.0
+    tick_n(tree, 1)
+    assert_karar("S15d-kirmizi", "dur")
+    fresh_now(bb)
+    bb.obs.levha_isim = "YAVAS"; bb.obs.levha_distance = 6.0   # kırmızı sonrası sarı
+    tick_n(tree, 1)
+    assert_karar("S15d-sari", "slow")
+    if bb.last_decision.get("reason") != "trafik_sari_hazir":
+        failures.append(f"[S15d-sari] reason={bb.last_decision.get('reason')} (beklenen trafik_sari_hazir)")
+        print(f"  ✗ S15d-sari reason={bb.last_decision.get('reason')}")
+    else:
+        print("  ✓ S15d-sari reason=trafik_sari_hazir (yeşile hazırlan)")
+    fresh_now(bb)
+    bb.obs.levha_isim = "YESIL"; bb.obs.levha_distance = 6.0
+    tick_n(tree, 1)
+    assert_karar("S15d-yesil", "normal")
+
+    # -----------------------------------------------------------------
     # S16: Trafik ışığı YAVAS (sarı) → slow
     # -----------------------------------------------------------------
     print("\nS16: YAVAS ışık 6m → slow")
@@ -367,11 +444,12 @@ def run_scenarios():
     print("\nS19: 30km/h'de yaya 5m → erken dur")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
+    arm_yaya_levha(bb)
     bb.obs.speed_kmh = 30.0          # ~8.3 m/s
     bb.obs.yaya_present = True
     bb.obs.yaya_distance = 5.0
     for _ in range(n_yaya):
-        fresh_now(bb); bb.obs.speed_kmh = 30.0; tree.tick()
+        fresh_now(bb); arm_yaya_levha(bb); bb.obs.speed_kmh = 30.0; tree.tick()
     assert_karar("S19", "dur")
 
     # -----------------------------------------------------------------
@@ -385,6 +463,7 @@ def run_scenarios():
     bb.obs.speed_kmh = 30.0
     for _ in range(n_yaya):
         bb.obs.yaya_last_seen = time.time()        # yaya taze
+        arm_yaya_levha(bb)                          # levha taze → kapı açık (odom bayat olsa da silahlanır)
         bb.obs.odom_last_seen = time.time() - 5.0  # odom bayat
         tree.tick()
     assert_karar("S20", "slow")

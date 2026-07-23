@@ -155,11 +155,18 @@ speed_adaptive:
   engel_block_gain_s: 0.4   # engel blokaj eşiği büyümesi
   max_extra_m:        6.0   # hız katkısının üst sınırı
 
-# Trafik ışığı davranışı
+# Trafik ışığı davranışı — birleşik FSM (TrafikIsigiFSM): KIRMIZI/SARI/YEŞİL
 traffic_light:
-  # Sarı (YAVAS) ışıkta ne yapılsın: "slow" (yavaşla, varsayılan) | "dur" (tam dur).
-  # KTR §7.5.5 "kırmızı veya sarı → tam dur" istiyor; sahada flip için param.
+  # YAKLAŞMA sarısı (kırmızısız görülen sarı) aksiyonu: "slow" (varsayılan) | "dur".
+  # KTR §7.5.5 "kırmızı veya sarı → tam dur" için "dur" yapılabilir. NOT: kırmızıdan
+  # SONRA görülen sarı bundan BAĞIMSIZDIR → her zaman 'slow' (yeşile yavaştan hazırlan).
   yellow_action: slow
+  # Işık release grace'i (2026-07-23): KIRMIZI → YEŞİLE kadar 'dur' (zaman-sınırı
+  # yok); SARI → 'slow'. Son aksiyon-alan ışık bu süre boyunca TUTULUR → kısa algı
+  # flicker'ı (levha 1-tick NONE) kararı bozmaz (kırmızıda öne seğirme / sarıda gaz
+  # kesme yok). Model 'lamba_yesil' veriyorsa yeşilde release anındadır; vermiyorsa
+  # ışık bu süre boyunca hiç görülmeyince 'geçildi' sayılıp geçilir. Sahada tune et.
+  kirmizi_release_grace_s: 2.0
 
 # Zamanlayıcılar
 timers:
@@ -189,6 +196,19 @@ yaya_gecidi:
   max_bekleme_s:  20.0    # engel(yaya) sürerse üst sınır → kalıcı kilit keser (fail-safe)
   engel_bekle_m:   8.0    # merkez lidar engeli bu mesafe içindeyse "geçitte yaya var" say
   release_grace_s: 8.0    # devam sonrası: aynı geçidi (araç hâlâ üstündeyken) yeniden tetikleme
+
+  # --- Levha ÖN-KAPISI (2026-07-23) — YayaLevhaKapisi okur ---
+  # Adanmış çizgi modeli (/yaya_gecidi/model) geçit çizgisini ŞERİTLE karıştırabiliyor.
+  # Bu yüzden karar çizgi modeline YALNIZ yaya geçidi LEVHASI görülünce güvenir:
+  # levha modelinin yaya_gecidi sınıfı /yaya_gecidi'de gelir → kapı açılır. Kapı,
+  # çizgi FSM release olunca VEYA levha geçilince (dünya-çapası) kapanır.
+  levha_kapisi_enabled: true   # false → eski davranış (çizgiye hep güven, kapı yok)
+  levha_topic: "/yaya_gecidi"  # levha modelinin yaya_gecidi çıkışı (adanmış /yaya_gecidi/model'DEN farklı)
+  levha_max_age_s:   0.6       # levha tazelik (freshness.levha_max_age_s aynası)
+  levha_arm_menzil_m: 10.0     # levha bu ileri mesafe içinde görülünce kapı açılır
+  levha_pass_behind_m: 3.0     # levha çapası bu kadar GERİDE kalınca kapı kapanır (geçildi)
+  levha_arm_max_s:   30.0      # fail-safe: kapı en fazla bu kadar açık kalır (0=kapalı)
+  levha_kapi_grace_s: 5.0      # kapandıktan sonra yeniden silahlanma bekleme (flip-flop önler)
 
 # Debounce — flicker önleme (tick cinsinden, 10Hz @ 0.1s/tick varsayar)
 debounce:

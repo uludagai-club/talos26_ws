@@ -17,12 +17,19 @@ _NA = -1.0
 
 @dataclass
 class Observations:
-    # --- Yaya ---
+    # --- Yaya (adanmış çizgi modeli /yaya_gecidi/model) ---
     yaya_present: bool = False
     yaya_x: float = _NA
     yaya_y: float = _NA
     yaya_distance: float = _NA
-    yaya_last_seen: float = 0.0      # ROS time saniye
+    yaya_last_seen: float = 0.0
+
+    # --- Yaya geçidi LEVHASI (levha modelinin yaya_gecidi sınıfı → /yaya_gecidi;
+    #     adanmış çizgi modeli /yaya_gecidi/model'DEN AYRI). Çizgi modeli şeritle
+    #     karışabildiği için karar ona yalnız bu levha görülünce güvenir (kapı). ---
+    yaya_levha_present: bool = False
+    yaya_levha_distance: float = _NA   # ileri mesafe (m)
+    yaya_levha_last_seen: float = 0.0      # ROS time saniye
 
     # --- Trafik levhası ---
     levha_isim: str = "NONE"          # "DUR","SAG","SOL","30","OKUL","YAVAS","KIRMIZI","NONE"
@@ -99,11 +106,28 @@ class StatePersist:
     stop_sign_hold_start_s: float = 0.0
     stop_sign_released_s: float = 0.0   # son release zamanı — release_grace_s ile çift duruşu önler
 
+    # Trafik ışığı FSM (birleşik KIRMIZI/SARI/YEŞİL — TrafikIsigiFSM). Son aksiyon-
+    # alan ışık (KIRMIZI→dur / YAVAS→slow) grace ile tutulur → flicker'ı yutar;
+    # YEŞİL/ışık yok → geç. hazir: kırmızıdan sonra sarı = yeşile yavaştan hazırlan.
+    trafik_isik_last_light: str = ""      # "" | "KIRMIZI" | "YAVAS" (aksiyon-alan son ışık)
+    trafik_isik_last_s: float = 0.0       # o ışığın en son görüldüğü an (release grace)
+    trafik_isik_hazir: bool = False       # kırmızı→sarı geçişi (yeşile hazırlan; her zaman slow)
+
     # Yaya geçidi FSM: "idle" | "holding" | "released" (min zorunlu duruş + lidar
     # engel ile yaya-bekleme köprüsü; adanmış model yalnız 'crosswalk' verdiği için).
     yaya_gecidi_phase: str = "idle"
     yaya_gecidi_hold_start_s: float = 0.0
     yaya_gecidi_released_s: float = 0.0   # son release — release_grace_s ile çift duruşu önler
+
+    # Yaya geçidi LEVHA-KAPISI (2026-07-23): çizgi modeline yalnız yaya geçidi
+    # LEVHASI görülünce güven (çizgi modeli şeritle karışabiliyor). Kapı levha
+    # menzile girince açılır; çizgi FSM release olunca VEYA levha geçilince
+    # (dünya-çapası pass_behind gerisinde) kapanır. YayaLevhaKapisi yürütür.
+    yaya_kapi_armed: bool = False
+    yaya_kapi_anchor: tuple = (0.0, 0.0)   # levha görüldüğü an dünya konumu (geçildi tespiti)
+    yaya_kapi_anchored: bool = False       # çapa taze odom ile kuruldu mu (geçildi kapısı için)
+    yaya_kapi_arm_s: float = 0.0           # silahlanma anı (fail-safe max TTL)
+    yaya_kapi_released_s: float = 0.0      # son kapanma — grace ile hemen yeniden silahlanmayı önler
 
     # Lane change cooldown + manevra kilidi (control.py edge-tetiklemeli, manevrayı
     # kendi LANE_CHANGE_DURATION süresince sürdürür → BT aynı yönü o pencere boyunca
@@ -195,6 +219,10 @@ class Blackboard:
             "state": {
                 "emergency_latched": s.emergency_latched,
                 "stop_sign_phase": s.stop_sign_phase,
+                "trafik_isik": s.trafik_isik_last_light or "-",
+                "trafik_isik_hazir": s.trafik_isik_hazir,
+                "yaya_gecidi_phase": s.yaya_gecidi_phase,
+                "yaya_kapi_armed": s.yaya_kapi_armed,
             },
             "decision": self.last_decision,
         }
