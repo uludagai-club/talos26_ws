@@ -228,6 +228,33 @@ yaya_gecidi:
   levha_arm_max_s:   45.0      # fail-safe: kapı en fazla bu kadar açık (uzaktan arm → geçide varış payı)
   levha_kapi_grace_s: 5.0      # kapandıktan sonra yeniden silahlanma bekleme (flip-flop önler)
 
+# ---------------------------------------------------------------------------
+# PARK MÜSAİTLİK (2026-07-24) — ParkFSM okur. "park tabelası → model → lidar" AND
+# ---------------------------------------------------------------------------
+# Kullanıcı akışı: park tabelası (PARK_YERI) görülünce park alanı modeli devreye
+# girer; müsaitlik ÜÇ koşulun AND'idir:
+#   Kapı 1  PARK_YERI levhası (levha modeli /trafik_levha; SINIF_ESLESTIRME dışı →
+#           ham ad "PARK_YERI"). PARK_ETMEK_YASAKTIR → doğrudan "müsait değil" (yasak).
+#   Kapı 2  /park_alani modeli (park_durak_node HSV mavi-renk) alan gösteriyor mu.
+#   Kapı 3  o alanda lidar engeli yok mu  → 2026-07-24 ERTELENDİ (lidar_enabled=false;
+#           bag analizinden sonra eklenecek — bkz. saha-bag-analiz-plani).
+# Üçü de olumlu → reason=park_musait; biri yoksa → park_musait_degil / park_yasak.
+# Çıktı motion'ı 'slow' (park cebine yaklaşma/tarama; asıl manevra mission/hedef).
+# Yaya geçidi levha-kapısı desenini birebir yansıtır (levhasız modele güvenilmez).
+park:
+  enabled:            true
+  model_topic:  "/park_alani"  # park_durak_node çıkışı (String "mesafe,offset" | "none")
+  model_max_age_s:    0.6      # /park_alani tazelik (Kapı 2; freshness.levha_max_age_s aynası)
+  levha_max_age_s:    0.6      # PARK_YERI levha tazelik (Kapı 1)
+  lidar_enabled:      false    # Kapı 3 — 2026-07-24 ertelendi; true olunca lidar engel taraması aranır
+  # ARM MESAFESİ: park tabelası cebi UZAKTAN duyurur; bbox-proxy mesafe kaba olduğu
+  # için geniş (trafik ışığı isik_oku_m=40 / yaya levha arm 45 ile aynı proxy-gerçekçi
+  # mantık). Bag analizinde tabelanın hangi mesafede görüldüğüne göre tune edilecek.
+  levha_arm_menzil_m: 45.0     # PARK_YERI bu ileri mesafe içinde görülünce kapı açılır (park cebi duyurusu)
+  levha_pass_behind_m: 3.0     # levha çapası bu kadar geride kalınca kapı kapanır (geçildi)
+  levha_arm_max_s:   60.0      # fail-safe: kapı en fazla bu kadar açık (park cebini tararken uzun sürebilir)
+  levha_kapi_grace_s: 5.0      # kapandıktan sonra yeniden silahlanma bekleme (flip-flop önler)
+
 # Debounce — flicker önleme (tick cinsinden, 10Hz @ 0.1s/tick varsayar)
 debounce:
   yaya_min_consecutive:     2

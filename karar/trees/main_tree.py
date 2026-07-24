@@ -10,6 +10,7 @@
   5. Engelden kaçınma (lane change varsa, yoksa dur)
   6. Yön levhası (SAG/SOL)
   7. Hız sınırı (30/OKUL)
+  7b. Park müsaitlik (PARK_YERI levha kapısı → /park_alani model AND; lidar ertelendi)
   8. Cruise (default: normal)
 
 Ağaç memory'siz selector: ilk SUCCESS dönen dal kararı sahiplenir.
@@ -29,7 +30,7 @@ from behaviors.conditions import (
 )
 from behaviors.actions import (
     SetKarar, LatchEmergency, ReleaseEmergencyIfClear,
-    DurLevhasiFSM, TrafikIsigiFSM, YayaGecidiFSM, YayaLevhaKapisi,
+    DurLevhasiFSM, TrafikIsigiFSM, YayaGecidiFSM, YayaLevhaKapisi, ParkFSM,
     LaneChangeStamp, RerouteKarar, HoldLaneChange,
 )
 from behaviors.decorators import Debounce
@@ -290,6 +291,28 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     ])
 
     # ============================================================
+    # 7b. Park müsaitlik (2026-07-24) — "park tabelası → model → lidar" AND
+    # ============================================================
+    # ParkFSM: PARK_YERI levhası görülünce kapı arm → /park_alani modeli dinlenir →
+    # (lidar Kapı 3 ertelendi) müsaitlik reason/phase ile raporlanır. Cruise'un HEMEN
+    # ÜSTÜNDE: emniyet/levha/engel dalları önceliklidir; park yalnız onlar SUSTUĞUNDA
+    # (park tabelası epizodu) cruise yerine geçer. Motion 'slow' (mission manevrayı
+    # yürütür); PARK_ETMEK_YASAKTIR → park_yasak. enabled=False → dal kapalı.
+    pk = p.get("park", {}) or {}
+    park = ParkFSM(
+        bb,
+        enabled=bool(pk.get("enabled", True)),
+        arm_menzil_m=float(pk.get("levha_arm_menzil_m", 45.0)),
+        levha_max_age_s=float(pk.get("levha_max_age_s", fresh["levha_max_age_s"])),
+        park_max_age_s=float(pk.get("model_max_age_s", 0.6)),
+        odom_max_age_s=odom_age,
+        pass_behind_m=float(pk.get("levha_pass_behind_m", 3.0)),
+        arm_max_s=float(pk.get("levha_arm_max_s", 60.0)),
+        grace_s=float(pk.get("levha_kapi_grace_s", 5.0)),
+        lidar_enabled=bool(pk.get("lidar_enabled", False)),  # Kapı 3 — 2026-07-24 ertelendi
+    )
+
+    # ============================================================
     # 8. Cruise (default)
     # ============================================================
     cruise = SetKarar("Karar=NORMAL(cruise)", bb, karar="normal", reason="cruise")
@@ -308,6 +331,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         direction_right,
         direction_left,
         speed_limit,
+        park,                  # park tabelası epizodu → müsaitlik (levha+model AND)
         cruise,
     ])
 

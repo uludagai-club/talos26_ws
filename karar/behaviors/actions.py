@@ -644,6 +644,137 @@ class YayaLevhaKapisi(py_trees.behaviour.Behaviour):
 
 
 # ============================================================
+# Park müsaitlik FSM (2026-07-24) — "park tabelası → model → lidar" üç-kapılı AND
+# ============================================================
+class ParkFSM(py_trees.behaviour.Behaviour):
+    """Park alanı MÜSAİTLİK kararı — yaya geçidi levha-kapısı desenini yansıtır.
+
+    AKIŞ (kullanıcı isteği): park tabelası görülünce park alanı modeli DEVREYE
+    girer; müsaitlik üç koşulun AND'idir:
+      Kapı 1  PARK_YERI levhası görüldü mü?  (kapıyı arm eder; model ancak bundan
+              sonra dinlenir — /park_alani'ya levhasız güvenilmez). PARK_ETMEK_
+              YASAKTIR görülürse park YASAK → doğrudan "müsait değil".
+      Kapı 2  /park_alani modeli park alanı gösteriyor mu?  (present + taze)
+      Kapı 3  o alanda lidar engeli YOK mu?  → 2026-07-24: ERTELENDİ. Bag analizinden
+              sonra eklenecek; `lidar_enabled=False` iken True kabul edilir.
+    Üçü de olumlu → "park müsait"; biri bile yoksa → "park müsait değil".
+
+    KAPI YAŞAM DÖNGÜSÜ (YayaLevhaKapisi ile aynı mantık):
+      • ARM   — PARK_YERI levhası taze + `arm_menzil_m` içinde görülünce (tabela
+                park cebini UZAKTAN duyurur; bbox-proxy mesafe kaba olduğu için
+                menzil geniş tutulur). Levha 1-tick düşse de epizot sürer (sustain).
+      • KAPAN — (a) levhayı geçtik (dünya-çapası `pass_behind_m` gerisinde), VEYA
+                (b) fail-safe: kapı `arm_max_s`'ten uzun açık kaldı.
+      • grace — kapandıktan sonra `grace_s` boyunca yeniden silahlanmaz (flip-flop).
+
+    ÇIKTI: motion komutu epizot boyunca 'slow' (park cebine yaklaşma/tarama hızı;
+    asıl park manevrasını mission/hedef yürütür — karar yalnız MÜSAİTLİĞİ raporlar).
+    Müsaitlik `reason`/`phase` ile taşınır: park_musait / park_musait_degil /
+    park_yasak. `enabled=False` → dal tümden kapalı (FAILURE → cruise). control
+    tarafı park motion'ını henüz ele almadı (2026-07-24 kullanıcı: sonra) — bu yüzden
+    'slow' güvenli köprü; mission reason/phase'i okur.
+    """
+
+    def __init__(self, bb: Blackboard, enabled: bool, arm_menzil_m: float,
+                 levha_max_age_s: float, park_max_age_s: float, odom_max_age_s: float,
+                 pass_behind_m: float, arm_max_s: float, grace_s: float,
+                 lidar_enabled: bool = False):
+        super().__init__("ParkFSM")
+        self.bb = bb
+        self.enabled = bool(enabled)
+        self.arm_menzil_m = float(arm_menzil_m)
+        self.levha_max_age_s = float(levha_max_age_s)
+        self.park_max_age_s = float(park_max_age_s)
+        self.odom_max_age_s = float(odom_max_age_s)
+        self.pass_behind_m = float(pass_behind_m)
+        self.arm_max_s = float(arm_max_s)
+        self.grace_s = float(grace_s)
+        self.lidar_enabled = bool(lidar_enabled)
+
+    @staticmethod
+    def _fresh(last_seen: float, max_age_s: float) -> bool:
+        return last_seen > 0.0 and (time.time() - last_seen) <= max_age_s
+
+    def _kapat(self, s):
+        s.park_phase = "released"
+        s.park_kapi_anchored = False
+        s.park_kapi_released_s = time.time()
+
+    def _emit(self, reason: str, phase: str):
+        self.bb.last_decision = {
+            "karar": "slow", "reason": reason,
+            "phase": phase, "wait_remaining_s": 0.0,
+        }
+        return Status.SUCCESS
+
+    def update(self):
+        if not self.enabled:
+            return Status.FAILURE
+
+        o = self.bb.obs
+        s = self.bb.state
+        now = time.time()
+
+        levha_taze = self._fresh(o.levha_last_seen, self.levha_max_age_s)
+        odom_taze = self._fresh(o.odom_last_seen, self.odom_max_age_s)
+        d_levha = o.levha_distance
+        menzilde = (d_levha is not None and 0.0 < d_levha <= self.arm_menzil_m)
+        is_park_yeri = levha_taze and o.levha_isim == "PARK_YERI" and menzilde
+        is_yasak = levha_taze and o.levha_isim == "PARK_ETMEK_YASAKTIR" and menzilde
+        grace_ic = (self.grace_s > 0.0 and s.park_kapi_released_s > 0.0
+                    and (now - s.park_kapi_released_s) < self.grace_s)
+
+        # --- Silahlanma: PARK_YERI levhası → kapıyı aç (grace dışında) ---
+        if is_park_yeri and not grace_ic:
+            if s.park_phase != "armed":
+                s.park_phase = "armed"
+                s.park_kapi_arm_s = now
+                s.park_kapi_anchored = False
+            if odom_taze:
+                s.park_kapi_anchor = (
+                    o.x + math.cos(o.yaw) * d_levha,
+                    o.y + math.sin(o.yaw) * d_levha,
+                )
+                s.park_kapi_anchored = True
+
+        # --- Kapı kapalı (idle/released): park epizodu yok ---
+        if s.park_phase != "armed":
+            if s.park_phase == "released" and not is_park_yeri:
+                s.park_phase = "idle"
+            if is_yasak:   # tabela park yasağı → müsait değil (epizottan bağımsız uyarı)
+                return self._emit("park_yasak", "park_yasak")
+            return Status.FAILURE   # cruise (park tabelası yok)
+
+        # --- armed: kapatma koşulları ---
+        # (a) levhayı geçtik → çapa pass_behind_m gerisinde (odom + geçerli çapa şart)
+        if odom_taze and s.park_kapi_anchored:
+            dx = s.park_kapi_anchor[0] - o.x
+            dy = s.park_kapi_anchor[1] - o.y
+            ileri = math.cos(o.yaw) * dx + math.sin(o.yaw) * dy
+            if ileri < -self.pass_behind_m:
+                self._kapat(s)
+                return Status.FAILURE
+        # (b) fail-safe: kapı çok uzun açık kaldı
+        if self.arm_max_s > 0.0 and (now - s.park_kapi_arm_s) > self.arm_max_s:
+            self._kapat(s)
+            return Status.FAILURE
+
+        # --- armed: üç-kapılı AND ile müsaitlik ---
+        # Kapı 1 (PARK_YERI) armed olmakla sağlandı. Yasak levha araya girdiyse müsait değil.
+        if is_yasak:
+            return self._emit("park_yasak", "park_yasak")
+        # Kapı 2: /park_alani modeli park alanı gösteriyor mu (present + taze)
+        model_ok = (o.park_alani_present
+                    and self._fresh(o.park_alani_last_seen, self.park_max_age_s))
+        # Kapı 3: lidar engel yok mu — 2026-07-24 ERTELENDİ (bag analizi sonrası)
+        lidar_ok = True if not self.lidar_enabled else True  # TODO(kapı3): lidar engel taraması
+        if model_ok and lidar_ok:
+            return self._emit("park_musait", "park_musait")
+        # Model henüz alan göstermiyor → epizot içinde tarama; verdict: müsait değil
+        return self._emit("park_musait_degil", "park_tarama")
+
+
+# ============================================================
 # Şerit değiştirme bildirimi (cooldown güncelle)
 # ============================================================
 class LaneChangeStamp(py_trees.behaviour.Behaviour):

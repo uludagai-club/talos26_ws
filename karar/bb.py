@@ -31,8 +31,17 @@ class Observations:
     yaya_levha_distance: float = _NA   # ileri mesafe (m)
     yaya_levha_last_seen: float = 0.0      # ROS time saniye
 
+    # --- Park alanı modeli (/park_alani; park_durak_node HSV mavi-renk) ---
+    #     "mesafe,offset" veya "none". mesafe bbox-proxy (kaba; yalnız "en yakın"
+    #     sıralaması için — mutlak güvenilmez), offset işaretli (sol- / sağ+).
+    #     Park müsaitlik AND'inin Kapı 2'si (model park alanı gösteriyor mu). ---
+    park_alani_present: bool = False
+    park_alani_distance: float = _NA   # ileri mesafe (m; bbox-proxy)
+    park_alani_offset: float = _NA     # işaretli yatay offset (sol- / sağ+)
+    park_alani_last_seen: float = 0.0
+
     # --- Trafik levhası ---
-    levha_isim: str = "NONE"          # "DUR","SAG","SOL","30","OKUL","YAVAS","KIRMIZI","NONE"
+    levha_isim: str = "NONE"          # "DUR","SAG","SOL","30","OKUL","YAVAS","KIRMIZI","PARK_YERI","PARK_ETMEK_YASAKTIR","NONE"
     levha_distance: float = _NA
     levha_x: float = _NA              # ileri (m)
     levha_y: float = _NA              # yan (m)
@@ -129,6 +138,19 @@ class StatePersist:
     yaya_kapi_arm_s: float = 0.0           # silahlanma anı (fail-safe max TTL)
     yaya_kapi_released_s: float = 0.0      # son kapanma — grace ile hemen yeniden silahlanmayı önler
 
+    # Park müsaitlik FSM (ParkFSM) — üç-kapılı AND, "park tabelası → model → lidar":
+    #   Kapı 1  PARK_YERI levhası görüldü mü (kapı arm; PARK_ETMEK_YASAKTIR → yasak)
+    #   Kapı 2  /park_alani modeli alan gösteriyor mu (present+taze)
+    #   Kapı 3  o alanda lidar engeli yok mu  (2026-07-24: ERTELENDİ — bag analizinden
+    #           sonra eklenecek; park.lidar_enabled=false iken True kabul edilir)
+    # Kapı, yaya geçidi levha-kapısı (YayaLevhaKapisi) desenini yansıtır: levha
+    # görülmeden /park_alani modeli DİNLENMEZ. "idle"|"armed"|"released".
+    park_phase: str = "idle"
+    park_kapi_arm_s: float = 0.0            # silahlanma anı (fail-safe TTL)
+    park_kapi_anchor: tuple = (0.0, 0.0)   # PARK_YERI levhası görüldüğü an dünya konumu (geçildi tespiti)
+    park_kapi_anchored: bool = False       # çapa taze odom ile kuruldu mu
+    park_kapi_released_s: float = 0.0      # son kapanma — grace ile yeniden silahlanmayı önler
+
     # Lane change cooldown + manevra kilidi (control.py edge-tetiklemeli, manevrayı
     # kendi LANE_CHANGE_DURATION süresince sürdürür → BT aynı yönü o pencere boyunca
     # tutmalı; aksi halde "dur"/"normal" manevrayı keser).
@@ -203,6 +225,8 @@ class Blackboard:
         return {
             "yaya": {"present": o.yaya_present, "d": o.yaya_distance, "age_s": _age(o.yaya_last_seen)},
             "levha": {"isim": o.levha_isim, "d": o.levha_distance, "age_s": _age(o.levha_last_seen)},
+            "park": {"model": o.park_alani_present, "d": _fin(o.park_alani_distance),
+                     "off": o.park_alani_offset, "age_s": _age(o.park_alani_last_seen)},
             "engel": {
                 "present": o.engel_present,
                 "d_arc":    _fin(o.engel_d_arc),     # ACİL tetiği bunu okur (yay-kapısı)
@@ -223,6 +247,7 @@ class Blackboard:
                 "trafik_isik_hazir": s.trafik_isik_hazir,
                 "yaya_gecidi_phase": s.yaya_gecidi_phase,
                 "yaya_kapi_armed": s.yaya_kapi_armed,
+                "park_phase": s.park_phase,
             },
             "decision": self.last_decision,
         }

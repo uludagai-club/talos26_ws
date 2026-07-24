@@ -94,6 +94,14 @@ class RosBridge:
         if bool(yg.get("levha_kapisi_enabled", True)):
             rospy.Subscriber(self._yaya_levha_topic, String, self._on_yaya_levha, queue_size=10)
 
+        # Park alanı modeli (park_durak_node → /park_alani; HSV mavi-renk). Park
+        # müsaitlik AND'inin Kapı 2'si. Karar bu modele YALNIZ PARK_YERI levhası
+        # görülünce (ParkFSM kapısı armed) güvenir — /trafik_levha üzerinden.
+        pk = params.get("park", {}) or {}
+        self._park_topic = str(pk.get("model_topic", "/park_alani"))
+        if bool(pk.get("enabled", True)):
+            rospy.Subscriber(self._park_topic, String, self._on_park_alani, queue_size=10)
+
         # YENI engel arayüzü: talos_obstacle_detector → /obstacles/poses (PoseArray)
         if self._obs_source in ("auto", "poses"):
             # queue_size=1: hafıza köprüsü dünya konumunu GÜNCEL pozla hesaplıyor →
@@ -211,6 +219,30 @@ class RosBridge:
             )
         except Exception:
             rospy.logwarn_throttle(5.0, f"[karar_bt] yaya_levha parse hatası: {raw!r}")
+
+    def _on_park_alani(self, msg: String):
+        """Park alanı modeli (/park_alani, park_durak_node) — "mesafe,offset" | "none".
+
+        Yalnız gözlem yazar; ParkFSM AND'inin Kapı 2'sidir (model park alanı
+        gösteriyor mu). mesafe bbox-proxy (kaba), offset işaretli (sol- / sağ+).
+        """
+        raw = (msg.data or "").strip()
+        if not raw or raw.lower() == "none":
+            self.bb.write(park_alani_present=False,
+                          park_alani_distance=-1.0, park_alani_offset=-1.0)
+            return
+        try:
+            parts = raw.split(",")
+            d = float(parts[0])                                   # ileri mesafe (m; proxy)
+            off = float(parts[1]) if len(parts) > 1 else 0.0      # işaretli yatay offset
+            self.bb.write(
+                park_alani_present=True,
+                park_alani_distance=d,
+                park_alani_offset=off,
+                park_alani_last_seen=time.time(),
+            )
+        except Exception:
+            rospy.logwarn_throttle(5.0, f"[karar_bt] park_alani parse hatası: {raw!r}")
 
     # --- YENI engel kaynağı: /obstacles/poses (talos_obstacle_detector) ---
     def _on_obstacles_poses(self, msg: PoseArray):
