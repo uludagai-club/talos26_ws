@@ -6,8 +6,8 @@
 
 Birleşik ışık FSM'i (KIRMIZI/SARI/YEŞİL), DUR levhasından AYRI:
   • KIRMIZI → 'dur' (yeşile kadar; zaman-sınırı yok)
-  • SARI    → 'slow'  (kırmızıdan SONRA = yeşile hazırlan, HER ZAMAN slow;
-                        yaklaşırken = yellow_action politikası)
+  • SARI    → (2026-07-24) önceki ışığa bağlı: KIRMIZI'dan sonra = 'dur' (yeşili
+              bekle); YEŞİL'den/yaklaşırken = 'slow' (yellow_action politikası)
   • YEŞİL / ışık yok → FAILURE (geç)
   • son ışık release_grace_s tutulur → kısa flicker duruşu/yavaşı bozmaz
 """
@@ -128,19 +128,19 @@ set_levha(bb, "YAVAS", 6.0)
 st = fsm.update()
 check("yaklaşma sarı → dur (politika)", st == Status.SUCCESS and karar(bb) == ("dur", "trafik_sari"), bb.last_decision)
 
-print("== KIRMIZI → SARI → yeşile HAZIRLAN (slow), yellow_action=dur olsa bile ==")
+print("== KIRMIZI → SARI → HÂLÂ DUR (yeşili bekle), yellow_action fark etmez (2026-07-24) ==")
 _clock.t = 1600.0
-fsm = make_fsm(yellow_action="dur"); bb = fsm.bb
+fsm = make_fsm(yellow_action="slow"); bb = fsm.bb
 set_levha(bb, "KIRMIZI", 6.0); fsm.update()          # dur
 set_levha(bb, "YAVAS", 6.0)
 st = fsm.update()
-check("kırmızı→sarı → slow (hazir)", st == Status.SUCCESS and karar(bb) == ("slow", "trafik_sari_hazir"), bb.last_decision)
+check("kırmızı→sarı → dur (bekle)", st == Status.SUCCESS and karar(bb) == ("dur", "trafik_sari_kirmizidan_bekle"), bb.last_decision)
 check("hazir True", bb.state.trafik_isik_hazir is True)
 
-print("== KIRMIZI → SARI(hazir) → 1-tick flicker → hâlâ slow(hazir) ==")
+print("== KIRMIZI → SARI(bekle) → 1-tick flicker → hâlâ dur(bekle) ==")
 _clock.ilerle(0.5); set_levha(bb, "NONE", -1.0)
 st = fsm.update()
-check("flicker → hâlâ hazir slow", st == Status.SUCCESS and karar(bb) == ("slow", "trafik_sari_hazir"))
+check("flicker → hâlâ dur (bekle)", st == Status.SUCCESS and karar(bb) == ("dur", "trafik_sari_kirmizidan_bekle"))
 
 print("== KIRMIZI → SARI → YEŞİL → geç ==")
 _clock.ilerle(0.2); set_levha(bb, "YESIL", 6.0)

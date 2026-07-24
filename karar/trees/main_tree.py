@@ -1,17 +1,16 @@
 """Kök Behavior Tree birleşimi.
 
-Öncelik (yukarıdan aşağı):
+Öncelik (yukarıdan aşağı) — 2026-07-24 senaryo spec'i (plan D1):
   0. Emergency latch / yeniden silahlanma (Safety)
-  1. Emergency tetik (yaya/engel çok yakın → mührü kilitle)
-  2. Yaya geçidi (ÖN-KAPI: levha görülmeden çizgi modeli dinlenmez; yakın → dur, orta → slow)
-  3. DUR levhası (approach → slow, hold → dur 3s, released → cruise'a düşer)
-  4. Trafik ışığı (birleşik FSM: KIRMIZI→dur, SARI→slow[yeşile hazırlan], YEŞİL→geç)
-  5a. Şerit değişimi kilidi (devam eden manevrayı control.py senkronuyla tut)
-  5. Engelden kaçınma (lane change varsa, yoksa dur)
-  6. Yön levhası (SAG/SOL)
-  7. Hız sınırı (30/OKUL)
-  7b. Park müsaitlik (PARK_YERI levha kapısı → /park_alani model AND; lidar ertelendi)
-  8. Cruise (default: normal)
+  1. S0 Acil e-stop tetik (yaya/engel çok yakın → mührü kilitle)  → acildurus
+  2. S5 Hareketli engel — PLACEHOLDER (davranışsız; kullanıcı planı sonra)
+  3. S3 Sabit engel → dur + reroute talebi  (kullanıcı: yaya/ışığın ÜSTÜNDE)
+  4. S2 Yaya geçidi (levha kapısı → geçit modeli + lidar bekleme)  → dur→normal
+  5. DUR levhası (kapsam dışı — korunur)
+  6. S1 Trafik ışığı (KIRMIZI→dur, kırmızı→sarı→dur[yeşili bekle], yeşil→sarı→slow, YEŞİL→geç)
+  7. Şerit değişimi kilidi + yön levhaları + hız sınırı (kapsam dışı — korunur)
+  8. S4 Park müsaitlik (PARK_YERI kapısı → /park_alani model + lidar AND → park_musait/degil)
+  9. Cruise (default: normal)
 
 Ağaç memory'siz selector: ilk SUCCESS dönen dal kararı sahiplenir.
 """
@@ -31,7 +30,7 @@ from behaviors.conditions import (
 from behaviors.actions import (
     SetKarar, LatchEmergency, ReleaseEmergencyIfClear,
     DurLevhasiFSM, TrafikIsigiFSM, YayaGecidiFSM, YayaLevhaKapisi, ParkFSM,
-    LaneChangeStamp, RerouteKarar, HoldLaneChange,
+    LaneChangeStamp, RerouteKarar, HoldLaneChange, HareketliEngelPlaceholder,
 )
 from behaviors.decorators import Debounce
 
@@ -309,7 +308,7 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
         pass_behind_m=float(pk.get("levha_pass_behind_m", 3.0)),
         arm_max_s=float(pk.get("levha_arm_max_s", 60.0)),
         grace_s=float(pk.get("levha_kapi_grace_s", 5.0)),
-        lidar_enabled=bool(pk.get("lidar_enabled", False)),  # Kapı 3 — 2026-07-24 ertelendi
+        lidar_enabled=bool(pk.get("lidar_enabled", True)),   # Kapı 3 AKTİF (eşleştirme TODO stub)
     )
 
     # ============================================================
@@ -318,21 +317,33 @@ def build_root(bb: Blackboard, p: dict) -> py_trees.behaviour.Behaviour:
     cruise = SetKarar("Karar=NORMAL(cruise)", bb, karar="normal", reason="cruise")
 
     # ============================================================
-    # Kök
+    # 1b. Hareketli engel (S5) — PLACEHOLDER (davranışsız; kullanıcı planı sonra)
+    # ============================================================
+    hareketli_engel = HareketliEngelPlaceholder(bb)
+
+    # ============================================================
+    # Kök — ÖNCELİK (2026-07-24 senaryo spec'i, plan D1):
+    #   acil → hareketli(placeholder) → SABİT ENGEL → yaya geçidi → trafik ışığı → park → cruise
+    #   (kullanıcı: sabit engel, yaya/ışığın ÜSTÜNDE). DUR levhası / yön / hız / lane-change-hold
+    #   senaryo listesinde yok → KORUNUR, yerlerinde bırakıldı.
+    # UYARI (D1 notu): obstacle_avoidance lidar-tabanlı ve statik/hareketli ayırmıyor →
+    #   yaya geçidinde yayayı "engel" sanıp reroute tetikleyebilir. S5 (hareketli engel)
+    #   davranışı tanımlanınca yaya/hareketli ayrımı burada netleşecek.
     # ============================================================
     root = Selector("Root", memory=False, children=[
         safety_release,        # mühür çözülürse FAILURE → diğer dallar
-        emergency_trigger,
-        pedestrian,
-        stop_sign,
-        traffic_light,         # KIRMIZI/SARI/YEŞİL birleşik FSM
-        lane_change_hold,      # devam eden manevrayı tut (control.py senkronu)
-        obstacle_avoidance,
-        direction_right,
-        direction_left,
-        speed_limit,
-        park,                  # park tabelası epizodu → müsaitlik (levha+model AND)
-        cruise,
+        emergency_trigger,     # S0 acil e-stop (güvenlik tabanı — her şeyi ezer)
+        hareketli_engel,       # S5 hareketli engel — PLACEHOLDER (davranışsız FAILURE)
+        obstacle_avoidance,    # S3 sabit engel → dur+reroute (ışık/yaya ÜSTÜNDE)
+        pedestrian,            # S2 yaya geçidi (levha kapısı + bekleme + lidar)
+        stop_sign,             # DUR levhası (kapsam dışı — korunur)
+        traffic_light,         # S1 trafik ışığı (KIRMIZI=dur / kırmızı→sarı=dur / yeşil→sarı=slow)
+        lane_change_hold,      # devam eden manevrayı tut (kapsam dışı — korunur)
+        direction_right,       # yön levhası SAG (kapsam dışı — korunur)
+        direction_left,        # yön levhası SOL (kapsam dışı — korunur)
+        speed_limit,           # hız sınırı (kapsam dışı — korunur)
+        park,                  # S4 park müsaitlik (levha+model+lidar üç-kapılı AND)
+        cruise,                # default → normal
     ])
 
     return root

@@ -308,10 +308,10 @@ class TrafikIsigiFSM(py_trees.behaviour.Behaviour):
 
     Renkler (algı okuma menzili `oku_esik_m` içinde):
       • KIRMIZI → 'dur' (yeşile kadar; zaman-sınırlı DEĞİL)
-      • YAVAS (sarı) → 'slow':
-          - kırmızıdan SONRA görülen sarı → yeşile YAVAŞTAN HAZIRLAN (her zaman
-            slow; kullanıcı isteği 2026-07-23) → reason 'trafik_sari_hazir'
-          - yaklaşırken (kırmızısız) sarı → `yellow_action` (slow|dur, KTR §7.5.5)
+      • YAVAS (sarı) — aksiyon ÖNCEKİ ışığa bağlı (2026-07-24 kullanıcı spec):
+          - KIRMIZI'dan SONRA görülen sarı → sarı ÖNEMSİZ, HÂLÂ 'dur' (yeşili bekle;
+            sarıda kalkma) → reason 'trafik_sari_kirmizidan_bekle'
+          - YEŞİL'den / yaklaşırken (kırmızısız) sarı → 'slow' (`yellow_action`)
             → reason 'trafik_sari'
       • YESIL / ışık yok → FAILURE (geç; üst selector alt dallara iner)
 
@@ -350,7 +350,7 @@ class TrafikIsigiFSM(py_trees.behaviour.Behaviour):
         if isim in ("KIRMIZI", "YAVAS") and in_range:
             prev = s.trafik_isik_last_light
             if isim == "YAVAS" and prev == "KIRMIZI":
-                s.trafik_isik_hazir = True    # kırmızı→sarı → yeşile hazırlan
+                s.trafik_isik_hazir = True    # kırmızı→sarı işareti → hâlâ dur (yeşili bekle)
             elif isim == "KIRMIZI":
                 s.trafik_isik_hazir = False
             s.trafik_isik_last_light = isim
@@ -371,13 +371,16 @@ class TrafikIsigiFSM(py_trees.behaviour.Behaviour):
             return Status.SUCCESS
         if s.trafik_isik_last_light == "YAVAS":
             if s.trafik_isik_hazir:
-                karar, reason = "slow", "trafik_sari_hazir"   # yeşile yavaştan hazırlan
+                # KIRMIZI→SARI (2026-07-24 kullanıcı spec): sarı ÖNEMSİZ, HÂLÂ DUR —
+                # harekete geçerken yine YEŞİLİ bekle (sarıda kalkma). 'slow' DEĞİL.
+                karar, reason, phase = "dur", "trafik_sari_kirmizidan_bekle", "waiting_red_light"
             else:
-                karar, reason = self.yellow_action, "trafik_sari"
+                # YEŞİL→SARI / yaklaşma sarısı → YAVAŞLA (yellow_action, varsayılan slow)
+                karar, reason, phase = self.yellow_action, "trafik_sari", "approach"
             self.bb.last_decision = {
                 "karar": karar,
                 "reason": reason,
-                "phase": "approach",
+                "phase": phase,
                 "wait_remaining_s": 0.0,
             }
             return Status.SUCCESS
@@ -655,8 +658,9 @@ class ParkFSM(py_trees.behaviour.Behaviour):
               sonra dinlenir — /park_alani'ya levhasız güvenilmez). PARK_ETMEK_
               YASAKTIR görülürse park YASAK → doğrudan "müsait değil".
       Kapı 2  /park_alani modeli park alanı gösteriyor mu?  (present + taze)
-      Kapı 3  o alanda lidar engeli YOK mu?  → 2026-07-24: ERTELENDİ. Bag analizinden
-              sonra eklenecek; `lidar_enabled=False` iken True kabul edilir.
+      Kapı 3  o alanda lidar engeli YOK mu?  → AKTİF mantık (plan D3). Lidar↔alan
+              eşleştirme yöntemi `_alan_engel_var` içinde TODO stub (gerçek lidar+model
+              gelince netleşecek; stub 'temiz' döner). `lidar_enabled=False` → Kapı 3 atlanır.
     Üçü de olumlu → "park müsait"; biri bile yoksa → "park müsait değil".
 
     KAPI YAŞAM DÖNGÜSÜ (YayaLevhaKapisi ile aynı mantık):
@@ -701,6 +705,19 @@ class ParkFSM(py_trees.behaviour.Behaviour):
         s.park_phase = "released"
         s.park_kapi_anchored = False
         s.park_kapi_released_s = time.time()
+
+    def _alan_engel_var(self) -> bool:
+        """Kapı 3 — park alanında lidar engeli VAR mı?
+
+        TODO(eşleştirme): park alanını lidarla eşleştirme yöntemi (park_alani_offset
+        yönündeki lidar sektörü vs park alanının dünya-projeksiyonu ↔ lidar noktaları)
+        GERÇEK lidar + park modeli gelince netleşecek — plan D3. Şimdilik STUB: engel
+        verisi yok/eşleştirme yapılmadığı için "temiz" (engel yok) döner → mevcut
+        davranışı bozmaz (üç-kapılı AND yapısal olarak aktif ama Kapı 3 henüz pasif).
+        lidar_enabled=False iken bu metod HİÇ çağrılmaz (Kapı 3 tümden atlanır).
+        """
+        # TODO: gerçek lidar-alan eşleştirmesi (o.engel_* + o.park_alani_offset).
+        return False
 
     def _emit(self, karar: str, reason: str, phase: str):
         # ÇIKTI KARARI = MÜSAİTLİK (2026-07-24 kullanıcı): park tabelası görülünce
@@ -772,12 +789,35 @@ class ParkFSM(py_trees.behaviour.Behaviour):
         # Kapı 2: /park_alani modeli park alanı gösteriyor mu (present + taze)
         model_ok = (o.park_alani_present
                     and self._fresh(o.park_alani_last_seen, self.park_max_age_s))
-        # Kapı 3: lidar engel yok mu — 2026-07-24 ERTELENDİ (bag analizi sonrası)
-        lidar_ok = True if not self.lidar_enabled else True  # TODO(kapı3): lidar engel taraması
+        # Kapı 3: park alanında lidar engeli YOK mu (aktif; eşleştirme TODO stub → temiz)
+        lidar_ok = (not self._alan_engel_var()) if self.lidar_enabled else True
+        # Üç-kapılı AND: Kapı1(armed=PARK_YERI) ∧ Kapı2(model) ∧ Kapı3(engel yok) → müsait
         if model_ok and lidar_ok:
             return self._emit("park_musait", "park_musait", "park_musait")
-        # Model henüz alan göstermiyor → epizot içinde tarama; verdict: müsait değil
-        return self._emit("park_musait_degil", "park_musait_degil", "park_tarama")
+        if not model_ok:
+            # Kapı 2 eksik → henüz alan yok/tarama
+            return self._emit("park_musait_degil", "park_musait_degil", "park_tarama")
+        # Kapı 2 var ama Kapı 3 düştü → alanda engel var
+        return self._emit("park_musait_degil", "park_alan_engelli", "park_engelli")
+
+
+# ============================================================
+# Hareketli engel — PLACEHOLDER (S5, plan D1/D4). Davranış kullanıcı planı gelince.
+# ============================================================
+class HareketliEngelPlaceholder(py_trees.behaviour.Behaviour):
+    """S5 hareketli engel dalı — İSKELET KANCASI (2026-07-24).
+
+    Kullanıcı hareketli engel senaryosunu SONRA tanımlayacak. Şimdilik DAVRANIŞSIZ:
+    her tick FAILURE döner → kararı hiç etkilemez; yalnız ağaçta önceliğini (acil
+    e-stop ile sabit engel ARASI) tutar. Davranış tanımlanınca burası doldurulur.
+    """
+
+    def __init__(self, bb: Blackboard):
+        super().__init__("HareketliEngelPlaceholder")
+        self.bb = bb
+
+    def update(self):
+        return Status.FAILURE
 
 
 # ============================================================

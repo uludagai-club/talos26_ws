@@ -361,9 +361,10 @@ def run_scenarios():
     assert_karar("S15c", "dur")
 
     # -----------------------------------------------------------------
-    # S15d: TAM DÖNGÜ — KIRMIZI(dur) → SARI(yeşile hazırlan: slow) → YEŞİL(geç)
+    # S15d: TAM DÖNGÜ — KIRMIZI(dur) → SARI(hâlâ dur, yeşili bekle) → YEŞİL(geç)
+    # 2026-07-24 spec: kırmızı→sarı ÖNEMSİZ, hâlâ dur (sarıda kalkma).
     # -----------------------------------------------------------------
-    print("\nS15d: KIRMIZI → SARI(hazırlan) → YEŞİL")
+    print("\nS15d: KIRMIZI → SARI(hâlâ dur/bekle) → YEŞİL")
     bb.obs.__init__(); bb.state.__init__()
     fresh_now(bb)
     bb.obs.levha_isim = "KIRMIZI"; bb.obs.levha_distance = 6.0
@@ -372,12 +373,12 @@ def run_scenarios():
     fresh_now(bb)
     bb.obs.levha_isim = "YAVAS"; bb.obs.levha_distance = 6.0   # kırmızı sonrası sarı
     tick_n(tree, 1)
-    assert_karar("S15d-sari", "slow")
-    if bb.last_decision.get("reason") != "trafik_sari_hazir":
-        failures.append(f"[S15d-sari] reason={bb.last_decision.get('reason')} (beklenen trafik_sari_hazir)")
+    assert_karar("S15d-sari", "dur")
+    if bb.last_decision.get("reason") != "trafik_sari_kirmizidan_bekle":
+        failures.append(f"[S15d-sari] reason={bb.last_decision.get('reason')} (beklenen trafik_sari_kirmizidan_bekle)")
         print(f"  ✗ S15d-sari reason={bb.last_decision.get('reason')}")
     else:
-        print("  ✓ S15d-sari reason=trafik_sari_hazir (yeşile hazırlan)")
+        print("  ✓ S15d-sari reason=trafik_sari_kirmizidan_bekle (yeşili bekle)")
     fresh_now(bb)
     bb.obs.levha_isim = "YESIL"; bb.obs.levha_distance = 6.0
     tick_n(tree, 1)

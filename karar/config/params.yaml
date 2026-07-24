@@ -236,17 +236,17 @@ yaya_gecidi:
 #   Kapı 1  PARK_YERI levhası (levha modeli /trafik_levha; SINIF_ESLESTIRME dışı →
 #           ham ad "PARK_YERI"). PARK_ETMEK_YASAKTIR → doğrudan "müsait değil" (yasak).
 #   Kapı 2  /park_alani modeli (park_durak_node HSV mavi-renk) alan gösteriyor mu.
-#   Kapı 3  o alanda lidar engeli yok mu  → 2026-07-24 ERTELENDİ (lidar_enabled=false;
-#           bag analizinden sonra eklenecek — bkz. saha-bag-analiz-plani).
-# Üçü de olumlu → reason=park_musait; biri yoksa → park_musait_degil / park_yasak.
-# Çıktı motion'ı 'slow' (park cebine yaklaşma/tarama; asıl manevra mission/hedef).
+#   Kapı 3  o alanda lidar engeli yok mu  → AKTİF (plan D3); lidar↔alan eşleştirme
+#           ParkFSM._alan_engel_var TODO stub (gerçek lidar+model gelince netleşecek).
+# Üçü de olumlu → karar=park_musait; biri yoksa → park_musait_degil (reason: park_yasak /
+# park_musait_degil / park_alan_engelli). Çıktı KARARI müsaitlik (slow değil, 2026-07-24).
 # Yaya geçidi levha-kapısı desenini birebir yansıtır (levhasız modele güvenilmez).
 park:
   enabled:            true
   model_topic:  "/park_alani"  # park_durak_node çıkışı (String "mesafe,offset" | "none")
   model_max_age_s:    0.6      # /park_alani tazelik (Kapı 2; freshness.levha_max_age_s aynası)
   levha_max_age_s:    0.6      # PARK_YERI levha tazelik (Kapı 1)
-  lidar_enabled:      false    # Kapı 3 — 2026-07-24 ertelendi; true olunca lidar engel taraması aranır
+  lidar_enabled:      true     # Kapı 3 AKTİF; eşleştirme _alan_engel_var TODO stub (temiz döner)
   # ARM MESAFESİ: park tabelası cebi UZAKTAN duyurur; bbox-proxy mesafe kaba olduğu
   # için geniş (trafik ışığı isik_oku_m=40 / yaya levha arm 45 ile aynı proxy-gerçekçi
   # mantık). Bag analizinde tabelanın hangi mesafede görüldüğüne göre tune edilecek.

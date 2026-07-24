@@ -141,8 +141,8 @@ class StatePersist:
     # Park müsaitlik FSM (ParkFSM) — üç-kapılı AND, "park tabelası → model → lidar":
     #   Kapı 1  PARK_YERI levhası görüldü mü (kapı arm; PARK_ETMEK_YASAKTIR → yasak)
     #   Kapı 2  /park_alani modeli alan gösteriyor mu (present+taze)
-    #   Kapı 3  o alanda lidar engeli yok mu  (2026-07-24: ERTELENDİ — bag analizinden
-    #           sonra eklenecek; park.lidar_enabled=false iken True kabul edilir)
+    #   Kapı 3  o alanda lidar engeli yok mu  (AKTİF — plan D3; lidar↔alan eşleştirme
+    #           ParkFSM._alan_engel_var TODO stub, gerçek lidar+model gelince netleşir)
     # Kapı, yaya geçidi levha-kapısı (YayaLevhaKapisi) desenini yansıtır: levha
     # görülmeden /park_alani modeli DİNLENMEZ. "idle"|"armed"|"released".
     park_phase: str = "idle"
