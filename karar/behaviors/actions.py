@@ -667,12 +667,14 @@ class ParkFSM(py_trees.behaviour.Behaviour):
                 (b) fail-safe: kapı `arm_max_s`'ten uzun açık kaldı.
       • grace — kapandıktan sonra `grace_s` boyunca yeniden silahlanmaz (flip-flop).
 
-    ÇIKTI: motion komutu epizot boyunca 'slow' (park cebine yaklaşma/tarama hızı;
-    asıl park manevrasını mission/hedef yürütür — karar yalnız MÜSAİTLİĞİ raporlar).
-    Müsaitlik `reason`/`phase` ile taşınır: park_musait / park_musait_degil /
-    park_yasak. `enabled=False` → dal tümden kapalı (FAILURE → cruise). control
-    tarafı park motion'ını henüz ele almadı (2026-07-24 kullanıcı: sonra) — bu yüzden
-    'slow' güvenli köprü; mission reason/phase'i okur.
+    ÇIKTI KARARI (2026-07-24 kullanıcı isteği): park tabelası görülünce (armed) karar
+    doğrudan MÜSAİTLİĞİ basar — 'slow' DEĞİL:
+      • armed + /park_alani model present (+ lidar: ertelendi → temiz) → karar='park_musait'
+      • armed + model yok  VEYA  PARK_ETMEK_YASAKTIR                    → karar='park_musait_degil'
+      • park tabelası yok (armed değil)                                → FAILURE → cruise 'normal'
+    reason: park_musait / park_musait_degil / park_yasak. Asıl park manevrasını ve
+    park_musait/degil motion karşılığını control/mission SONRA ele alacak (kullanıcı:
+    "control tarafını sonra"). `enabled=False` → dal tümden kapalı.
     """
 
     def __init__(self, bb: Blackboard, enabled: bool, arm_menzil_m: float,
@@ -700,9 +702,13 @@ class ParkFSM(py_trees.behaviour.Behaviour):
         s.park_kapi_anchored = False
         s.park_kapi_released_s = time.time()
 
-    def _emit(self, reason: str, phase: str):
+    def _emit(self, karar: str, reason: str, phase: str):
+        # ÇIKTI KARARI = MÜSAİTLİK (2026-07-24 kullanıcı): park tabelası görülünce
+        # 'slow' DEĞİL doğrudan 'park_musait' / 'park_musait_degil' basılır. Kullanıcı:
+        # "engel yoksa (lidar sonra) park müsait basılsın". control park motion'ını
+        # sonra ele alacak; karar müsaitliği net bir karar değeri olarak raporlar.
         self.bb.last_decision = {
-            "karar": "slow", "reason": reason,
+            "karar": karar, "reason": reason,
             "phase": phase, "wait_remaining_s": 0.0,
         }
         return Status.SUCCESS
@@ -742,7 +748,7 @@ class ParkFSM(py_trees.behaviour.Behaviour):
             if s.park_phase == "released" and not is_park_yeri:
                 s.park_phase = "idle"
             if is_yasak:   # tabela park yasağı → müsait değil (epizottan bağımsız uyarı)
-                return self._emit("park_yasak", "park_yasak")
+                return self._emit("park_musait_degil", "park_yasak", "park_yasak")
             return Status.FAILURE   # cruise (park tabelası yok)
 
         # --- armed: kapatma koşulları ---
@@ -762,16 +768,16 @@ class ParkFSM(py_trees.behaviour.Behaviour):
         # --- armed: üç-kapılı AND ile müsaitlik ---
         # Kapı 1 (PARK_YERI) armed olmakla sağlandı. Yasak levha araya girdiyse müsait değil.
         if is_yasak:
-            return self._emit("park_yasak", "park_yasak")
+            return self._emit("park_musait_degil", "park_yasak", "park_yasak")
         # Kapı 2: /park_alani modeli park alanı gösteriyor mu (present + taze)
         model_ok = (o.park_alani_present
                     and self._fresh(o.park_alani_last_seen, self.park_max_age_s))
         # Kapı 3: lidar engel yok mu — 2026-07-24 ERTELENDİ (bag analizi sonrası)
         lidar_ok = True if not self.lidar_enabled else True  # TODO(kapı3): lidar engel taraması
         if model_ok and lidar_ok:
-            return self._emit("park_musait", "park_musait")
+            return self._emit("park_musait", "park_musait", "park_musait")
         # Model henüz alan göstermiyor → epizot içinde tarama; verdict: müsait değil
-        return self._emit("park_musait_degil", "park_tarama")
+        return self._emit("park_musait_degil", "park_musait_degil", "park_tarama")
 
 
 # ============================================================
